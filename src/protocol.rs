@@ -87,17 +87,26 @@ impl WebSocketProtocol {
     /// 发送 hello 握手
     pub async fn send_hello(&mut self) -> Result<()> {
         let hello = Message::hello();
+        info!("发送 hello: {}", serde_json::to_string(&hello)?);
         self.send_json(&hello).await?;
 
         // 等待服务器响应
-        let response = self.receive_json().await?;
+        info!("等待服务器 hello 响应...");
+        let response = self.receive().await?;
         match response {
-            ServerMessage::Hello { session_id, .. } => {
+            ReceivedMessage::Json(ServerMessage::Hello { session_id, .. }) => {
                 *self.session_id.lock().await = session_id.clone();
                 info!("握手成功，session_id: {}", session_id);
                 Ok(())
             }
-            _ => Err(anyhow!("期望 hello 响应，收到: {:?}", response)),
+            ReceivedMessage::Json(msg) => {
+                warn!("期望 hello 响应，收到: {:?}", msg);
+                Err(anyhow!("期望 hello 响应，收到: {:?}", msg))
+            }
+            ReceivedMessage::Audio(data) => {
+                warn!("期望 JSON，收到音频数据: {} 字节", data.len());
+                Err(anyhow!("期望 JSON，收到音频"))
+            }
         }
     }
 
@@ -140,9 +149,9 @@ impl WebSocketProtocol {
                     debug!("接收音频: {} 字节", data.len());
                     Ok(ReceivedMessage::Audio(data))
                 }
-                Some(Ok(WsMessage::Close(_))) => {
-                    info!("服务器关闭连接");
-                    Err(anyhow!("连接已关闭"))
+                Some(Ok(WsMessage::Close(close_frame))) => {
+                    info!("服务器关闭连接: {:?}", close_frame);
+                    Err(anyhow!("连接已关闭: {:?}", close_frame))
                 }
                 Some(Ok(msg)) => {
                     warn!("收到非文本/二进制消息: {:?}", msg);

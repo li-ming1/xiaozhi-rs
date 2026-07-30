@@ -3,7 +3,7 @@
 //! 负责：MAC地址获取、UUID生成、序列号/HMAC生成、efuse缓存
 
 use anyhow::Result;
-use log::{info, warn};
+use log::info;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -57,7 +57,16 @@ impl DeviceIdentity {
     /// 从文件加载
     fn load_from_file(efuse_path: &PathBuf) -> Result<Self> {
         let content = fs::read_to_string(efuse_path)?;
-        let data: EfuseData = serde_json::from_str(&content)?;
+        
+        // 文件为空或无效，创建新身份
+        if content.trim().is_empty() {
+            return Self::create_new(efuse_path);
+        }
+        
+        let data: EfuseData = match serde_json::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => return Self::create_new(efuse_path),
+        };
 
         let device_id = data.mac_address.clone().unwrap_or_else(Self::generate_mac_address);
         let client_id = Uuid::new_v4().to_string();
@@ -127,35 +136,65 @@ impl DeviceIdentity {
         }
     }
 
-    /// Windows: 获取第一个非回环网卡的MAC
+    /// Windows: 生成随机 MAC 地址
     #[cfg(windows)]
     fn get_windows_mac_address() -> String {
-        // 使用 GetAdaptersInfo 获取MAC地址
-        // 这里简化实现，实际应该调用Win32 API
-        // 暂时返回一个伪MAC（实际项目应该调用windows crate的API）
-        warn!("Windows MAC地址获取未实现，使用伪MAC");
-        "00:00:00:00:00:00".to_string()
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        // 使用时间戳生成伪随机 MAC
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        
+        // 生成 6 字节 MAC 地址（本地管理地址，避免冲突）
+        let bytes = [
+            ((now >> 40) & 0xFF) as u8 | 0x02, // 本地管理地址标志
+            ((now >> 32) & 0xFF) as u8,
+            ((now >> 24) & 0xFF) as u8,
+            ((now >> 16) & 0xFF) as u8,
+            ((now >> 8) & 0xFF) as u8,
+            (now & 0xFF) as u8,
+        ];
+        // 使用小写格式
+        format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5])
     }
 
-    /// Unix: 获取MAC地址
+    /// Unix: 生成随机 MAC 地址
     #[cfg(not(windows))]
     fn get_unix_mac_address() -> String {
-        // 使用nix库获取网络接口
-        warn!("Unix MAC地址获取未实现，使用伪MAC");
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // 使用时间戳生成伪随机 MAC
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        // 生成 6 字节 MAC 地址（本地管理地址，避免冲突）
+        let bytes = [
+            ((now >> 40) & 0xFF) as u8 | 0x02, // 本地管理地址标志
+            ((now >> 32) & 0xFF) as u8,
+            ((now >> 24) & 0xFF) as u8,
+            ((now >> 16) & 0xFF) as u8,
+            ((now >> 8) & 0xFF) as u8,
+            (now & 0xFF) as u8,
+        ];
+
+        // 使用小写格式
+        format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5])
+    }
+
+    /// 获取测试用 MAC 地址（服务器自动授权）
+    pub fn get_test_mac_address() -> String {
         "00:00:00:00:00:00".to_string()
     }
 
     /// 检查是否已激活
     pub fn is_activated(&self) -> bool {
         self.activation_status
-    }
-
-    /// 设置激活状态
-    #[allow(dead_code)]
-    pub fn set_activated(&mut self, status: bool) -> Result<()> {
-        self.activation_status = status;
-        self.save()?;
-        Ok(())
     }
 
     /// 生成HMAC签名
@@ -183,6 +222,13 @@ impl DeviceIdentity {
         fs::write(&tmp_path, content)?;
         fs::rename(&tmp_path, &self.efuse_path)?;
 
+        Ok(())
+    }
+    
+    /// 标记为已激活
+    pub fn set_activated(&mut self) -> Result<()> {
+        self.activation_status = true;
+        self.save()?;
         Ok(())
     }
 }

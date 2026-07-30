@@ -9,8 +9,6 @@ use std::time::Duration;
 use crate::identity::DeviceIdentity;
 
 const OTA_URL: &str = "https://api.tenclass.net/xiaozhi/ota/";
-const ACTIVATION_MAX_RETRIES: u32 = 60;
-const ACTIVATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// OTA 响应配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,8 +48,10 @@ pub struct ActivationData {
 
 /// 从 OTA 服务器获取配置
 pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
+    info!("正在连接服务器（超时60秒）...");
     let client = Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(15))
         .danger_accept_invalid_certs(true)
         .build()?;
 
@@ -118,7 +118,7 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
     Ok(config)
 }
 
-/// 等待激活完成（轮询）
+/// 等待激活完成（60秒超时）
 pub async fn wait_for_activation(
     identity: &DeviceIdentity,
     challenge: &str,
@@ -126,6 +126,7 @@ pub async fn wait_for_activation(
 ) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
         .danger_accept_invalid_certs(true)
         .build()?;
 
@@ -142,36 +143,53 @@ pub async fn wait_for_activation(
 
     let activate_url = format!("{}activate", OTA_URL);
 
-    for attempt in 1..=ACTIVATION_MAX_RETRIES {
-        info!("激活尝试 {}/{}...", attempt, ACTIVATION_MAX_RETRIES);
+    // 60秒超时，每5秒轮询一次（共12次）
+    const MAX_POLLS: u32 = 12;
+    const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+    info!("请在60秒内完成激活...");
+
+    for attempt in 1..=MAX_POLLS {
+        // 先等待，给用户时间输入
+        if attempt > 1 {
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        // 注意：v1 激活版本不添加 Activation-Version 头部
         let response = client
             .post(&activate_url)
             .header("Device-Id", &identity.device_id)
             .header("Client-Id", &identity.client_id)
-            .header("Activation-Version", "2")
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()
-            .await?;
+            .await;
 
-        match response.status().as_u16() {
-            200 => {
-                info!("激活成功！");
-                return Ok(());
+        match response {
+            Ok(resp) => {
+                match resp.status().as_u16() {
+                    200 => {
+                        info!("激活成功！");
+                        return Ok(());
+                    }
+                    202 => {
+                        let remaining = (MAX_POLLS - attempt) * 5;
+                        info!("等待用户输入验证码...（剩余{}秒）", remaining);
+                    }
+                    status => {
+                        warn!("服务器返回状态码: {}", status);
+                    }
+                }
             }
-            202 => {
-                info!("等待用户输入验证码，{}秒后重试...", ACTIVATION_RETRY_INTERVAL.as_secs());
-                tokio::time::sleep(ACTIVATION_RETRY_INTERVAL).await;
-            }
-            _ => {
-                warn!("服务器返回: {}，{}秒后重试...", response.status(), ACTIVATION_RETRY_INTERVAL.as_secs());
-                tokio::time::sleep(ACTIVATION_RETRY_INTERVAL).await;
+            Err(_) => {
+                // 网络错误，继续重试
+                let remaining = (MAX_POLLS - attempt) * 5;
+                info!("网络请求失败，{}秒后重试...（剩余{}秒）", POLL_INTERVAL.as_secs(), remaining);
             }
         }
     }
 
-    Err(anyhow!("激活失败，已达到最大重试次数"))
+    Err(anyhow!("激活码已过期（60秒超时）"))
 }
 
 /// 获取本机IP

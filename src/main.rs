@@ -48,21 +48,58 @@ async fn main() -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            
+
             // UTC+8 转换
             let local = now + 8 * 3600;
-            let days = local / 86400;
+            let days_since_epoch = local / 86400;
             let secs = local % 86400;
-            
-            // 简化日期计算（足够精确用于日志）
-            let year = 1970 + (days * 400 + 146096) / 146097; // 考虑闰年
-            let ydays = days - ((year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400);
-            let month = (ydays / 31 + 1) as u8;
-            let day = (ydays % 31 + 1) as u8;
+
+            // 正确的日期计算算法
+            fn days_in_year(year: i32) -> i32 {
+                if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) {
+                    366
+                } else {
+                    365
+                }
+            }
+
+            fn days_in_month(year: i32, month: u8) -> u8 {
+                match month {
+                    1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                    4 | 6 | 9 | 11 => 30,
+                    2 => if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) { 29 } else { 28 },
+                    _ => 0,
+                }
+            }
+
+            // 计算年份
+            let mut year = 1970;
+            let mut days_left = days_since_epoch as i32;
+            loop {
+                let days = days_in_year(year);
+                if days_left < days {
+                    break;
+                }
+                days_left -= days;
+                year += 1;
+            }
+
+            // 计算月份和日期
+            let mut month: u8 = 1;
+            loop {
+                let days = days_in_month(year, month) as i32;
+                if days_left < days {
+                    break;
+                }
+                days_left -= days;
+                month += 1;
+            }
+
+            let day = (days_left + 1) as u8;
             let hour = (secs / 3600) as u8;
             let min = ((secs % 3600) / 60) as u8;
             let sec = (secs % 60) as u8;
-            
+
             writeln!(
                 buf,
                 "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}",
@@ -111,24 +148,50 @@ async fn run_client(skip_activation: bool) -> Result<()> {
     info!("正在启动小智客户端...");
 
     // 1. 加载/创建设备身份
-    let identity = DeviceIdentity::load_or_create()?;
+    let mut identity = DeviceIdentity::load_or_create()?;
+
+    // 如果跳过激活，使用测试 MAC 地址
+    if skip_activation {
+        identity.device_id = DeviceIdentity::get_test_mac_address();
+        info!("使用测试 MAC 地址: {}", identity.device_id);
+    }
 
     // 2. OTA 拉取配置
     info!("正在从 OTA 服务器获取配置...");
-    let ota_config = ota::fetch_config(&identity).await?;
+    let mut ota_config = ota::fetch_config(&identity).await?;
 
     // 3. 检查激活状态
     if !skip_activation && !identity.is_activated() {
-        if let Some(activation_data) = &ota_config.activation {
-            info!("设备未激活，请访问以下地址激活：");
-            if let Some(url) = &activation_data.authorization_url {
-                info!("  网址: {}", url);
-            }
-            info!("  激活码: {}", activation_data.code);
+        const MAX_RETRIES: u32 = 5;
+        let mut retry_count = 0;
 
-            // 轮询激活
-            ota::wait_for_activation(&identity, &activation_data.challenge, &activation_data.code).await?;
-            info!("激活成功！");
+        while retry_count < MAX_RETRIES {
+            if let Some(activation_data) = &ota_config.activation {
+                retry_count += 1;
+                info!("设备需要激活（尝试 {}/{}）", retry_count, MAX_RETRIES);
+                info!("请访问 https://xiaozhi.me/ 输入激活码：{}", activation_data.code);
+                
+                // 等待激活（60秒超时）
+                match ota::wait_for_activation(&identity, &activation_data.challenge, &activation_data.code).await {
+                    Ok(_) => {
+                        info!("激活成功！");
+                        identity.set_activated()?;
+                        break;
+                    }
+                    Err(e) => {
+                        if retry_count < MAX_RETRIES {
+                            info!("激活码已过期，正在重新获取...");
+                            // 重新获取配置（新的激活码）
+                            ota_config = ota::fetch_config(&identity).await?;
+                        } else {
+                            return Err(anyhow::anyhow!("激活失败，已达到最大重试次数: {}", e));
+                        }
+                    }
+                }
+            } else {
+                // 没有激活数据，表示已激活
+                break;
+            }
         }
     }
 
