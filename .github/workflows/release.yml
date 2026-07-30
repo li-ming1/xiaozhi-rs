@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -15,14 +18,14 @@ jobs:
       matrix:
         include:
           # Windows
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   name: windows-x64,   exe: xiaozhi-rs.exe, opus: win/x64/opus.dll }
-          - { os: windows-latest, target: aarch64-pc-windows-msvc,  name: windows-arm64, exe: xiaozhi-rs.exe, opus: win/arm64/opus.dll }
+          - { os: windows-latest,  target: x86_64-pc-windows-msvc,   name: windows-x64,   exe: xiaozhi-rs.exe, opus: win/x64/opus.dll }
+          - { os: windows-latest,  target: aarch64-pc-windows-msvc,  name: windows-arm64, exe: xiaozhi-rs.exe, opus: win/arm64/opus.dll }
           # macOS（macos-13 = Intel, macos-latest = Apple Silicon）
-          - { os: macos-13,       target: x86_64-apple-darwin,      name: macos-x64,     exe: xiaozhi-rs,     opus: mac/x64/libopus.dylib }
-          - { os: macos-latest,   target: aarch64-apple-darwin,     name: macos-arm64,   exe: xiaozhi-rs,     opus: mac/arm64/libopus.dylib }
-          # Linux
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  name: linux-x64,     exe: xiaozhi-rs,     opus: linux/x64/libopus.so }
-          - { os: ubuntu-latest,  target: aarch64-unknown-linux-gnu, name: linux-arm64,   exe: xiaozhi-rs,     opus: linux/arm64/libopus.so, cross: true }
+          - { os: macos-13,        target: x86_64-apple-darwin,      name: macos-x64,     exe: xiaozhi-rs,     opus: mac/x64/libopus.dylib }
+          - { os: macos-latest,    target: aarch64-apple-darwin,     name: macos-arm64,   exe: xiaozhi-rs,     opus: mac/arm64/libopus.dylib }
+          # Linux（ubuntu-24.04-arm = 原生 ARM64 runner，无需交叉编译）
+          - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,  name: linux-x64,     exe: xiaozhi-rs,     opus: linux/x64/libopus.so }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-arm64,  exe: xiaozhi-rs,     opus: linux/arm64/libopus.so }
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -34,31 +37,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       # ── Linux: 安装 ALSA 开发库（cpal 依赖）──
-      - name: Install Linux native ALSA
-        if: runner.os == 'Linux' && !matrix.cross
+      - name: Install ALSA dev
+        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y libasound2-dev
 
-      # ── Linux ARM64 交叉编译：安装 aarch64 交叉编译器 + ALSA 头文件 ──
-      - name: Install ARM64 cross-compiler
-        if: matrix.cross
-        run: |
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update -qq
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libasound2-dev:arm64
-
-      - name: Build (ARM64 cross)
-        if: matrix.cross
-        run: cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-          PKG_CONFIG_ALLOW_CROSS: 1
-          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
-          BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu: -I/usr/include -I/usr/include/aarch64-linux-gnu
-
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
       # ── 打包：可执行文件 + opus 库 + README + LICENSE ──
