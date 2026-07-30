@@ -8,13 +8,14 @@ description = "小智客户端 - Rust 极简实现"
 # 异步运行时
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 
-# WebSocket
-tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+# WebSocket（rustls 纯 Rust TLS，无需系统 OpenSSL）
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
-native-tls = "0.2"
 
-# HTTP 客户端（OTA/激活）
-reqwest = { version = "0.13", features = ["json", "native-tls"], default-features = false }
+# HTTP 客户端（OTA/激活）— rustls-no-provider + 手动安装 ring，避免 aws-lc-rs 的 cmake/NASM 依赖
+reqwest = { version = "0.13", features = ["json", "rustls-no-provider"], default-features = false }
+# rustls 直接依赖：为 reqwest 的 rustls-no-provider 安装 ring crypto provider
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # 序列化
 serde = { version = "1", features = ["derive"] }

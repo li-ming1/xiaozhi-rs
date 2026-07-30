@@ -1,6 +1,6 @@
 //! Opus 编解码
 //!
-//! 使用 libloading 加载预编译的 opus.dll
+//! 使用 libloading 动态加载 opus 库（跨平台：opus.dll / libopus.dylib / libopus.so）
 
 use anyhow::{anyhow, Result};
 use libloading::{Library, Symbol};
@@ -45,42 +45,7 @@ impl OpusCodec {
     /// 创建编解码器
     #[allow(clippy::missing_transmute_annotations)]
     pub fn new() -> Result<Self> {
-        // 加载 opus.dll（Windows）
-        #[cfg(windows)]
-        let library = {
-            // 获取程序所在目录
-            let exe_path = std::env::current_exe()
-                .map(|p| p.parent().map(|p| p.to_path_buf()).unwrap_or_default())
-                .unwrap_or_default();
-            
-            // 尝试从多个路径加载
-            let paths = [
-                exe_path.join("opus.dll"),
-                std::path::PathBuf::from("opus.dll"),
-                std::path::PathBuf::from("libs/libopus/win/x64/opus.dll"),
-                std::path::PathBuf::from("./opus.dll"),
-            ];
-
-            let mut lib = None;
-            for path in &paths {
-                if path.exists() {
-                    if let Ok(l) = unsafe { Library::new(path) } {
-                        lib = Some(l);
-                        info!("已加载 Opus 库: {}", path.display());
-                        break;
-                    }
-                }
-            }
-
-            lib.ok_or_else(|| anyhow!("未找到 opus.dll，请将 opus.dll 复制到程序目录: {}", exe_path.display()))?
-        };
-
-        #[cfg(not(windows))]
-        let library = Library::new("libopus.so.0")
-            .or_else(|_| Library::new("libopus.so"))
-            .map_err(|e| anyhow!("无法加载 opus 库: {}", e))?;
-
-        let library = Arc::new(library);
+        let library = Arc::new(load_opus_library()?);
 
         // 加载函数
         let encoder_create: Symbol<OpusEncoderCreate> = unsafe {
@@ -206,4 +171,66 @@ impl Drop for OpusCodec {
             (self.decoder_destroy)(self.decoder);
         }
     }
+}
+
+/// 加载 Opus 动态库（跨平台）
+///
+/// 搜索顺序：exe 同级目录 → 当前目录 → 平台特定路径 → 系统库（dlopen 默认搜索）
+fn load_opus_library() -> Result<Library> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+    // 平台相关：库名 + 额外搜索路径
+    #[cfg(windows)]
+    let (lib_names, extra_paths): (&[&str], &[&str]) =
+        (&["opus.dll"], &["libs/libopus/win/x64"]);
+
+    #[cfg(target_os = "macos")]
+    let (lib_names, extra_paths): (&[&str], &[&str]) =
+        (&["libopus.dylib"], &["/opt/homebrew/lib", "/usr/local/lib"]);
+
+    #[cfg(target_os = "linux")]
+    let (lib_names, extra_paths): (&[&str], &[&str]) =
+        (&["libopus.so.0", "libopus.so"], &[]);
+
+    // 构建搜索目录：exe 同级 → 当前目录 → 额外路径
+    let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = &exe_dir {
+        search_dirs.push(dir.clone());
+    }
+    search_dirs.push(std::path::PathBuf::from("."));
+    for extra in extra_paths {
+        search_dirs.push(std::path::PathBuf::from(extra));
+    }
+
+    // 按目录搜索库文件
+    for name in lib_names {
+        for dir in &search_dirs {
+            let path = dir.join(name);
+            if path.exists() {
+                if let Ok(lib) = unsafe { Library::new(&path) } {
+                    info!("已加载 Opus 库: {}", path.display());
+                    return Ok(lib);
+                }
+            }
+        }
+    }
+
+    // 最后尝试系统库（dlopen 搜索 LD_LIBRARY_PATH / 默认路径）
+    for name in lib_names {
+        if let Ok(lib) = unsafe { Library::new(*name) } {
+            info!("已加载系统 Opus 库: {}", name);
+            return Ok(lib);
+        }
+    }
+
+    #[cfg(windows)]
+    let hint = "请将 opus.dll 复制到程序目录";
+    #[cfg(target_os = "macos")]
+    let hint = "请运行 brew install opus 或将 libopus.dylib 放到程序目录";
+    #[cfg(target_os = "linux")]
+    let hint = "请安装 libopus-dev 或将 libopus.so 放到程序目录";
+
+    Err(anyhow!("未找到 opus 库，{}", hint))
 }

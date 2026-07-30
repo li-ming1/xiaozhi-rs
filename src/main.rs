@@ -41,6 +41,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 安装 ring 作为 rustls 默认 crypto provider（reqwest rustls-no-provider 不含 provider）
+    // 必须在任何 HTTPS 请求前调用；已安装时 install_default 返回 Err，用 .ok() 忽略
+    rustls::crypto::ring::default_provider().install_default().ok();
+
     // 自定义日志格式：本地时间（UTC+8）+ 消息
     // 使用 O(1) 日期算法，避免每次日志都循环减年份
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))

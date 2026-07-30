@@ -11,7 +11,7 @@ use serde::Serialize;
 use tokio_tungstenite::{
     connect_async_tls_with_config,
     tungstenite::{protocol::Message as WsMessage, Bytes},
-    Connector, MaybeTlsStream, WebSocketStream,
+    MaybeTlsStream, WebSocketStream,
 };
 
 use crate::message::{Message, ServerMessage};
@@ -119,13 +119,8 @@ pub async fn connect_and_handshake(
 ) -> Result<(WsSender, WsReceiver, String)> {
     info!("正在连接: {}", url);
 
-    let connector = Some(Connector::NativeTls(
-        native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
-            .build()?,
-    ));
-
+    // rustls 自动使用 webpki-roots（Mozilla 根证书），connector 传 None 即可，
+    // 无需 native-tls / 系统 OpenSSL 依赖
     let uri: http::Uri = url
         .parse()
         .map_err(|e| anyhow!("URI 解析失败: {}", e))?;
@@ -152,7 +147,7 @@ pub async fn connect_and_handshake(
         .body(())
         .map_err(|e| anyhow!("构建请求失败: {}", e))?;
 
-    let (ws_stream, _) = connect_async_tls_with_config(request, None, false, connector)
+    let (ws_stream, _) = connect_async_tls_with_config(request, None, false, None)
         .await
         .map_err(|e| anyhow!("WebSocket 连接失败: {}", e))?;
 
