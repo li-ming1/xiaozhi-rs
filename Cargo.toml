@@ -9,12 +9,12 @@ description = "小智客户端 - Rust 极简实现"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 
 # WebSocket
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = "0.3"
 native-tls = "0.2"
 
 # HTTP 客户端（OTA/激活）
-reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "native-tls"], default-features = false }
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
@@ -34,11 +34,11 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 
 # 目录
-directories = "5"
+directories = "6"
 
 # 加密
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hmac = "0.13"
 hex = "0.4"
 
 # 主机名
@@ -46,13 +46,13 @@ hostname = "0.4"
 
 # HTTP（WebSocket Headers）
 http = "1"
-tungstenite = "0.24"
+tungstenite = "0.30"
 
 # 音频
-cpal = "0.15"
+cpal = "0.18"
 
 # Opus 编解码（使用 libloading 加载预编译库）
-libloading = "0.8"
+libloading = "0.9"
 
 [profile.release]
 # 本项目音频 DSP（重采样/Opus）为计算密集型，整体提至 3；依赖库仍优化体积

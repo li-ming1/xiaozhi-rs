@@ -53,8 +53,8 @@ impl Resampler {
             //   y2/y3 越界时钳位到末尾样本
             let y0 = if src_idx == 0 { self.prev_last } else { input[src_idx - 1] };
             let y1 = input[src_idx];
-            let y2 = if src_idx + 1 <= last { input[src_idx + 1] } else { input[last] };
-            let y3 = if src_idx + 2 <= last { input[src_idx + 2] } else { input[last] };
+            let y2 = if src_idx < last { input[src_idx + 1] } else { input[last] };
+            let y3 = if src_idx + 1 < last { input[src_idx + 2] } else { input[last] };
 
             let frac2 = frac * frac;
             let frac3 = frac2 * frac;
@@ -132,8 +132,9 @@ impl AudioManager {
             .default_output_device()
             .ok_or_else(|| anyhow!("未找到输出设备"))?;
 
-        info!("输入设备: {}", input_device.name().unwrap_or_default());
-        info!("输出设备: {}", output_device.name().unwrap_or_default());
+        // cpal 0.18: Device 实现 Display，直接 {} 格式化即设备名
+        info!("输入设备: {}", input_device);
+        info!("输出设备: {}", output_device);
 
         Ok(Self {
             input_device,
@@ -156,7 +157,7 @@ impl AudioManager {
 
         let sample_format = supported_config.sample_format();
         let config: StreamConfig = supported_config.into();
-        let input_sample_rate = config.sample_rate.0;
+        let input_sample_rate = config.sample_rate;
         let input_channels = config.channels as usize;
 
         let (tx, rx) = channel::<[f32; FRAME_SIZE]>();
@@ -172,7 +173,7 @@ impl AudioManager {
             SampleFormat::I16 => {
                 let state = state.clone();
                 self.input_device.build_input_stream(
-                    &config,
+                    config,
                     move |data: &[i16], _: &_| {
                         process_input_chunk(data, input_channels, |s| s as f32 / 32768.0, resample_ratio, &state, &tx);
                     },
@@ -183,7 +184,7 @@ impl AudioManager {
             SampleFormat::F32 => {
                 let state = state.clone();
                 self.input_device.build_input_stream(
-                    &config,
+                    config,
                     move |data: &[f32], _: &_| {
                         process_input_chunk(data, input_channels, |s| s, resample_ratio, &state, &tx);
                     },
@@ -211,7 +212,7 @@ impl AudioManager {
 
         let sample_format = supported_config.sample_format();
         let config: StreamConfig = supported_config.into();
-        let output_sample_rate = config.sample_rate.0;
+        let output_sample_rate = config.sample_rate;
         let output_channels = config.channels as usize;
 
         let (tx, rx): (Sender<[f32; FRAME_SIZE]>, Receiver<[f32; FRAME_SIZE]>) = channel();
@@ -227,7 +228,7 @@ impl AudioManager {
             SampleFormat::I16 => {
                 let state = state.clone();
                 self.output_device.build_output_stream(
-                    &config,
+                    config,
                     move |data: &mut [i16], _: &_| {
                         fill_output(data, output_channels, resample_ratio, &state, &rx);
                     },
@@ -238,7 +239,7 @@ impl AudioManager {
             SampleFormat::F32 => {
                 let state = state.clone();
                 self.output_device.build_output_stream(
-                    &config,
+                    config,
                     move |data: &mut [f32], _: &_| {
                         fill_output(data, output_channels, resample_ratio, &state, &rx);
                     },

@@ -6,7 +6,7 @@ use anyhow::Result;
 use log::info;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::fs;
 use uuid::Uuid;
 
@@ -56,7 +56,7 @@ impl DeviceIdentity {
     }
 
     /// 从文件加载
-    fn load_from_file(efuse_path: &PathBuf) -> Result<Self> {
+    fn load_from_file(efuse_path: &Path) -> Result<Self> {
         let content = fs::read_to_string(efuse_path)?;
         
         // 文件为空或无效，创建新身份
@@ -81,7 +81,7 @@ impl DeviceIdentity {
             serial_number,
             hmac_key,
             activation_status: data.activation_status,
-            efuse_path: efuse_path.clone(),
+            efuse_path: efuse_path.to_path_buf(),
         };
 
         info!("已加载设备身份: {}", identity.device_id);
@@ -89,7 +89,7 @@ impl DeviceIdentity {
     }
 
     /// 创建新身份
-    fn create_new(efuse_path: &PathBuf) -> Result<Self> {
+    fn create_new(efuse_path: &Path) -> Result<Self> {
         info!("首次运行，正在生成设备身份...");
 
         // 获取MAC地址
@@ -100,15 +100,15 @@ impl DeviceIdentity {
 
         // 生成序列号: SN-{MD5(mac)[:8]}-{mac_clean}
         let mac_clean = device_id.replace(":", "").to_lowercase();
-        let hash = format!("{:x}", Sha256::digest(&mac_clean.as_bytes()));
-        let serial_number = format!("SN-{}-{}", &hash[..8].to_uppercase(), mac_clean);
+        let hash = hex::encode(Sha256::digest(mac_clean.as_bytes()));
+        let serial_number = format!("SN-{}-{}", hash[..8].to_uppercase(), mac_clean);
 
         // 生成HMAC密钥
         let hostname = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
         let hmac_input = format!("{}||{}||{}", hostname, device_id, client_id);
-        let hmac_key = format!("{:x}", Sha256::digest(hmac_input.as_bytes()));
+        let hmac_key = hex::encode(Sha256::digest(hmac_input.as_bytes()));
 
         let identity = DeviceIdentity {
             device_id,
@@ -116,7 +116,7 @@ impl DeviceIdentity {
             serial_number,
             hmac_key,
             activation_status: false,
-            efuse_path: efuse_path.clone(),
+            efuse_path: efuse_path.to_path_buf(),
         };
 
         // 保存到文件
@@ -149,8 +149,9 @@ impl DeviceIdentity {
 
     /// 生成HMAC签名
     pub fn generate_hmac_signature(&self, challenge: &str) -> String {
-        use hmac::{Hmac, Mac};
-        type HmacSha256 = Hmac<Sha256>;
+        // hmac 0.13: SimpleHmac 适用于直接实现 Digest 的哈希（如 Sha256）
+        use hmac::{KeyInit, Mac, SimpleHmac};
+        type HmacSha256 = SimpleHmac<Sha256>;
 
         let mut mac = HmacSha256::new_from_slice(self.hmac_key.as_bytes())
             .expect("HMAC初始化失败");

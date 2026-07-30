@@ -43,6 +43,7 @@ unsafe impl Sync for OpusCodec {}
 
 impl OpusCodec {
     /// 创建编解码器
+    #[allow(clippy::missing_transmute_annotations)]
     pub fn new() -> Result<Self> {
         // 加载 opus.dll（Windows）
         #[cfg(windows)]

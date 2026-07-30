@@ -10,7 +10,7 @@ use log::{debug, info, warn};
 use serde::Serialize;
 use tokio_tungstenite::{
     connect_async_tls_with_config,
-    tungstenite::protocol::Message as WsMessage,
+    tungstenite::{protocol::Message as WsMessage, Bytes},
     Connector, MaybeTlsStream, WebSocketStream,
 };
 
@@ -22,7 +22,8 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 #[derive(Debug)]
 pub enum ReceivedMessage {
     Json(ServerMessage),
-    Audio(Vec<u8>),
+    /// 直接持有 tungstenite 的 Bytes（引用计数，零拷贝），decode 时 deref 到 &[u8]
+    Audio(Bytes),
 }
 
 /// WebSocket 发送端（持有 SplitSink，与接收端独立，无锁）
@@ -35,7 +36,7 @@ impl WsSender {
         let json = serde_json::to_string(msg)?;
         debug!("发送 JSON: {}", json);
         self.sink
-            .send(WsMessage::Text(json))
+            .send(WsMessage::Text(json.into()))
             .await
             .map_err(|e| anyhow!("发送失败: {}", e))?;
         Ok(())
@@ -45,7 +46,7 @@ impl WsSender {
         // 接受 owned Vec 直接 move，省一次 to_vec 拷贝
         // 音频帧每秒 50 次，debug 日志会刷屏且字节数可预测，故不记录
         self.sink
-            .send(WsMessage::Binary(data))
+            .send(WsMessage::Binary(data.into()))
             .await
             .map_err(|e| anyhow!("音频发送失败: {}", e))?;
         Ok(())
@@ -55,7 +56,7 @@ impl WsSender {
     pub async fn send_ping(&mut self, payload: Vec<u8>) -> Result<()> {
         debug!("发送 Ping: {} 字节", payload.len());
         self.sink
-            .send(WsMessage::Ping(payload))
+            .send(WsMessage::Ping(payload.into()))
             .await
             .map_err(|e| anyhow!("Ping 发送失败: {}", e))?;
         Ok(())
