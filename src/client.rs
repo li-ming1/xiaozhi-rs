@@ -1,6 +1,8 @@
 //! 客户端核心逻辑
 //!
-//! 实现全双工音频对话
+//! 实现全双工音频对话。
+//! WebSocket 收发分离（WsSender/WsReceiver），select! 中利用 disjoint borrow
+//! 让接收与发送互不阻塞，消除旧 Mutex 架构的收发互锁。
 
 use anyhow::Result;
 use log::{debug, info, warn};
@@ -9,47 +11,52 @@ use tokio::time::{interval, Duration};
 use crate::audio::AudioManager;
 use crate::message::{ListenState, Message, ServerMessage};
 use crate::opus_codec::OpusCodec;
-use crate::protocol::{ReceivedMessage, WebSocketProtocol};
-
-/// 客户端状态
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum State {
-    Idle,
-    Connecting,
-    Connected,
-    Listening,
-    Speaking,
-}
+use crate::protocol::{connect_and_handshake, ReceivedMessage, WsReceiver, WsSender};
 
 /// 客户端
 pub struct Client {
-    protocol: WebSocketProtocol,
+    // 连接参数（重连需要）
+    url: String,
+    token: String,
+    device_id: String,
+    client_id: String,
+    // WebSocket 收发分离（独立字段，select! 中 disjoint borrow 互不阻塞）
+    sender: Option<WsSender>,
+    receiver: Option<WsReceiver>,
+    session_id: String,
+    // 音频 + 编解码
     audio: AudioManager,
     opus: OpusCodec,
-    state: State,
 }
 
 impl Client {
     pub fn new(url: String, token: String, device_id: String, client_id: String) -> Self {
         Self {
-            protocol: WebSocketProtocol::new(url, token, device_id, client_id),
+            url,
+            token,
+            device_id,
+            client_id,
+            sender: None,
+            receiver: None,
+            session_id: String::new(),
             audio: AudioManager::new().expect("音频初始化失败"),
             opus: OpusCodec::new().expect("Opus初始化失败"),
-            state: State::Idle,
         }
     }
 
     /// 连接服务器
     pub async fn connect(&mut self) -> Result<()> {
-        self.state = State::Connecting;
+        let (sender, receiver, session_id) = connect_and_handshake(
+            &self.url,
+            &self.token,
+            &self.device_id,
+            &self.client_id,
+        )
+        .await?;
 
-        // 1. WebSocket 连接
-        self.protocol.connect().await?;
-
-        // 2. hello 握手
-        self.protocol.send_hello().await?;
-
-        self.state = State::Connected;
+        self.sender = Some(sender);
+        self.receiver = Some(receiver);
+        self.session_id = session_id;
         info!("客户端已连接");
         Ok(())
     }
@@ -95,17 +102,14 @@ impl Client {
 
     /// 运行对话循环
     async fn run_conversation(&mut self) -> Result<()> {
-        self.state = State::Listening;
-
         // 发送监听开始
-        let session_id = self.protocol.session_id().await;
         let msg = Message::Listen {
-            session_id,
+            session_id: self.session_id.clone(),
             state: ListenState::Start,
             mode: Some("realtime".to_string()),
             text: None,
         };
-        self.protocol.send_json(&msg).await?;
+        self.sender.as_mut().unwrap().send_json(&msg).await?;
 
         // 启动音频
         self.audio.start_capture()?;
@@ -118,8 +122,8 @@ impl Client {
 
         loop {
             tokio::select! {
-                // 接收 WebSocket 消息
-                result = self.protocol.receive() => {
+                // 接收 WebSocket 消息（借用 &mut self.receiver）
+                result = self.receiver.as_mut().unwrap().receive() => {
                     match result {
                         Ok(ReceivedMessage::Json(json_msg)) => {
                             self.handle_json_message(json_msg)?;
@@ -141,14 +145,13 @@ impl Client {
                     }
                 }
 
-                // 定时发送音频（每 20ms 一帧）
+                // 定时发送音频（借用 &mut self.sender，与 receiver 字段 disjoint，无锁互不阻塞）
                 // 每次 tick 只取一帧发送，避免缓冲累积导致延迟线性增长
                 _ = send_tick.tick() => {
                     if let Some(frame) = self.audio.read_frame() {
-                        // 编码并发送
                         match self.opus.encode(&frame) {
                             Ok(encoded) => {
-                                if let Err(e) = self.protocol.send_audio(&encoded).await {
+                                if let Err(e) = self.sender.as_mut().unwrap().send_audio(&encoded).await {
                                     warn!("音频发送失败: {}", e);
                                 }
                             }
@@ -169,21 +172,15 @@ impl Client {
     }
 
     /// 处理 JSON 消息
-    fn handle_json_message(&mut self, msg: ServerMessage) -> Result<()> {
+    fn handle_json_message(&self, msg: ServerMessage) -> Result<()> {
         use crate::message::TtsState;
         match msg {
             ServerMessage::Tts { state: tts_state, text: _ } => {
                 // TTS 只负责状态机切换，不显示文本
                 // 文本统一由 LLM 消息显示，避免 Stt/Llm/Tts 三处重复
                 match tts_state {
-                    TtsState::Start => {
-                        self.state = State::Speaking;
-                        info!("AI 开始说话");
-                    }
-                    TtsState::Stop => {
-                        self.state = State::Listening;
-                        info!("AI 说完，继续监听");
-                    }
+                    TtsState::Start => info!("AI 开始说话"),
+                    TtsState::Stop => info!("AI 说完，继续监听"),
                     TtsState::SentenceStart | TtsState::SentenceStop | TtsState::SentenceEnd => {
                         debug!("TTS 句子状态: {:?}", tts_state);
                     }
@@ -212,8 +209,8 @@ impl Client {
                 info!("会话结束: {}", session_id);
                 return Err(anyhow::anyhow!("会话已关闭"));
             }
-            _ => {
-                debug!("消息: {:?}", msg);
+            ServerMessage::Hello { .. } => {
+                debug!("收到 hello");
             }
         }
         Ok(())

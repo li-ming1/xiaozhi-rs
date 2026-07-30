@@ -4,7 +4,7 @@
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Host, SampleFormat, Stream, StreamConfig};
+use cpal::{Device, SampleFormat, Stream, StreamConfig};
 use log::{info, warn};
 use std::collections::VecDeque;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -17,15 +17,15 @@ pub const FRAME_SIZE: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize;
 
 /// 高质量重采样器（Catmull-Rom 三次样条，保持跨块相位连续）
 ///
-/// 保存上一次输入的最后 2 个样本，作为下次插值的 y0/y1，
-/// 避免块边界处波形不连续产生的高频杂音。
+/// 仅保存前一次输入的最后一个样本作为本次 input[-1]，
+/// 用于块起始处 Catmull-Rom 的 y0，避免波形不连续产生的高频杂音。
 struct Resampler {
-    tail: [f32; 2],
+    prev_last: f32,
 }
 
 impl Resampler {
     fn new() -> Self {
-        Self { tail: [0.0, 0.0] }
+        Self { prev_last: 0.0 }
     }
 
     /// 重采样：输出长度 = input.len() * ratio
@@ -34,27 +34,24 @@ impl Resampler {
             return Vec::new();
         }
 
-        let output_len = (input.len() as f64 * ratio) as usize;
+        let n = input.len();
+        let last = n - 1;
+        let output_len = (n as f64 * ratio) as usize;
         let mut output = Vec::with_capacity(output_len);
-
-        // 构造带历史前缀的输入：[tail0, tail1, input...]
-        // Catmull-Rom 需要当前点的前后各一个点；加前缀保证块起始处也能取到正确 y0/y1
-        let mut extended = Vec::with_capacity(input.len() + 2);
-        extended.extend_from_slice(&self.tail);
-        extended.extend_from_slice(input);
 
         for i in 0..output_len {
             let src_pos = i as f64 / ratio;
             let src_idx = src_pos.floor() as usize;
             let frac = (src_pos - src_idx as f64) as f32;
 
-            // extended 中 tail 在 [0,2)，input 在 [2, 2+n)
-            // 输出 i 对应 input[src_idx]，即 extended[src_idx+2]
-            // Catmull-Rom 四点取 extended[src_idx+1..src_idx+5]
-            let y0 = extended.get(src_idx + 1).copied().unwrap_or(0.0);
-            let y1 = extended.get(src_idx + 2).copied().unwrap_or(0.0);
-            let y2 = extended.get(src_idx + 3).copied().unwrap_or(0.0);
-            let y3 = extended.get(src_idx + 4).copied().unwrap_or(0.0);
+            // Catmull-Rom 四点：
+            //   y0 = input[src_idx-1]（src_idx==0 时用前一块末尾 prev_last）
+            //   y1 = input[src_idx]
+            //   y2/y3 越界时钳位到末尾样本
+            let y0 = if src_idx == 0 { self.prev_last } else { input[src_idx - 1] };
+            let y1 = input[src_idx];
+            let y2 = if src_idx + 1 <= last { input[src_idx + 1] } else { input[last] };
+            let y3 = if src_idx + 2 <= last { input[src_idx + 2] } else { input[last] };
 
             let frac2 = frac * frac;
             let frac3 = frac2 * frac;
@@ -65,13 +62,7 @@ impl Resampler {
             output.push(a0 * frac3 + a1 * frac2 + a2 * frac + y1);
         }
 
-        // 更新 tail 为本次输入的最后 2 个样本
-        if input.len() >= 2 {
-            self.tail = [input[input.len() - 2], input[input.len() - 1]];
-        } else if input.len() == 1 {
-            self.tail = [self.tail[1], input[0]];
-        }
-
+        self.prev_last = input[last];
         output
     }
 }
@@ -107,10 +98,7 @@ impl OutputState {
 }
 
 /// 音频管理器
-#[allow(dead_code)]
 pub struct AudioManager {
-    #[allow(dead_code)]
-    host: Host,
     input_device: Device,
     output_device: Device,
     input_stream: Option<Stream>,
@@ -136,7 +124,6 @@ impl AudioManager {
         info!("输出设备: {}", output_device.name().unwrap_or_default());
 
         Ok(Self {
-            host,
             input_device,
             output_device,
             input_stream: None,

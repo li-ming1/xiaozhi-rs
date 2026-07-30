@@ -47,16 +47,12 @@ hostname = "0.4"
 # HTTP（WebSocket Headers）
 http = "1"
 tungstenite = "0.24"
-url = "2"
 
 # 音频
 cpal = "0.15"
 
 # Opus 编解码（使用 libloading 加载预编译库）
 libloading = "0.8"
-
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Networking_WinSock", "Win32_Foundation"] }
 
 [profile.release]
 # 本项目音频 DSP（重采样/Opus）为计算密集型，整体提至 3；依赖库仍优化体积

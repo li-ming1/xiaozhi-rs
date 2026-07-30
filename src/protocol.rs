@@ -1,12 +1,13 @@
-//! WebSocket 协议实现
+//! WebSocket 协议实现（收发分离，无锁互不阻塞）
 //!
-//! 支持 JSON 文本消息和二进制音频帧
+//! 将 WebSocketStream split 为独立的发送端与接收端，
+//! 消除旧 Arc<Mutex<Stream>> 架构中 receive 持锁跨 await 阻塞 send 的互锁问题。
 
 use anyhow::{anyhow, Result};
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use serde::Serialize;
 use tokio_tungstenite::{
     connect_async_tls_with_config,
     tungstenite::protocol::Message as WsMessage,
@@ -15,15 +16,7 @@ use tokio_tungstenite::{
 
 use crate::message::{Message, ServerMessage};
 
-/// WebSocket 协议客户端
-pub struct WebSocketProtocol {
-    url: String,
-    token: String,
-    device_id: String,
-    client_id: String,
-    ws: Option<Arc<Mutex<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>>>,
-    session_id: Arc<Mutex<String>>,
-}
+type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// 接收到的消息类型
 #[derive(Debug)]
@@ -32,140 +25,137 @@ pub enum ReceivedMessage {
     Audio(Vec<u8>),
 }
 
-impl WebSocketProtocol {
-    pub fn new(url: String, token: String, device_id: String, client_id: String) -> Self {
-        Self {
-            url,
-            token,
-            device_id,
-            client_id,
-            ws: None,
-            session_id: Arc::new(Mutex::new(String::new())),
-        }
-    }
+/// WebSocket 发送端（持有 SplitSink，与接收端独立，无锁）
+pub struct WsSender {
+    sink: SplitSink<WsStream, WsMessage>,
+}
 
-    /// 连接 WebSocket
-    pub async fn connect(&mut self) -> Result<()> {
-        info!("正在连接: {}", self.url);
-
-        // 创建 TLS 连接器（跳过证书验证）
-        let connector = Some(Connector::NativeTls(
-            native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .danger_accept_invalid_hostnames(true)
-                .build()?,
-        ));
-
-        // 构建带 Headers 的 HTTP Request
-        let uri: http::Uri = self.url.parse()
-            .map_err(|e| anyhow!("URI 解析失败: {}", e))?;
-
-        let request = http::Request::builder()
-            .uri(uri)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("Protocol-Version", "1")
-            .header("Device-Id", &self.device_id)
-            .header("Client-Id", &self.client_id)
-            .header("Host", "api.tenclass.net")
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
-            .body(())
-            .map_err(|e| anyhow!("构建请求失败: {}", e))?;
-
-        // 连接
-        let (ws_stream, _) = connect_async_tls_with_config(request, None, false, connector)
-            .await
-            .map_err(|e| anyhow!("WebSocket 连接失败: {}", e))?;
-
-        self.ws = Some(Arc::new(Mutex::new(ws_stream)));
-        info!("WebSocket 连接成功");
-        Ok(())
-    }
-
-    /// 发送 hello 握手
-    pub async fn send_hello(&mut self) -> Result<()> {
-        let hello = Message::hello();
-        info!("发送 hello: {}", serde_json::to_string(&hello)?);
-        self.send_json(&hello).await?;
-
-        // 等待服务器响应
-        info!("等待服务器 hello 响应...");
-        let response = self.receive().await?;
-        match response {
-            ReceivedMessage::Json(ServerMessage::Hello { session_id, .. }) => {
-                *self.session_id.lock().await = session_id.clone();
-                info!("握手成功，session_id: {}", session_id);
-                Ok(())
-            }
-            ReceivedMessage::Json(msg) => {
-                warn!("期望 hello 响应，收到: {:?}", msg);
-                Err(anyhow!("期望 hello 响应，收到: {:?}", msg))
-            }
-            ReceivedMessage::Audio(data) => {
-                warn!("期望 JSON，收到音频数据: {} 字节", data.len());
-                Err(anyhow!("期望 JSON，收到音频"))
-            }
-        }
-    }
-
-    /// 获取 session_id
-    pub async fn session_id(&self) -> String {
-        self.session_id.lock().await.clone()
-    }
-
-    /// 发送 JSON 消息
-    pub async fn send_json(&self, msg: &Message) -> Result<()> {
+impl WsSender {
+    pub async fn send_json(&mut self, msg: &impl Serialize) -> Result<()> {
         let json = serde_json::to_string(msg)?;
         debug!("发送 JSON: {}", json);
-
-        if let Some(ws) = &self.ws {
-            ws.lock().await.send(WsMessage::Text(json)).await?;
-        }
-
+        self.sink
+            .send(WsMessage::Text(json))
+            .await
+            .map_err(|e| anyhow!("发送失败: {}", e))?;
         Ok(())
     }
 
-    /// 发送二进制音频数据
-    pub async fn send_audio(&self, data: &[u8]) -> Result<()> {
-        if let Some(ws) = &self.ws {
-            ws.lock().await.send(WsMessage::Binary(data.to_vec())).await?;
-            debug!("发送音频: {} 字节", data.len());
-        }
+    pub async fn send_audio(&mut self, data: &[u8]) -> Result<()> {
+        self.sink
+            .send(WsMessage::Binary(data.to_vec()))
+            .await
+            .map_err(|e| anyhow!("音频发送失败: {}", e))?;
+        debug!("发送音频: {} 字节", data.len());
         Ok(())
     }
+}
 
-    /// 接收消息（JSON 或音频）
-    pub async fn receive(&self) -> Result<ReceivedMessage> {
-        if let Some(ws) = &self.ws {
-            match ws.lock().await.next().await {
-                Some(Ok(WsMessage::Text(text))) => {
-                    debug!("接收 JSON: {}", text);
-                    let msg: ServerMessage = serde_json::from_str(&text)?;
-                    Ok(ReceivedMessage::Json(msg))
-                }
-                Some(Ok(WsMessage::Binary(data))) => {
-                    debug!("接收音频: {} 字节", data.len());
-                    Ok(ReceivedMessage::Audio(data))
-                }
-                Some(Ok(WsMessage::Close(close_frame))) => {
-                    info!("服务器关闭连接: {:?}", close_frame);
-                    Err(anyhow!("连接已关闭: {:?}", close_frame))
-                }
-                Some(Ok(msg)) => {
-                    warn!("收到非文本/二进制消息: {:?}", msg);
-                    Err(anyhow!("未知消息类型"))
-                }
-                Some(Err(e)) => {
-                    Err(anyhow!("WebSocket错误: {}", e))
-                }
-                None => {
-                    Err(anyhow!("连接已断开"))
-                }
+/// WebSocket 接收端（持有 SplitStream，与发送端独立，无锁）
+pub struct WsReceiver {
+    stream: SplitStream<WsStream>,
+}
+
+impl WsReceiver {
+    pub async fn receive(&mut self) -> Result<ReceivedMessage> {
+        match self.stream.next().await {
+            Some(Ok(WsMessage::Text(text))) => {
+                debug!("接收 JSON: {}", text);
+                let msg: ServerMessage = serde_json::from_str(&text)?;
+                Ok(ReceivedMessage::Json(msg))
             }
-        } else {
-            Err(anyhow!("未连接"))
+            Some(Ok(WsMessage::Binary(data))) => {
+                debug!("接收音频: {} 字节", data.len());
+                Ok(ReceivedMessage::Audio(data))
+            }
+            Some(Ok(WsMessage::Close(close_frame))) => {
+                info!("服务器关闭连接: {:?}", close_frame);
+                Err(anyhow!("连接已关闭: {:?}", close_frame))
+            }
+            Some(Ok(msg)) => {
+                warn!("收到非文本/二进制消息: {:?}", msg);
+                Err(anyhow!("未知消息类型"))
+            }
+            Some(Err(e)) => Err(anyhow!("WebSocket错误: {}", e)),
+            None => Err(anyhow!("连接已断开")),
+        }
+    }
+}
+
+/// 连接 WebSocket 并完成握手
+///
+/// 返回 (发送端, 接收端, session_id)。
+/// 收发分离后，receive 等待消息时不再阻塞 send，彻底消除收发互锁。
+pub async fn connect_and_handshake(
+    url: &str,
+    token: &str,
+    device_id: &str,
+    client_id: &str,
+) -> Result<(WsSender, WsReceiver, String)> {
+    info!("正在连接: {}", url);
+
+    let connector = Some(Connector::NativeTls(
+        native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .build()?,
+    ));
+
+    let uri: http::Uri = url
+        .parse()
+        .map_err(|e| anyhow!("URI 解析失败: {}", e))?;
+    // Host 从 URL 解析，避免硬编码
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow!("URL 缺少 host: {}", url))?
+        .to_string();
+
+    let request = http::Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Protocol-Version", "1")
+        .header("Device-Id", device_id)
+        .header("Client-Id", client_id)
+        .header("Host", host.as_str())
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header(
+            "Sec-WebSocket-Key",
+            tungstenite::handshake::client::generate_key(),
+        )
+        .body(())
+        .map_err(|e| anyhow!("构建请求失败: {}", e))?;
+
+    let (ws_stream, _) = connect_async_tls_with_config(request, None, false, connector)
+        .await
+        .map_err(|e| anyhow!("WebSocket 连接失败: {}", e))?;
+
+    // split：收发分离，消除互锁
+    let (sink, stream) = ws_stream.split();
+    let mut sender = WsSender { sink };
+    let mut receiver = WsReceiver { stream };
+
+    info!("WebSocket 连接成功");
+
+    // 握手
+    let hello = Message::hello();
+    info!("发送 hello: {}", serde_json::to_string(&hello)?);
+    sender.send_json(&hello).await?;
+
+    info!("等待服务器 hello 响应...");
+    match receiver.receive().await? {
+        ReceivedMessage::Json(ServerMessage::Hello { session_id, .. }) => {
+            info!("握手成功，session_id: {}", session_id);
+            Ok((sender, receiver, session_id))
+        }
+        ReceivedMessage::Json(msg) => {
+            warn!("期望 hello 响应，收到: {:?}", msg);
+            Err(anyhow!("期望 hello 响应，收到: {:?}", msg))
+        }
+        ReceivedMessage::Audio(data) => {
+            warn!("期望 JSON，收到音频数据: {} 字节", data.len());
+            Err(anyhow!("期望 JSON，收到音频"))
         }
     }
 }

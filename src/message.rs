@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 客户端发送的消息
+/// 客户端发送的消息（仅保留实际构造的变体）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -25,34 +25,9 @@ pub enum Message {
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
-
-    /// 中止语音
-    Abort {
-        session_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
-
-    /// IoT 设备描述
-    Iot {
-        session_id: String,
-        update: bool,
-        descriptors: Vec<serde_json::Value>,
-    },
-
-    /// MCP 消息
-    Mcp {
-        session_id: String,
-        payload: serde_json::Value,
-    },
-
-    /// 关闭会话
-    Goodbye {
-        session_id: String,
-    },
 }
 
-/// 服务器发送的消息
+/// 服务器发送的消息（保留全部变体以反序列化服务器推送）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -60,8 +35,6 @@ pub enum ServerMessage {
     Hello {
         transport: String,
         session_id: String,
-        #[serde(default)]
-        udp: Option<UdpConfig>,
     },
 
     Tts {
@@ -127,19 +100,10 @@ impl Default for AudioParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UdpConfig {
-    pub server: String,
-    pub port: u16,
-    pub key: String,
-    pub nonce: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListenState {
     Start,
     Stop,
-    Detect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,28 +125,6 @@ impl Message {
             features: Features { mcp: true },
             transport: "websocket".to_string(),
             audio_params: AudioParams::default(),
-        }
-    }
-
-    /// 创建监听开始消息
-    #[allow(dead_code)]
-    pub fn listen_start(session_id: &str, mode: &str) -> Self {
-        Message::Listen {
-            session_id: session_id.to_string(),
-            state: ListenState::Start,
-            mode: Some(mode.to_string()),
-            text: None,
-        }
-    }
-
-    /// 创建监听停止消息
-    #[allow(dead_code)]
-    pub fn listen_stop(session_id: &str) -> Self {
-        Message::Listen {
-            session_id: session_id.to_string(),
-            state: ListenState::Stop,
-            mode: None,
-            text: None,
         }
     }
 }
