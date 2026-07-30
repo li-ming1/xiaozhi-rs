@@ -1,0 +1,68 @@
+[package]
+name = "xiaozhi-rs"
+version = "0.1.0"
+edition = "2021"
+description = "小智客户端 - Rust 极简实现"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+native-tls = "0.2"
+
+# HTTP 客户端（OTA/激活）
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# 日志
+log = "0.4"
+env_logger = "0.11"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# 错误处理
+anyhow = "1"
+thiserror = "2"
+
+# 目录
+directories = "5"
+
+# 加密
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+
+# 主机名
+hostname = "0.4"
+
+# HTTP（WebSocket Headers）
+http = "1"
+tungstenite = "0.24"
+url = "2"
+
+# 音频
+cpal = "0.15"
+ringbuf = "0.4"  # 音频缓冲
+
+# Opus 编解码（使用 libloading 加载预编译库）
+libloading = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Networking_WinSock", "Win32_Foundation"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
