@@ -2,7 +2,7 @@
 //!
 //! 负责：MAC地址获取、UUID生成、序列号/HMAC生成、efuse缓存
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -130,8 +130,6 @@ impl DeviceIdentity {
     /// Windows: 获取第一个非回环网卡的MAC
     #[cfg(windows)]
     fn get_windows_mac_address() -> String {
-        use std::mem;
-
         // 使用 GetAdaptersInfo 获取MAC地址
         // 这里简化实现，实际应该调用Win32 API
         // 暂时返回一个伪MAC（实际项目应该调用windows crate的API）
@@ -153,6 +151,7 @@ impl DeviceIdentity {
     }
 
     /// 设置激活状态
+    #[allow(dead_code)]
     pub fn set_activated(&mut self, status: bool) -> Result<()> {
         self.activation_status = status;
         self.save()?;

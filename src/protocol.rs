@@ -161,6 +161,7 @@ impl WebSocketProtocol {
     }
 
     /// 尝试接收消息（非阻塞）
+    #[allow(dead_code)]
     pub fn try_receive(&self) -> Result<Option<ReceivedMessage>> {
         // 注意：这个实现需要同步访问 WebSocket，这里简化处理
         // 实际应该使用 tokio::select! 或单独的接收任务
@@ -176,6 +177,7 @@ impl WebSocketProtocol {
     }
 
     /// 关闭连接
+    #[allow(dead_code)]
     pub async fn close(&mut self) -> Result<()> {
         if let Some(ws) = self.ws.take() {
             ws.lock().await.close(None).await?;
@@ -185,6 +187,7 @@ impl WebSocketProtocol {
     }
 
     /// 检查是否已连接
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.ws.is_some()
     }

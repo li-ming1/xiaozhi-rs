@@ -98,6 +98,7 @@ impl OpusCodec {
 
         // 创建编码器
         let mut error: c_int = 0;
+        #[allow(unused_unsafe)]
         let encoder = unsafe { encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION_VOIP, &mut error) };
         if error != OPUS_OK || encoder.is_null() {
             return Err(anyhow!("创建 Opus 编码器失败: {}", error));
@@ -105,6 +106,7 @@ impl OpusCodec {
 
         // 创建解码器
         let mut error: c_int = 0;
+        #[allow(unused_unsafe)]
         let decoder = unsafe { decoder_create(SAMPLE_RATE, CHANNELS, &mut error) };
         if error != OPUS_OK || decoder.is_null() {
             return Err(anyhow!("创建 Opus 解码器失败: {}", error));
@@ -136,6 +138,7 @@ impl OpusCodec {
 
         let mut output = vec![0u8; MAX_PACKET_SIZE];
 
+        #[allow(unused_unsafe)]
         let len = unsafe {
             (self.encode_float)(
                 self.encoder,
@@ -161,6 +164,7 @@ impl OpusCodec {
     pub fn decode(&self, input: &[u8]) -> Result<Vec<f32>> {
         let mut output = vec![0.0f32; FRAME_SIZE];
 
+        #[allow(unused_unsafe)]
         let samples = unsafe {
             (self.decode_float)(
                 self.decoder,

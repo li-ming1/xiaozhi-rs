@@ -122,7 +122,7 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
 pub async fn wait_for_activation(
     identity: &DeviceIdentity,
     challenge: &str,
-    code: &str,
+    _code: &str,
 ) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))

@@ -165,6 +165,7 @@ impl Message {
     }
 
     /// 创建监听开始消息
+    #[allow(dead_code)]
     pub fn listen_start(session_id: &str, mode: &str) -> Self {
         Message::Listen {
             session_id: session_id.to_string(),
@@ -175,6 +176,7 @@ impl Message {
     }
 
     /// 创建监听停止消息
+    #[allow(dead_code)]
     pub fn listen_stop(session_id: &str) -> Self {
         Message::Listen {
             session_id: session_id.to_string(),

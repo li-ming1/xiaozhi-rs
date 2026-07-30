@@ -14,7 +14,9 @@ pub const FRAME_DURATION_MS: u32 = 20;
 pub const FRAME_SIZE: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize;
 
 /// 音频管理器
+#[allow(dead_code)]
 pub struct AudioManager {
+    #[allow(dead_code)]
     host: Host,
     input_device: Device,
     output_device: Device,
@@ -71,9 +73,6 @@ impl AudioManager {
 
         // 重采样比例
         let resample_ratio = SAMPLE_RATE as f64 / input_sample_rate as f64;
-
-        // 音频缓冲
-        let mut buffer: Vec<f32> = Vec::with_capacity(FRAME_SIZE * 4);
 
         let stream = match sample_format {
             SampleFormat::I16 => {
@@ -238,6 +237,7 @@ impl AudioManager {
     }
 
     /// 停止采集
+    #[allow(dead_code)]
     pub fn stop_capture(&mut self) {
         self.input_stream = None;
         self.input_rx = None;
@@ -245,6 +245,7 @@ impl AudioManager {
     }
 
     /// 停止播放
+    #[allow(dead_code)]
     pub fn stop_playback(&mut self) {
         self.output_stream = None;
         self.output_tx = None;

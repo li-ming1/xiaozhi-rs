@@ -231,6 +231,7 @@ impl Client {
     }
 
     /// 关闭连接
+    #[allow(dead_code)]
     pub async fn close(&mut self) -> Result<()> {
         self.audio.stop_capture();
         self.audio.stop_playback();
@@ -240,6 +241,7 @@ impl Client {
     }
 
     /// 获取状态
+    #[allow(dead_code)]
     pub fn state(&self) -> State {
         self.state
     }

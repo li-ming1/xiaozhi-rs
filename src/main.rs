@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use log::info;
+use std::io::Write;
 
 mod audio;
 mod client;
@@ -39,7 +40,37 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // 自定义日志格式：本地时间 + 消息
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            // 计算本地时间（UTC+8）
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            // UTC+8 转换
+            let local = now + 8 * 3600;
+            let days = local / 86400;
+            let secs = local % 86400;
+            
+            // 简化日期计算（足够精确用于日志）
+            let year = 1970 + (days * 400 + 146096) / 146097; // 考虑闰年
+            let ydays = days - ((year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400);
+            let month = (ydays / 31 + 1) as u8;
+            let day = (ydays % 31 + 1) as u8;
+            let hour = (secs / 3600) as u8;
+            let min = ((secs % 3600) / 60) as u8;
+            let sec = (secs % 60) as u8;
+            
+            writeln!(
+                buf,
+                "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}",
+                year, month, day, hour, min, sec,
+                record.args()
+            )
+        })
+        .init();
 
     let cli = Cli::parse();
 
