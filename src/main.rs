@@ -175,7 +175,6 @@ async fn ensure_activated(
             match ota::wait_for_activation(
                 identity,
                 &activation_data.challenge,
-                &activation_data.code,
             )
             .await
             {

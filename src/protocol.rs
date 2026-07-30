@@ -41,12 +41,23 @@ impl WsSender {
         Ok(())
     }
 
-    pub async fn send_audio(&mut self, data: &[u8]) -> Result<()> {
+    pub async fn send_audio(&mut self, data: Vec<u8>) -> Result<()> {
+        // 接受 owned Vec 直接 move，省一次 to_vec 拷贝
+        // 音频帧每秒 50 次，debug 日志会刷屏且字节数可预测，故不记录
         self.sink
-            .send(WsMessage::Binary(data.to_vec()))
+            .send(WsMessage::Binary(data))
             .await
             .map_err(|e| anyhow!("音频发送失败: {}", e))?;
-        debug!("发送音频: {} 字节", data.len());
+        Ok(())
+    }
+
+    /// 发送心跳 Ping（保活 + 触发 Sink flush，让 tungstenite 自动排队的 Pong 一并发出）
+    pub async fn send_ping(&mut self, payload: Vec<u8>) -> Result<()> {
+        debug!("发送 Ping: {} 字节", payload.len());
+        self.sink
+            .send(WsMessage::Ping(payload))
+            .await
+            .map_err(|e| anyhow!("Ping 发送失败: {}", e))?;
         Ok(())
     }
 }
@@ -58,26 +69,39 @@ pub struct WsReceiver {
 
 impl WsReceiver {
     pub async fn receive(&mut self) -> Result<ReceivedMessage> {
-        match self.stream.next().await {
-            Some(Ok(WsMessage::Text(text))) => {
-                debug!("接收 JSON: {}", text);
-                let msg: ServerMessage = serde_json::from_str(&text)?;
-                Ok(ReceivedMessage::Json(msg))
+        // 循环直到拿到业务消息（Text/Binary）。
+        // Ping/Pong 等控制帧由 tungstenite 底层自动处理（收到 Ping 会自动排队 Pong，
+        // 下次 Sink send/flush 时发出），应用层只需忽略并继续等待下一条消息。
+        loop {
+            match self.stream.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    debug!("接收 JSON: {}", text);
+                    let msg: ServerMessage = serde_json::from_str(&text)?;
+                    return Ok(ReceivedMessage::Json(msg));
+                }
+                Some(Ok(WsMessage::Binary(data))) => {
+                    // 音频帧每秒 50 次，debug 日志会刷屏且字节数可预测，故不记录
+                    return Ok(ReceivedMessage::Audio(data));
+                }
+                Some(Ok(WsMessage::Ping(payload))) => {
+                    // tungstenite 已自动排队 Pong，无需手动回复
+                    debug!("收到 Ping: {} 字节（已自动排队 Pong）", payload.len());
+                }
+                Some(Ok(WsMessage::Pong(payload))) => {
+                    // 心跳响应，保活确认
+                    debug!("收到 Pong: {} 字节", payload.len());
+                }
+                Some(Ok(WsMessage::Close(close_frame))) => {
+                    info!("服务器关闭连接: {:?}", close_frame);
+                    return Err(anyhow!("连接已关闭: {:?}", close_frame));
+                }
+                Some(Ok(msg)) => {
+                    // 其他帧（理论上协议层不会上抛），忽略继续
+                    warn!("收到未处理的消息类型: {:?}", msg);
+                }
+                Some(Err(e)) => return Err(anyhow!("WebSocket错误: {}", e)),
+                None => return Err(anyhow!("连接已断开")),
             }
-            Some(Ok(WsMessage::Binary(data))) => {
-                debug!("接收音频: {} 字节", data.len());
-                Ok(ReceivedMessage::Audio(data))
-            }
-            Some(Ok(WsMessage::Close(close_frame))) => {
-                info!("服务器关闭连接: {:?}", close_frame);
-                Err(anyhow!("连接已关闭: {:?}", close_frame))
-            }
-            Some(Ok(msg)) => {
-                warn!("收到非文本/二进制消息: {:?}", msg);
-                Err(anyhow!("未知消息类型"))
-            }
-            Some(Err(e)) => Err(anyhow!("WebSocket错误: {}", e)),
-            None => Err(anyhow!("连接已断开")),
         }
     }
 }

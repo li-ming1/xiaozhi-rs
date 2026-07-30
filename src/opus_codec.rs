@@ -33,9 +33,8 @@ pub struct OpusCodec {
     decode_float: Symbol<'static, OpusDecodeFloat>,
     encoder_destroy: Symbol<'static, OpusEncoderDestroy>,
     decoder_destroy: Symbol<'static, OpusDecoderDestroy>,
-    // 复用编码/解码缓冲，避免每帧分配（20ms 一帧 = 每秒 50 次分配）
+    // 复用编码缓冲（Opus 输出大小可变，需 buffer）；解码直接写入栈数组
     encode_buf: Vec<u8>,
-    decode_buf: Vec<f32>,
 }
 
 // 确保线程安全
@@ -142,7 +141,6 @@ impl OpusCodec {
             encoder_destroy,
             decoder_destroy,
             encode_buf: vec![0u8; MAX_PACKET_SIZE],
-            decode_buf: vec![0.0f32; FRAME_SIZE],
         })
     }
 
@@ -156,16 +154,14 @@ impl OpusCodec {
         }
 
         // 复用 encode_buf，避免每帧分配 4000 字节
-        #[allow(unused_unsafe)]
-        let len = unsafe {
-            (self.encode_float)(
-                self.encoder,
-                input.as_ptr(),
-                FRAME_SIZE as c_int,
-                self.encode_buf.as_mut_ptr(),
-                MAX_PACKET_SIZE as c_int,
-            )
-        };
+        // Rust 2021 调用 extern fn 是 safe 的，无需 unsafe 块
+        let len = (self.encode_float)(
+            self.encoder,
+            input.as_ptr(),
+            FRAME_SIZE as c_int,
+            self.encode_buf.as_mut_ptr(),
+            MAX_PACKET_SIZE as c_int,
+        );
 
         if len < 0 {
             return Err(anyhow!("Opus 编码失败: {}", len));
@@ -178,30 +174,24 @@ impl OpusCodec {
     ///
     /// input: Opus 压缩数据
     /// 返回: f32 PCM 数据（16kHz, 单声道, 320样本/帧）
-    pub fn decode(&mut self, input: &[u8]) -> Result<Vec<f32>> {
-        // 复用 decode_buf，避免每帧分配 1280 字节
-        #[allow(unused_unsafe)]
-        let samples = unsafe {
-            (self.decode_float)(
-                self.decoder,
-                input.as_ptr(),
-                input.len() as c_int,
-                self.decode_buf.as_mut_ptr(),
-                FRAME_SIZE as c_int,
-                0, // decode_fec
-            )
-        };
+    pub fn decode(&mut self, input: &[u8]) -> Result<[f32; FRAME_SIZE]> {
+        // 直接写入栈数组，无需复用缓冲（数组 Copy，栈上传递零堆分配）
+        let mut out = [0f32; FRAME_SIZE];
+        let samples = (self.decode_float)(
+            self.decoder,
+            input.as_ptr(),
+            input.len() as c_int,
+            out.as_mut_ptr(),
+            FRAME_SIZE as c_int,
+            0, // decode_fec
+        );
 
         if samples < 0 {
             return Err(anyhow!("Opus 解码失败: {}", samples));
         }
 
-        if samples as usize != FRAME_SIZE {
-            // 不匹配时补零到 FRAME_SIZE
-            self.decode_buf[samples as usize..].fill(0.0);
-        }
-
-        Ok(self.decode_buf.clone())
+        // samples <= FRAME_SIZE，out[..samples] 已由 FFI 填充，剩余保持 0（初始化值）
+        Ok(out)
     }
 }
 

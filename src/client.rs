@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use log::{debug, info, warn};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, interval_at, Duration, Instant};
 
 use crate::audio::AudioManager;
 use crate::message::{ListenState, Message, ServerMessage};
@@ -73,6 +73,9 @@ impl Client {
             match self.run_conversation().await {
                 Ok(_) => break,
                 Err(e) => {
+                    // 立即停止音频流：避免重连等待期间输入回调持续往无界 channel
+                    // 灌数据导致旧音频积压（重连后播放历史延迟），同时释放设备 + CPU
+                    self.audio.stop();
                     conv_failures += 1;
                     if conv_failures >= MAX_RETRIES {
                         return Err(e);
@@ -119,6 +122,12 @@ impl Client {
 
         // 发送定时器（20ms，匹配音频帧）
         let mut send_tick = interval(Duration::from_millis(20));
+        // 心跳定时器（30秒，防止空闲断开；首个 tick 延后 30s，避免握手后立即发）
+        // 定期 Ping 同时触发 Sink flush，让 tungstenite 收到 Ping 时自动排队的 Pong 一并发出
+        let mut heartbeat = interval_at(
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(30),
+        );
 
         loop {
             tokio::select! {
@@ -129,7 +138,7 @@ impl Client {
                             self.handle_json_message(json_msg)?;
                         }
                         Ok(ReceivedMessage::Audio(audio_data)) => {
-                            // 解码 Opus
+                            // 解码 Opus → [f32; FRAME_SIZE]，write_frame 接受数组，零堆分配
                             match self.opus.decode(&audio_data) {
                                 Ok(decoded) => {
                                     self.audio.write_frame(decoded);
@@ -151,7 +160,8 @@ impl Client {
                     if let Some(frame) = self.audio.read_frame() {
                         match self.opus.encode(&frame) {
                             Ok(encoded) => {
-                                if let Err(e) = self.sender.as_mut().unwrap().send_audio(&encoded).await {
+                                // encoded 直接 move 进 send_audio，省一次 to_vec 拷贝
+                                if let Err(e) = self.sender.as_mut().unwrap().send_audio(encoded).await {
                                     warn!("音频发送失败: {}", e);
                                 }
                             }
@@ -159,6 +169,13 @@ impl Client {
                                 warn!("Opus 编码失败: {}", e);
                             }
                         }
+                    }
+                }
+
+                // 心跳保活：定期发送 Ping，防止空闲超时断连
+                _ = heartbeat.tick() => {
+                    if let Err(e) = self.sender.as_mut().unwrap().send_ping(b"xz".to_vec()).await {
+                        warn!("心跳发送失败: {}", e);
                     }
                 }
             }

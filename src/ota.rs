@@ -13,12 +13,13 @@ const OTA_URL: &str = "https://api.tenclass.net/xiaozhi/ota/";
 /// OTA 响应配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OtaConfig {
+    #[serde(default)]
     pub websocket: WebSocketConfig,
     #[serde(default)]
     pub activation: Option<ActivationData>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WebSocketConfig {
     pub url: Option<String>,
     pub token: Option<String>,
@@ -74,24 +75,10 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
     let ota_response: serde_json::Value = response.json().await?;
     info!("OTA 响应: {}", serde_json::to_string_pretty(&ota_response)?);
 
-    // 解析响应
-    let mut config = OtaConfig {
-        websocket: WebSocketConfig {
-            url: None,
-            token: None,
-        },
-        activation: None,
-    };
+    // 直接反序列化（字段缺失由 #[serde(default)] 处理，未知字段自动忽略）
+    let config: OtaConfig = serde_json::from_value(ota_response)?;
 
-    // 提取 WebSocket 配置
-    if let Some(ws) = ota_response.get("websocket") {
-        config.websocket.url = ws.get("url").and_then(|v| v.as_str()).map(String::from);
-        config.websocket.token = ws.get("token").and_then(|v| v.as_str()).map(String::from);
-    }
-
-    // 提取激活数据
-    if let Some(activation) = ota_response.get("activation") {
-        config.activation = Some(serde_json::from_value(activation.clone())?);
+    if config.activation.is_some() {
         warn!("设备需要激活");
     } else {
         info!("设备已授权");
@@ -104,7 +91,6 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
 pub async fn wait_for_activation(
     identity: &DeviceIdentity,
     challenge: &str,
-    _code: &str,
 ) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
