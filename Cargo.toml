@@ -3,6 +3,8 @@ name = "xiaozhi-rs"
 version = "0.1.0"
 edition = "2021"
 description = "小智客户端 - Rust 极简实现"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
 # 异步运行时

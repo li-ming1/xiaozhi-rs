@@ -23,8 +23,14 @@ Thumbs.db
 *.so
 *.dylib
 
+# 但保留 libs/ 下的预编译依赖（opus 库随仓库分发）
+!libs/**/*.dll
+!libs/**/*.so
+!libs/**/*.dylib
+
 # Logs
 *.log
 
 # Project specific
 efuse.json
+dist/

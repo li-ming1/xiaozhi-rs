@@ -175,62 +175,68 @@ impl Drop for OpusCodec {
 
 /// 加载 Opus 动态库（跨平台）
 ///
-/// 搜索顺序：exe 同级目录 → 当前目录 → 平台特定路径 → 系统库（dlopen 默认搜索）
+/// 搜索顺序：exe 同级 bundled 路径 → 当前目录 bundled 路径 → 系统库（dlopen 默认搜索）
 fn load_opus_library() -> Result<Library> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
-    // 平台相关：库名 + 额外搜索路径
+    // 编译目标对应的 bundled 库相对路径（libs/libopus/{os}/{arch}/{libname}）
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    const BUNDLED: &str = "libs/libopus/win/x64/opus.dll";
+    #[cfg(all(windows, target_arch = "aarch64"))]
+    const BUNDLED: &str = "libs/libopus/win/arm64/opus.dll";
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    const BUNDLED: &str = "libs/libopus/mac/x64/libopus.dylib";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const BUNDLED: &str = "libs/libopus/mac/arm64/libopus.dylib";
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    const BUNDLED: &str = "libs/libopus/linux/x64/libopus.so";
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    const BUNDLED: &str = "libs/libopus/linux/arm64/libopus.so";
+
+    // 系统库名（dlopen 搜索 LD_LIBRARY_PATH / 默认路径）
     #[cfg(windows)]
-    let (lib_names, extra_paths): (&[&str], &[&str]) =
-        (&["opus.dll"], &["libs/libopus/win/x64"]);
-
+    const SYSTEM_NAMES: &[&str] = &["opus.dll"];
     #[cfg(target_os = "macos")]
-    let (lib_names, extra_paths): (&[&str], &[&str]) =
-        (&["libopus.dylib"], &["/opt/homebrew/lib", "/usr/local/lib"]);
-
+    const SYSTEM_NAMES: &[&str] = &["libopus.dylib"];
     #[cfg(target_os = "linux")]
-    let (lib_names, extra_paths): (&[&str], &[&str]) =
-        (&["libopus.so.0", "libopus.so"], &[]);
+    const SYSTEM_NAMES: &[&str] = &["libopus.so.0", "libopus.so"];
 
-    // 构建搜索目录：exe 同级 → 当前目录 → 额外路径
+    // macOS 额外搜索 Homebrew 路径
+    #[cfg(target_os = "macos")]
+    const EXTRA_PATHS: &[&str] = &["/opt/homebrew/lib", "/usr/local/lib"];
+    #[cfg(not(target_os = "macos"))]
+    const EXTRA_PATHS: &[&str] = &[];
+
+    // 搜索目录：exe 同级 → 当前目录 → 额外路径
     let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
     if let Some(dir) = &exe_dir {
         search_dirs.push(dir.clone());
     }
     search_dirs.push(std::path::PathBuf::from("."));
-    for extra in extra_paths {
+    for extra in EXTRA_PATHS {
         search_dirs.push(std::path::PathBuf::from(extra));
     }
 
-    // 按目录搜索库文件
-    for name in lib_names {
-        for dir in &search_dirs {
-            let path = dir.join(name);
-            if path.exists() {
-                if let Ok(lib) = unsafe { Library::new(&path) } {
-                    info!("已加载 Opus 库: {}", path.display());
-                    return Ok(lib);
-                }
+    // 1. 搜索 bundled 库（libs/libopus/{os}/{arch}/...）
+    for dir in &search_dirs {
+        let path = dir.join(BUNDLED);
+        if path.exists() {
+            if let Ok(lib) = unsafe { Library::new(&path) } {
+                info!("已加载 Opus 库: {}", path.display());
+                return Ok(lib);
             }
         }
     }
 
-    // 最后尝试系统库（dlopen 搜索 LD_LIBRARY_PATH / 默认路径）
-    for name in lib_names {
+    // 2. 搜索系统库（dlopen 搜索 LD_LIBRARY_PATH / 默认路径）
+    for name in SYSTEM_NAMES {
         if let Ok(lib) = unsafe { Library::new(*name) } {
             info!("已加载系统 Opus 库: {}", name);
             return Ok(lib);
         }
     }
 
-    #[cfg(windows)]
-    let hint = "请将 opus.dll 复制到程序目录";
-    #[cfg(target_os = "macos")]
-    let hint = "请运行 brew install opus 或将 libopus.dylib 放到程序目录";
-    #[cfg(target_os = "linux")]
-    let hint = "请安装 libopus-dev 或将 libopus.so 放到程序目录";
-
-    Err(anyhow!("未找到 opus 库，{}", hint))
+    Err(anyhow!("未找到 opus 库，请确保 {} 存在或安装系统 opus 库", BUNDLED))
 }
