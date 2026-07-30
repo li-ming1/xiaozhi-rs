@@ -7,6 +7,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Host, SampleFormat, Stream, StreamConfig};
 use log::{info, warn};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 /// 音频配置
 pub const SAMPLE_RATE: u32 = 16000;
@@ -73,6 +74,10 @@ impl AudioManager {
 
         // 重采样比例
         let resample_ratio = SAMPLE_RATE as f64 / input_sample_rate as f64;
+        
+        // 共享缓冲区（用于累积数据）
+        let buffer = Arc::new(Mutex::new(Vec::with_capacity(FRAME_SIZE * 4)));
+        let buffer_clone = buffer.clone();
 
         let stream = match sample_format {
             SampleFormat::I16 => {
@@ -94,9 +99,31 @@ impl AudioManager {
                         // 重采样
                         let resampled = resample(&mono, resample_ratio);
                         
-                        // 发送到通道
-                        if tx.send(resampled).is_err() {
-                            warn!("音频通道已关闭");
+                        // 累积到缓冲区
+                        {
+                            let mut buf = buffer_clone.lock().unwrap();
+                            buf.extend_from_slice(&resampled);
+                        }
+                        
+                        // 检查是否有足够的数据
+                        loop {
+                            let frame = {
+                                let mut buf = buffer_clone.lock().unwrap();
+                                if buf.len() >= FRAME_SIZE {
+                                    Some(buf.drain(..FRAME_SIZE).collect::<Vec<f32>>())
+                                } else {
+                                    None
+                                }
+                            };
+                            
+                            if let Some(frame) = frame {
+                                if tx.send(frame).is_err() {
+                                    warn!("音频通道已关闭");
+                                    return;
+                                }
+                            } else {
+                                break;
+                            }
                         }
                     },
                     |err| warn!("输入流错误: {}", err),
@@ -116,9 +143,31 @@ impl AudioManager {
                         // 重采样
                         let resampled = resample(&mono, resample_ratio);
                         
-                        // 发送到通道
-                        if tx.send(resampled).is_err() {
-                            warn!("音频通道已关闭");
+                        // 累积到缓冲区
+                        {
+                            let mut buf = buffer_clone.lock().unwrap();
+                            buf.extend_from_slice(&resampled);
+                        }
+                        
+                        // 检查是否有足够的数据
+                        loop {
+                            let frame = {
+                                let mut buf = buffer_clone.lock().unwrap();
+                                if buf.len() >= FRAME_SIZE {
+                                    Some(buf.drain(..FRAME_SIZE).collect::<Vec<f32>>())
+                                } else {
+                                    None
+                                }
+                            };
+                            
+                            if let Some(frame) = frame {
+                                if tx.send(frame).is_err() {
+                                    warn!("音频通道已关闭");
+                                    return;
+                                }
+                            } else {
+                                break;
+                            }
                         }
                     },
                     |err| warn!("输入流错误: {}", err),
@@ -253,7 +302,7 @@ impl AudioManager {
     }
 }
 
-/// 简单线性插值重采样
+/// 高质量重采样（三次样条插值）
 fn resample(input: &[f32], ratio: f64) -> Vec<f32> {
     if input.is_empty() || ratio <= 0.0 {
         return Vec::new();
@@ -264,18 +313,27 @@ fn resample(input: &[f32], ratio: f64) -> Vec<f32> {
 
     for i in 0..output_len {
         let src_pos = i as f64 / ratio;
-        let src_idx = src_pos as usize;
+        let src_idx = src_pos.floor() as isize;
+        let frac = src_pos - src_idx as f64;
+
+        // 三次样条插值（Catmull-Rom）
+        let y0 = input.get((src_idx - 1).max(0) as usize).copied().unwrap_or(0.0);
+        let y1 = input.get(src_idx.max(0) as usize).copied().unwrap_or(0.0);
+        let y2 = input.get((src_idx + 1).min(input.len() as isize - 1) as usize).copied().unwrap_or(0.0);
+        let y3 = input.get((src_idx + 2).min(input.len() as isize - 1) as usize).copied().unwrap_or(0.0);
+
+        // Catmull-Rom 样条
+        let frac = frac as f32;
+        let frac2 = frac * frac;
+        let frac3 = frac2 * frac;
         
-        if src_idx + 1 < input.len() {
-            // 线性插值
-            let frac = src_pos - src_idx as f64;
-            let sample = input[src_idx] as f64 * (1.0 - frac) + input[src_idx + 1] as f64 * frac;
-            output.push(sample as f32);
-        } else if src_idx < input.len() {
-            output.push(input[src_idx]);
-        } else {
-            output.push(0.0);
-        }
+        let a0 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+        let a1 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+        let a2 = -0.5 * y0 + 0.5 * y2;
+        let a3 = y1;
+
+        let sample = a0 * frac3 + a1 * frac2 + a2 * frac + a3;
+        output.push(sample);
     }
 
     output

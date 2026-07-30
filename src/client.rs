@@ -110,8 +110,8 @@ impl Client {
         let frame_size = crate::audio::FRAME_SIZE;
         let mut audio_buffer: Vec<f32> = Vec::with_capacity(frame_size * 2);
 
-        // 定时器
-        let mut tick = interval(Duration::from_millis(10));
+        // 发送定时器（20ms，匹配音频帧）
+        let mut send_tick = interval(Duration::from_millis(20));
 
         loop {
             tokio::select! {
@@ -138,15 +138,22 @@ impl Client {
                     }
                 }
 
-                // 定时发送音频
-                _ = tick.tick() => {
-                    // 尝试读取音频数据
+                // 定时发送音频（每20ms一帧）
+                _ = send_tick.tick() => {
+                    // 读取所有可用音频数据（限制最大帧数）
+                    let mut frames_to_send = 0;
                     while let Some(chunk) = self.audio.read_frame() {
                         audio_buffer.extend_from_slice(&chunk);
+                        frames_to_send += 1;
+                        
+                        // 限制一次最多发送3帧，避免阻塞
+                        if frames_to_send >= 3 {
+                            break;
+                        }
                     }
                     
-                    // 累积到一帧后发送
-                    while audio_buffer.len() >= frame_size {
+                    // 发送一帧音频
+                    if audio_buffer.len() >= frame_size {
                         let frame: Vec<f32> = audio_buffer.drain(..frame_size).collect();
                         
                         // 编码并发送
