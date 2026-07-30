@@ -32,6 +32,7 @@ pub struct DeviceIdentity {
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct EfuseData {
     mac_address: Option<String>,
+    client_id: Option<String>,
     serial_number: Option<String>,
     hmac_key: Option<String>,
     activation_status: bool,
@@ -69,7 +70,8 @@ impl DeviceIdentity {
         };
 
         let device_id = data.mac_address.clone().unwrap_or_else(Self::generate_mac_address);
-        let client_id = Uuid::new_v4().to_string();
+        // 持久化的 client_id 优先；缺失时才生成新的（向后兼容旧 efuse 文件）
+        let client_id = data.client_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
         let serial_number = data.serial_number.clone().unwrap_or_default();
         let hmac_key = data.hmac_key.clone().unwrap_or_default();
 
@@ -124,67 +126,15 @@ impl DeviceIdentity {
         Ok(identity)
     }
 
-    /// 获取MAC地址（Windows实现）
+    /// 获取MAC地址（跨平台统一实现）
     fn generate_mac_address() -> String {
-        #[cfg(windows)]
-        {
-            Self::get_windows_mac_address()
-        }
-        #[cfg(not(windows))]
-        {
-            Self::get_unix_mac_address()
-        }
-    }
-
-    /// Windows: 生成随机 MAC 地址
-    #[cfg(windows)]
-    fn get_windows_mac_address() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        
-        // 使用时间戳生成伪随机 MAC
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        
-        // 生成 6 字节 MAC 地址（本地管理地址，避免冲突）
-        let bytes = [
-            ((now >> 40) & 0xFF) as u8 | 0x02, // 本地管理地址标志
-            ((now >> 32) & 0xFF) as u8,
-            ((now >> 24) & 0xFF) as u8,
-            ((now >> 16) & 0xFF) as u8,
-            ((now >> 8) & 0xFF) as u8,
-            (now & 0xFF) as u8,
-        ];
-        // 使用小写格式
+        // 使用 UUID v4 的随机字节（基于 getrandom，密码学安全）
+        // 相比时间戳，避免同秒内多次调用产生冲突
+        let bytes = *Uuid::new_v4().as_bytes();
+        // 第一字节：清多播位（bit0=0），设本地管理位（bit1=1），避免与全局唯一 MAC 冲突
+        let b0 = (bytes[0] & 0xFE) | 0x02;
         format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5])
-    }
-
-    /// Unix: 生成随机 MAC 地址
-    #[cfg(not(windows))]
-    fn get_unix_mac_address() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        // 使用时间戳生成伪随机 MAC
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-
-        // 生成 6 字节 MAC 地址（本地管理地址，避免冲突）
-        let bytes = [
-            ((now >> 40) & 0xFF) as u8 | 0x02, // 本地管理地址标志
-            ((now >> 32) & 0xFF) as u8,
-            ((now >> 24) & 0xFF) as u8,
-            ((now >> 16) & 0xFF) as u8,
-            ((now >> 8) & 0xFF) as u8,
-            (now & 0xFF) as u8,
-        ];
-
-        // 使用小写格式
-        format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5])
+            b0, bytes[1], bytes[2], bytes[3], bytes[4], bytes[5])
     }
 
     /// 获取测试用 MAC 地址（服务器自动授权）
@@ -212,6 +162,7 @@ impl DeviceIdentity {
     fn save(&self) -> Result<()> {
         let data = EfuseData {
             mac_address: Some(self.device_id.clone()),
+            client_id: Some(self.client_id.clone()),
             serial_number: Some(self.serial_number.clone()),
             hmac_key: Some(self.hmac_key.clone()),
             activation_status: self.activation_status,

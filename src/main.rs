@@ -15,6 +15,7 @@ mod protocol;
 
 use client::Client;
 use identity::DeviceIdentity;
+use ota::OtaConfig;
 
 #[derive(Parser)]
 #[command(name = "xiaozhi-rs")]
@@ -40,62 +41,20 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 自定义日志格式：本地时间 + 消息
+    // 自定义日志格式：本地时间（UTC+8）+ 消息
+    // 使用 O(1) 日期算法，避免每次日志都循环减年份
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
-            // 计算本地时间（UTC+8）
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
 
-            // UTC+8 转换
-            let local = now + 8 * 3600;
-            let days_since_epoch = local / 86400;
+            let local = now + 8 * 3600; // UTC+8
+            let days = (local / 86400) as i64;
             let secs = local % 86400;
 
-            // 正确的日期计算算法
-            fn days_in_year(year: i32) -> i32 {
-                if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) {
-                    366
-                } else {
-                    365
-                }
-            }
-
-            fn days_in_month(year: i32, month: u8) -> u8 {
-                match month {
-                    1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-                    4 | 6 | 9 | 11 => 30,
-                    2 => if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) { 29 } else { 28 },
-                    _ => 0,
-                }
-            }
-
-            // 计算年份
-            let mut year = 1970;
-            let mut days_left = days_since_epoch as i32;
-            loop {
-                let days = days_in_year(year);
-                if days_left < days {
-                    break;
-                }
-                days_left -= days;
-                year += 1;
-            }
-
-            // 计算月份和日期
-            let mut month: u8 = 1;
-            loop {
-                let days = days_in_month(year, month) as i32;
-                if days_left < days {
-                    break;
-                }
-                days_left -= days;
-                month += 1;
-            }
-
-            let day = (days_left + 1) as u8;
+            let (year, month, day) = civil_from_days(days);
             let hour = (secs / 3600) as u8;
             let min = ((secs % 3600) / 60) as u8;
             let sec = (secs % 60) as u8;
@@ -115,7 +74,7 @@ async fn main() -> Result<()> {
     if let Some(cmd) = cli.command {
         match cmd {
             Commands::Start { skip_activation } => {
-                run_client(skip_activation).await?;
+                run_with_signal(skip_activation).await?;
             }
             Commands::Info => {
                 show_device_info()?;
@@ -137,13 +96,41 @@ async fn main() -> Result<()> {
         println!("正在启动语音对话...");
         println!("(按 Ctrl+C 退出)");
         println!();
-        
-        run_client(false).await?;
+
+        run_with_signal(false).await?;
     }
 
     Ok(())
 }
 
+/// Howard Hinnant 的 civil_from_days 算法：O(1) 将"自 epoch 起的天数"转为 (年, 月, 日)
+/// 替代旧实现的逐年/逐月循环，高频日志下显著降低开销
+fn civil_from_days(z: i64) -> (i32, u8, u8) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let m = if mp < 10 { (mp + 3) as u8 } else { (mp - 9) as u8 };
+    let y = (y + if m <= 2 { 1 } else { 0 }) as i32;
+    (y, m, d)
+}
+
+/// 运行客户端，监听 Ctrl+C 优雅退出
+async fn run_with_signal(skip_activation: bool) -> Result<()> {
+    tokio::select! {
+        res = run_client(skip_activation) => res,
+        _ = tokio::signal::ctrl_c() => {
+            info!("收到 Ctrl+C 信号，正在退出...");
+            Ok(())
+        }
+    }
+}
+
+/// 启动客户端：身份加载 → 激活 → 连接 → 对话
 async fn run_client(skip_activation: bool) -> Result<()> {
     info!("正在启动小智客户端...");
 
@@ -156,51 +143,80 @@ async fn run_client(skip_activation: bool) -> Result<()> {
         info!("使用测试 MAC 地址: {}", identity.device_id);
     }
 
-    // 2. OTA 拉取配置
+    // 2. OTA 拉取配置 + 激活
+    let ota_config = ensure_activated(&mut identity, skip_activation).await?;
+
+    // 3. 连接并对话
+    connect_and_run(&identity, &ota_config).await
+}
+
+/// 确保设备已激活，返回 OTA 配置
+async fn ensure_activated(
+    identity: &mut DeviceIdentity,
+    skip_activation: bool,
+) -> Result<OtaConfig> {
     info!("正在从 OTA 服务器获取配置...");
-    let mut ota_config = ota::fetch_config(&identity).await?;
+    let mut ota_config = ota::fetch_config(identity).await?;
 
-    // 3. 检查激活状态
-    if !skip_activation && !identity.is_activated() {
-        const MAX_RETRIES: u32 = 5;
-        let mut retry_count = 0;
+    if skip_activation || identity.is_activated() {
+        return Ok(ota_config);
+    }
 
-        while retry_count < MAX_RETRIES {
-            if let Some(activation_data) = &ota_config.activation {
-                retry_count += 1;
-                info!("设备需要激活（尝试 {}/{}）", retry_count, MAX_RETRIES);
-                info!("请访问 https://xiaozhi.me/ 输入激活码：{}", activation_data.code);
-                
-                // 等待激活（60秒超时）
-                match ota::wait_for_activation(&identity, &activation_data.challenge, &activation_data.code).await {
-                    Ok(_) => {
-                        info!("激活成功！");
-                        identity.set_activated()?;
-                        break;
-                    }
-                    Err(e) => {
-                        if retry_count < MAX_RETRIES {
-                            info!("激活码已过期，正在重新获取...");
-                            // 重新获取配置（新的激活码）
-                            ota_config = ota::fetch_config(&identity).await?;
-                        } else {
-                            return Err(anyhow::anyhow!("激活失败，已达到最大重试次数: {}", e));
-                        }
+    const MAX_RETRIES: u32 = 5;
+    let mut retry_count = 0;
+
+    while retry_count < MAX_RETRIES {
+        if let Some(activation_data) = &ota_config.activation {
+            retry_count += 1;
+            info!("设备需要激活（尝试 {}/{}）", retry_count, MAX_RETRIES);
+            info!("请访问 https://xiaozhi.me/ 输入激活码：{}", activation_data.code);
+
+            // 等待激活（60秒超时）
+            match ota::wait_for_activation(
+                identity,
+                &activation_data.challenge,
+                &activation_data.code,
+            )
+            .await
+            {
+                Ok(_) => {
+                    info!("激活成功！");
+                    identity.set_activated()?;
+                    return Ok(ota_config);
+                }
+                Err(e) => {
+                    if retry_count < MAX_RETRIES {
+                        info!("激活码已过期，正在重新获取...");
+                        ota_config = ota::fetch_config(identity).await?;
+                    } else {
+                        return Err(anyhow::anyhow!("激活失败，已达到最大重试次数: {}", e));
                     }
                 }
-            } else {
-                // 没有激活数据，表示已激活
-                break;
             }
+        } else {
+            // 没有激活数据，表示已激活
+            return Ok(ota_config);
         }
     }
 
-    // 4. 连接 WebSocket
-    let ws_url = ota_config.websocket.url.ok_or_else(|| anyhow::anyhow!("未获取到 WebSocket URL"))?;
-    let token = ota_config.websocket.token.unwrap_or_else(|| "test-token".to_string());
+    Ok(ota_config)
+}
+
+/// 连接 WebSocket 并开始对话
+async fn connect_and_run(identity: &DeviceIdentity, ota_config: &OtaConfig) -> Result<()> {
+    let ws_url = ota_config
+        .websocket
+        .url
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("未获取到 WebSocket URL"))?;
+    let token = ota_config
+        .websocket
+        .token
+        .clone()
+        .unwrap_or_else(|| "test-token".to_string());
 
     info!("正在连接 WebSocket: {}", ws_url);
-    let mut client = Client::new(ws_url, token, identity.device_id, identity.client_id);
+    let mut client = Client::new(ws_url, token, identity.device_id.clone(), identity.client_id.clone());
     client.connect().await?;
 
     info!("已连接！开始语音对话...");

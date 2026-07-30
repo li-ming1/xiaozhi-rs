@@ -6,7 +6,7 @@ description = "小智客户端 - Rust 极简实现"
 
 [dependencies]
 # 异步运行时
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
@@ -32,7 +32,6 @@ clap = { version = "4", features = ["derive"] }
 
 # 错误处理
 anyhow = "1"
-thiserror = "2"
 
 # 目录
 directories = "5"
@@ -52,7 +51,6 @@ url = "2"
 
 # 音频
 cpal = "0.15"
-ringbuf = "0.4"  # 音频缓冲
 
 # Opus 编解码（使用 libloading 加载预编译库）
 libloading = "0.8"
@@ -61,8 +59,12 @@ libloading = "0.8"
 windows = { version = "0.58", features = ["Win32_Networking_WinSock", "Win32_Foundation"] }
 
 [profile.release]
-opt-level = "z"
+# 本项目音频 DSP（重采样/Opus）为计算密集型，整体提至 3；依赖库仍优化体积
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[profile.release.package."*"]
+opt-level = "z"

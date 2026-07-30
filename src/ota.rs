@@ -15,8 +15,6 @@ const OTA_URL: &str = "https://api.tenclass.net/xiaozhi/ota/";
 pub struct OtaConfig {
     pub websocket: WebSocketConfig,
     #[serde(default)]
-    pub mqtt: Option<MqttConfig>,
-    #[serde(default)]
     pub activation: Option<ActivationData>,
 }
 
@@ -24,16 +22,6 @@ pub struct OtaConfig {
 pub struct WebSocketConfig {
     pub url: Option<String>,
     pub token: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MqttConfig {
-    pub endpoint: Option<String>,
-    pub client_id: Option<String>,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub publish_topic: Option<String>,
-    pub subscribe_topic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,7 +80,6 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
             url: None,
             token: None,
         },
-        mqtt: None,
         activation: None,
     };
 
@@ -100,11 +87,6 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
     if let Some(ws) = ota_response.get("websocket") {
         config.websocket.url = ws.get("url").and_then(|v| v.as_str()).map(String::from);
         config.websocket.token = ws.get("token").and_then(|v| v.as_str()).map(String::from);
-    }
-
-    // 提取 MQTT 配置
-    if let Some(mqtt) = ota_response.get("mqtt") {
-        config.mqtt = Some(serde_json::from_value(mqtt.clone())?);
     }
 
     // 提取激活数据

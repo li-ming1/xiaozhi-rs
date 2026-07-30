@@ -168,36 +168,4 @@ impl WebSocketProtocol {
             Err(anyhow!("未连接"))
         }
     }
-
-    /// 尝试接收消息（非阻塞）
-    #[allow(dead_code)]
-    pub fn try_receive(&self) -> Result<Option<ReceivedMessage>> {
-        // 注意：这个实现需要同步访问 WebSocket，这里简化处理
-        // 实际应该使用 tokio::select! 或单独的接收任务
-        Ok(None)
-    }
-
-    /// 接收 JSON 消息（兼容旧接口）
-    pub async fn receive_json(&self) -> Result<ServerMessage> {
-        match self.receive().await? {
-            ReceivedMessage::Json(msg) => Ok(msg),
-            ReceivedMessage::Audio(_) => Err(anyhow!("期望 JSON，收到音频")),
-        }
-    }
-
-    /// 关闭连接
-    #[allow(dead_code)]
-    pub async fn close(&mut self) -> Result<()> {
-        if let Some(ws) = self.ws.take() {
-            ws.lock().await.close(None).await?;
-            info!("WebSocket 已关闭");
-        }
-        Ok(())
-    }
-
-    /// 检查是否已连接
-    #[allow(dead_code)]
-    pub fn is_connected(&self) -> bool {
-        self.ws.is_some()
-    }
 }

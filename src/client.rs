@@ -57,27 +57,34 @@ impl Client {
     /// 开始语音对话（全双工）
     pub async fn start_conversation(&mut self) -> Result<()> {
         const MAX_RETRIES: u32 = 5;
-        let mut retry_count = 0;
+        // 分离两个计数器：对话失败与重连失败各自独立
+        // 旧实现重连成功即重置对话计数，会导致"对话持续失败但重连一直成功"的死循环
+        let mut conv_failures = 0u32;
+        let mut reconnect_failures = 0u32;
 
         loop {
             match self.run_conversation().await {
                 Ok(_) => break,
                 Err(e) => {
-                    if retry_count >= MAX_RETRIES {
+                    conv_failures += 1;
+                    if conv_failures >= MAX_RETRIES {
                         return Err(e);
                     }
-                    
-                    retry_count += 1;
-                    let delay = std::cmp::min(retry_count * 2, 10);
-                    warn!("连接断开: {}，{}秒后重试 ({}/{})", e, delay, retry_count, MAX_RETRIES);
-                    
+
+                    let delay = std::cmp::min(conv_failures * 2, 10);
+                    warn!("连接断开: {}，{}秒后重试 (对话失败 {}/{})", e, delay, conv_failures, MAX_RETRIES);
+
                     tokio::time::sleep(Duration::from_secs(delay as u64)).await;
-                    
-                    // 重连
-                    if let Err(e) = self.reconnect().await {
-                        warn!("重连失败: {}", e);
+
+                    // 重连：失败独立计数，不因重连成功而重置对话失败计数
+                    if let Err(re) = self.reconnect().await {
+                        reconnect_failures += 1;
+                        warn!("重连失败: {} (重连失败 {}/{})", re, reconnect_failures, MAX_RETRIES);
+                        if reconnect_failures >= MAX_RETRIES {
+                            return Err(re);
+                        }
                     } else {
-                        retry_count = 0; // 重置重试计数
+                        reconnect_failures = 0;
                     }
                 }
             }
@@ -105,10 +112,6 @@ impl Client {
         self.audio.start_playback()?;
 
         info!("开始实时对话（按 Ctrl+C 退出）");
-
-        // 音频帧缓冲
-        let frame_size = crate::audio::FRAME_SIZE;
-        let mut audio_buffer: Vec<f32> = Vec::with_capacity(frame_size * 2);
 
         // 发送定时器（20ms，匹配音频帧）
         let mut send_tick = interval(Duration::from_millis(20));
@@ -138,24 +141,10 @@ impl Client {
                     }
                 }
 
-                // 定时发送音频（每20ms一帧）
+                // 定时发送音频（每 20ms 一帧）
+                // 每次 tick 只取一帧发送，避免缓冲累积导致延迟线性增长
                 _ = send_tick.tick() => {
-                    // 读取所有可用音频数据（限制最大帧数）
-                    let mut frames_to_send = 0;
-                    while let Some(chunk) = self.audio.read_frame() {
-                        audio_buffer.extend_from_slice(&chunk);
-                        frames_to_send += 1;
-                        
-                        // 限制一次最多发送3帧，避免阻塞
-                        if frames_to_send >= 3 {
-                            break;
-                        }
-                    }
-                    
-                    // 发送一帧音频
-                    if audio_buffer.len() >= frame_size {
-                        let frame: Vec<f32> = audio_buffer.drain(..frame_size).collect();
-                        
+                    if let Some(frame) = self.audio.read_frame() {
                         // 编码并发送
                         match self.opus.encode(&frame) {
                             Ok(encoded) => {
@@ -181,43 +170,36 @@ impl Client {
 
     /// 处理 JSON 消息
     fn handle_json_message(&mut self, msg: ServerMessage) -> Result<()> {
+        use crate::message::TtsState;
         match msg {
-            ServerMessage::Tts { state: tts_state, text } => {
+            ServerMessage::Tts { state: tts_state, text: _ } => {
+                // TTS 只负责状态机切换，不显示文本
+                // 文本统一由 LLM 消息显示，避免 Stt/Llm/Tts 三处重复
                 match tts_state {
-                    crate::message::TtsState::Start => {
+                    TtsState::Start => {
                         self.state = State::Speaking;
                         info!("AI 开始说话");
                     }
-                    crate::message::TtsState::Stop => {
+                    TtsState::Stop => {
                         self.state = State::Listening;
                         info!("AI 说完，继续监听");
                     }
-                    crate::message::TtsState::SentenceStart => {
-                        debug!("AI 开始句子");
-                    }
-                    crate::message::TtsState::SentenceStop | crate::message::TtsState::SentenceEnd => {
-                        debug!("AI 句子结束");
-                    }
-                }
-                // 只在 TTS stop 时显示文本（避免重复）
-                if matches!(tts_state, crate::message::TtsState::SentenceStop | crate::message::TtsState::SentenceEnd) {
-                    if let Some(text) = text {
-                        info!("AI: {}", text);
+                    TtsState::SentenceStart | TtsState::SentenceStop | TtsState::SentenceEnd => {
+                        debug!("TTS 句子状态: {:?}", tts_state);
                     }
                 }
             }
-            ServerMessage::Listen { state: listen_state, text } => {
-                info!("监听状态: {}", listen_state);
-                if let Some(text) = text {
-                    info!("用户: {}", text);
-                }
+            ServerMessage::Listen { state: listen_state, text: _ } => {
+                debug!("监听状态: {}", listen_state);
             }
             ServerMessage::Stt { text, state: _ } => {
-                info!("语音识别: {}", text);
+                // 用户语音识别结果（用户说的话）
+                info!("用户: {}", text);
             }
             ServerMessage::Llm { text, emotion } => {
+                // AI 完整回复文本（一次显示，不与 TTS 分句重复）
                 if let Some(text) = text {
-                    info!("AI 回复: {}", text);
+                    info!("AI: {}", text);
                 }
                 if let Some(emotion) = emotion {
                     debug!("AI 表情: {}", emotion);
@@ -235,21 +217,5 @@ impl Client {
             }
         }
         Ok(())
-    }
-
-    /// 关闭连接
-    #[allow(dead_code)]
-    pub async fn close(&mut self) -> Result<()> {
-        self.audio.stop_capture();
-        self.audio.stop_playback();
-        self.protocol.close().await?;
-        self.state = State::Idle;
-        Ok(())
-    }
-
-    /// 获取状态
-    #[allow(dead_code)]
-    pub fn state(&self) -> State {
-        self.state
     }
 }

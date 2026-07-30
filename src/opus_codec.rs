@@ -31,6 +31,11 @@ pub struct OpusCodec {
     decoder: *mut std::ffi::c_void,
     encode_float: Symbol<'static, OpusEncodeFloat>,
     decode_float: Symbol<'static, OpusDecodeFloat>,
+    encoder_destroy: Symbol<'static, OpusEncoderDestroy>,
+    decoder_destroy: Symbol<'static, OpusDecoderDestroy>,
+    // 复用编码/解码缓冲，避免每帧分配（20ms 一帧 = 每秒 50 次分配）
+    encode_buf: Vec<u8>,
+    decode_buf: Vec<f32>,
 }
 
 // 确保线程安全
@@ -95,6 +100,14 @@ impl OpusCodec {
             library.get(b"opus_decode_float\0")
                 .map_err(|e| anyhow!("无法加载 opus_decode_float: {}", e))?
         };
+        let encoder_destroy: Symbol<OpusEncoderDestroy> = unsafe {
+            library.get(b"opus_encoder_destroy\0")
+                .map_err(|e| anyhow!("无法加载 opus_encoder_destroy: {}", e))?
+        };
+        let decoder_destroy: Symbol<OpusDecoderDestroy> = unsafe {
+            library.get(b"opus_decoder_destroy\0")
+                .map_err(|e| anyhow!("无法加载 opus_decoder_destroy: {}", e))?
+        };
 
         // 创建编码器
         let mut error: c_int = 0;
@@ -114,9 +127,11 @@ impl OpusCodec {
 
         info!("Opus 编解码器初始化成功");
 
-        // 泄露符号的生命周期（因为 library 是 Arc）
+        // 泄露符号的生命周期（因为 library 是 Arc，存活不短于本结构体）
         let encode_float = unsafe { std::mem::transmute(encode_float) };
         let decode_float = unsafe { std::mem::transmute(decode_float) };
+        let encoder_destroy = unsafe { std::mem::transmute(encoder_destroy) };
+        let decoder_destroy = unsafe { std::mem::transmute(decoder_destroy) };
 
         Ok(Self {
             _library: library,
@@ -124,6 +139,10 @@ impl OpusCodec {
             decoder,
             encode_float,
             decode_float,
+            encoder_destroy,
+            decoder_destroy,
+            encode_buf: vec![0u8; MAX_PACKET_SIZE],
+            decode_buf: vec![0.0f32; FRAME_SIZE],
         })
     }
 
@@ -131,20 +150,19 @@ impl OpusCodec {
     ///
     /// input: f32 PCM 数据（16kHz, 单声道, 320样本/帧）
     /// 返回: Opus 压缩数据
-    pub fn encode(&self, input: &[f32]) -> Result<Vec<u8>> {
+    pub fn encode(&mut self, input: &[f32]) -> Result<Vec<u8>> {
         if input.len() != FRAME_SIZE {
             return Err(anyhow!("输入帧大小不正确: {} (期望 {})", input.len(), FRAME_SIZE));
         }
 
-        let mut output = vec![0u8; MAX_PACKET_SIZE];
-
+        // 复用 encode_buf，避免每帧分配 4000 字节
         #[allow(unused_unsafe)]
         let len = unsafe {
             (self.encode_float)(
                 self.encoder,
                 input.as_ptr(),
                 FRAME_SIZE as c_int,
-                output.as_mut_ptr(),
+                self.encode_buf.as_mut_ptr(),
                 MAX_PACKET_SIZE as c_int,
             )
         };
@@ -153,24 +171,22 @@ impl OpusCodec {
             return Err(anyhow!("Opus 编码失败: {}", len));
         }
 
-        output.truncate(len as usize);
-        Ok(output)
+        Ok(self.encode_buf[..len as usize].to_vec())
     }
 
     /// 解码 Opus 数据为 PCM
     ///
     /// input: Opus 压缩数据
     /// 返回: f32 PCM 数据（16kHz, 单声道, 320样本/帧）
-    pub fn decode(&self, input: &[u8]) -> Result<Vec<f32>> {
-        let mut output = vec![0.0f32; FRAME_SIZE];
-
+    pub fn decode(&mut self, input: &[u8]) -> Result<Vec<f32>> {
+        // 复用 decode_buf，避免每帧分配 1280 字节
         #[allow(unused_unsafe)]
         let samples = unsafe {
             (self.decode_float)(
                 self.decoder,
                 input.as_ptr(),
                 input.len() as c_int,
-                output.as_mut_ptr(),
+                self.decode_buf.as_mut_ptr(),
                 FRAME_SIZE as c_int,
                 0, // decode_fec
             )
@@ -181,29 +197,22 @@ impl OpusCodec {
         }
 
         if samples as usize != FRAME_SIZE {
-            // 不匹配时调整大小
-            output.truncate(samples as usize);
-            output.resize(FRAME_SIZE, 0.0);
+            // 不匹配时补零到 FRAME_SIZE
+            self.decode_buf[samples as usize..].fill(0.0);
         }
 
-        Ok(output)
+        Ok(self.decode_buf.clone())
     }
 }
 
 impl Drop for OpusCodec {
     fn drop(&mut self) {
-        // 加载销毁函数
-        unsafe {
-            if let Ok(encoder_destroy) = self._library.get::<Symbol<OpusEncoderDestroy>>(b"opus_encoder_destroy\0") {
-                if !self.encoder.is_null() {
-                    encoder_destroy(self.encoder);
-                }
-            }
-            if let Ok(decoder_destroy) = self._library.get::<Symbol<OpusDecoderDestroy>>(b"opus_decoder_destroy\0") {
-                if !self.decoder.is_null() {
-                    decoder_destroy(self.decoder);
-                }
-            }
+        // 直接调用已加载的 destroy 函数，无需每次重新 get 符号
+        if !self.encoder.is_null() {
+            (self.encoder_destroy)(self.encoder);
+        }
+        if !self.decoder.is_null() {
+            (self.decoder_destroy)(self.decoder);
         }
     }
 }
