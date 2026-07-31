@@ -1,7 +1,4 @@
-//! WebSocket 协议实现（收发分离，无锁互不阻塞）
-//!
-//! 将 WebSocketStream split 为独立的发送端与接收端，
-//! 消除旧 Arc<Mutex<Stream>> 架构中 receive 持锁跨 await 阻塞 send 的互锁问题。
+//! WebSocket 协议：split 收发双端，消除持锁跨 await 的收发互锁。
 
 use anyhow::{anyhow, Result};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -18,15 +15,14 @@ use crate::message::{Message, ServerMessage};
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// 接收到的消息类型
+/// 业务层可消费的消息。Audio 持有引用计数的 Bytes，解码时 deref 零拷贝。
 #[derive(Debug)]
 pub enum ReceivedMessage {
     Json(ServerMessage),
-    /// 直接持有 tungstenite 的 Bytes（引用计数，零拷贝），decode 时 deref 到 &[u8]
     Audio(Bytes),
 }
 
-/// WebSocket 发送端（持有 SplitSink，与接收端独立，无锁）
+/// 发送端：独占 SplitSink，与接收端无共享状态。
 pub struct WsSender {
     sink: SplitSink<WsStream, WsMessage>,
 }
@@ -43,8 +39,7 @@ impl WsSender {
     }
 
     pub async fn send_audio(&mut self, data: Vec<u8>) -> Result<()> {
-        // 接受 owned Vec 直接 move，省一次 to_vec 拷贝
-        // 音频帧每秒 50 次，debug 日志会刷屏且字节数可预测，故不记录
+        // owned Vec 直接 move，省一次 to_vec；音频帧高频且字节数可预测，故不打日志。
         self.sink
             .send(WsMessage::Binary(data.into()))
             .await
@@ -52,7 +47,7 @@ impl WsSender {
         Ok(())
     }
 
-    /// 发送心跳 Ping（保活 + 触发 Sink flush，让 tungstenite 自动排队的 Pong 一并发出）
+    /// 心跳 Ping：兼触发 Sink flush，排空底层自动排队的 Pong。
     pub async fn send_ping(&mut self, payload: Vec<u8>) -> Result<()> {
         debug!("发送 Ping: {} 字节", payload.len());
         self.sink
@@ -63,16 +58,14 @@ impl WsSender {
     }
 }
 
-/// WebSocket 接收端（持有 SplitStream，与发送端独立，无锁）
+/// 接收端：独占 SplitStream，与发送端无共享状态。
 pub struct WsReceiver {
     stream: SplitStream<WsStream>,
 }
 
 impl WsReceiver {
     pub async fn receive(&mut self) -> Result<ReceivedMessage> {
-        // 循环直到拿到业务消息（Text/Binary）。
-        // Ping/Pong 等控制帧由 tungstenite 底层自动处理（收到 Ping 会自动排队 Pong，
-        // 下次 Sink send/flush 时发出），应用层只需忽略并继续等待下一条消息。
+        // 控制帧由底层自动处理（收到 Ping 自动排队 Pong，随下次 flush 发出），应用层忽略并续等。
         loop {
             match self.stream.next().await {
                 Some(Ok(WsMessage::Text(text))) => {
@@ -81,15 +74,12 @@ impl WsReceiver {
                     return Ok(ReceivedMessage::Json(msg));
                 }
                 Some(Ok(WsMessage::Binary(data))) => {
-                    // 音频帧每秒 50 次，debug 日志会刷屏且字节数可预测，故不记录
                     return Ok(ReceivedMessage::Audio(data));
                 }
                 Some(Ok(WsMessage::Ping(payload))) => {
-                    // tungstenite 已自动排队 Pong，无需手动回复
                     debug!("收到 Ping: {} 字节（已自动排队 Pong）", payload.len());
                 }
                 Some(Ok(WsMessage::Pong(payload))) => {
-                    // 心跳响应，保活确认
                     debug!("收到 Pong: {} 字节", payload.len());
                 }
                 Some(Ok(WsMessage::Close(close_frame))) => {
@@ -97,7 +87,6 @@ impl WsReceiver {
                     return Err(anyhow!("连接已关闭: {:?}", close_frame));
                 }
                 Some(Ok(msg)) => {
-                    // 其他帧（理论上协议层不会上抛），忽略继续
                     warn!("收到未处理的消息类型: {:?}", msg);
                 }
                 Some(Err(e)) => return Err(anyhow!("WebSocket错误: {}", e)),
@@ -107,10 +96,7 @@ impl WsReceiver {
     }
 }
 
-/// 连接 WebSocket 并完成握手
-///
-/// 返回 (发送端, 接收端, session_id)。
-/// 收发分离后，receive 等待消息时不再阻塞 send，彻底消除收发互锁。
+/// 建连并完成握手，返回 (发送端, 接收端, session_id)；收发分离后互不阻塞。
 pub async fn connect_and_handshake(
     url: &str,
     token: &str,
@@ -119,12 +105,10 @@ pub async fn connect_and_handshake(
 ) -> Result<(WsSender, WsReceiver, String)> {
     info!("正在连接: {}", url);
 
-    // rustls 自动使用 webpki-roots（Mozilla 根证书），connector 传 None 即可，
-    // 无需 native-tls / 系统 OpenSSL 依赖
+    // connector 传 None 即启用 webpki-roots，免 native-tls/OpenSSL 依赖。
     let uri: http::Uri = url
         .parse()
         .map_err(|e| anyhow!("URI 解析失败: {}", e))?;
-    // Host 从 URL 解析，避免硬编码
     let host = uri
         .host()
         .ok_or_else(|| anyhow!("URL 缺少 host: {}", url))?
@@ -151,14 +135,13 @@ pub async fn connect_and_handshake(
         .await
         .map_err(|e| anyhow!("WebSocket 连接失败: {}", e))?;
 
-    // split：收发分离，消除互锁
+    // split 收发双端，消除互锁。
     let (sink, stream) = ws_stream.split();
     let mut sender = WsSender { sink };
     let mut receiver = WsReceiver { stream };
 
     info!("WebSocket 连接成功");
 
-    // 握手
     let hello = Message::hello();
     info!("发送 hello: {}", serde_json::to_string(&hello)?);
     sender.send_json(&hello).await?;

@@ -1,24 +1,33 @@
-//! 音频采集和播放
-//!
-//! 支持高质量重采样（Catmull-Rom 三次样条，带块边界相位连续性）
+//! 音频采集与播放。重采样采用 Catmull-Rom 三次样条，于块边界维持相位连续。
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, StreamConfig};
+use cpal::{Device, FromSample, SampleFormat, Stream, StreamConfig};
 use log::{info, warn};
 use std::collections::VecDeque;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-/// 音频配置
+/// 目标采样率（Opus 窄带语音）。
 pub const SAMPLE_RATE: u32 = 16000;
 pub const FRAME_DURATION_MS: u32 = 20;
 pub const FRAME_SIZE: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize;
 
-/// 高质量重采样器（Catmull-Rom 三次样条，保持跨块相位连续）
-///
-/// 仅保存前一次输入的最后一个样本作为本次 input[-1]，
-/// 用于块起始处 Catmull-Rom 的 y0，避免波形不连续产生的高频杂音。
+/// 抖动缓冲容量：25 帧 ≈ 500ms。余量过小会在网络突发/时钟漂移时丢新帧，引入可闻咔哒。
+const FRAME_QUEUE_CAP: usize = 25;
+
+/// 入队；溢出时丢最旧帧以封顶延迟，丢帧计数并限频告警（[DROP] 便于 grep）。
+fn push_frame(queue: &mut VecDeque<[f32; FRAME_SIZE]>, dropped: &mut u64, frame: [f32; FRAME_SIZE], side: &str) {
+    if queue.len() >= FRAME_QUEUE_CAP {
+        queue.pop_front();
+        *dropped += 1;
+        if *dropped % 50 == 1 {
+            warn!("[DROP] {}队列溢出（消费端落后），累计丢最旧帧 {} 次", side, dropped);
+        }
+    }
+    queue.push_back(frame);
+}
+
+/// Catmull-Rom 三次样条重采样器，跨块复用前一输入末样本作 y0，抑制边界高频伪影。
 struct Resampler {
     prev_last: f32,
 }
@@ -28,9 +37,7 @@ impl Resampler {
         Self { prev_last: 0.0 }
     }
 
-    /// 重采样写入复用 buffer（输出长度 = input.len() * ratio），零堆分配
-    ///
-    /// 调用方持有一个可复用的 Vec<f32> 传入，避免每帧 with_capacity 分配。
+    /// 重采样至复用缓冲（输出长度 = input.len() * ratio），全程零堆分配。
     fn process(&mut self, input: &[f32], ratio: f64, output: &mut Vec<f32>) {
         output.clear();
         if input.is_empty() || ratio <= 0.0 {
@@ -47,10 +54,7 @@ impl Resampler {
             let src_idx = src_pos.floor() as usize;
             let frac = (src_pos - src_idx as f64) as f32;
 
-            // Catmull-Rom 四点：
-            //   y0 = input[src_idx-1]（src_idx==0 时用前一块末尾 prev_last）
-            //   y1 = input[src_idx]
-            //   y2/y3 越界时钳位到末尾样本
+            // Catmull-Rom 四点；y0 以 prev_last 封头，y2/y3 越界钳位至末样本。
             let y0 = if src_idx == 0 { self.prev_last } else { input[src_idx - 1] };
             let y1 = input[src_idx];
             let y2 = if src_idx < last { input[src_idx + 1] } else { input[last] };
@@ -69,20 +73,22 @@ impl Resampler {
     }
 }
 
-/// 输入端共享状态（缓冲 + 重采样器），单次加锁
+/// 输入端共享状态：环形缓冲 + 有界帧队列 + 重采样器，单次加锁。
 struct InputState {
-    buffer: Vec<f32>,
+    buffer: VecDeque<f32>,
+    queue: VecDeque<[f32; FRAME_SIZE]>,
+    dropped: u64,
     resampler: Resampler,
-    // 复用单声道缓冲，避免输入回调每次分配
-    mono_buf: Vec<f32>,
-    // 复用重采样输出缓冲，避免每帧 Vec 分配
-    resampled: Vec<f32>,
+    mono_buf: Vec<f32>,   // 复用，免每帧分配
+    resampled: Vec<f32>,  // 复用，免每帧分配
 }
 
 impl InputState {
     fn new() -> Self {
         Self {
-            buffer: Vec::with_capacity(FRAME_SIZE * 4),
+            buffer: VecDeque::with_capacity(FRAME_SIZE * 4),
+            queue: VecDeque::with_capacity(FRAME_QUEUE_CAP),
+            dropped: 0,
             resampler: Resampler::new(),
             mono_buf: Vec::new(),
             resampled: Vec::with_capacity(FRAME_SIZE * 2),
@@ -90,12 +96,12 @@ impl InputState {
     }
 }
 
-/// 输出端共享状态（缓冲 + 重采样器），单次加锁
+/// 输出端共享状态：单声道缓冲 + 有界帧队列 + 重采样器，单次加锁。
 struct OutputState {
-    /// 单声道样本缓冲（输出时按 channels 展开，避免提前展开浪费空间/转码）
-    buffer: VecDeque<f32>,
+    buffer: VecDeque<f32>,  // 单声道，播放时按 channels 展开
+    queue: VecDeque<[f32; FRAME_SIZE]>,
+    dropped: u64,
     resampler: Resampler,
-    // 复用重采样输出缓冲
     resampled: Vec<f32>,
 }
 
@@ -103,24 +109,26 @@ impl OutputState {
     fn new() -> Self {
         Self {
             buffer: VecDeque::with_capacity(4096),
+            queue: VecDeque::with_capacity(FRAME_QUEUE_CAP),
+            dropped: 0,
             resampler: Resampler::new(),
             resampled: Vec::with_capacity(FRAME_SIZE * 2),
         }
     }
 }
 
-/// 音频管理器
+/// 音频管理器：封装 cpal 流与双端共享状态。
 pub struct AudioManager {
     input_device: Device,
     output_device: Device,
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
-    input_rx: Option<Receiver<[f32; FRAME_SIZE]>>,
-    output_tx: Option<Sender<[f32; FRAME_SIZE]>>,
+    input_state: Option<Arc<Mutex<InputState>>>,
+    output_state: Option<Arc<Mutex<OutputState>>>,
 }
 
 impl AudioManager {
-    /// 创建音频管理器
+    /// 探测默认设备并构造管理器（设备缺失即报错）。
     pub fn new() -> Result<Self> {
         let host = cpal::default_host();
 
@@ -132,7 +140,7 @@ impl AudioManager {
             .default_output_device()
             .ok_or_else(|| anyhow!("未找到输出设备"))?;
 
-        // cpal 0.18: Device 实现 Display，直接 {} 格式化即设备名
+        // cpal 0.18 的 Device 实现 Display，{} 即设备名。
         info!("输入设备: {}", input_device);
         info!("输出设备: {}", output_device);
 
@@ -141,8 +149,8 @@ impl AudioManager {
             output_device,
             input_stream: None,
             output_stream: None,
-            input_rx: None,
-            output_tx: None,
+            input_state: None,
+            output_state: None,
         })
     }
 
@@ -160,38 +168,20 @@ impl AudioManager {
         let input_sample_rate = config.sample_rate;
         let input_channels = config.channels as usize;
 
-        let (tx, rx) = channel::<[f32; FRAME_SIZE]>();
-        self.input_rx = Some(rx);
-
-        // 重采样比例：目标 16kHz / 输入采样率
         let resample_ratio = SAMPLE_RATE as f64 / input_sample_rate as f64;
 
-        // 共享状态：缓冲 + 重采样器（单次加锁）
         let state = Arc::new(Mutex::new(InputState::new()));
+        self.input_state = Some(state.clone());
 
         let stream = match sample_format {
-            SampleFormat::I16 => {
-                let state = state.clone();
-                self.input_device.build_input_stream(
-                    config,
-                    move |data: &[i16], _: &_| {
-                        process_input_chunk(data, input_channels, |s| s as f32 / 32768.0, resample_ratio, &state, &tx);
-                    },
-                    |err| warn!("输入流错误: {}", err),
-                    None,
-                )?
-            }
-            SampleFormat::F32 => {
-                let state = state.clone();
-                self.input_device.build_input_stream(
-                    config,
-                    move |data: &[f32], _: &_| {
-                        process_input_chunk(data, input_channels, |s| s, resample_ratio, &state, &tx);
-                    },
-                    |err| warn!("输入流错误: {}", err),
-                    None,
-                )?
-            }
+            SampleFormat::I16 => build_input_stream(
+                &self.input_device, config, input_channels,
+                |s: i16| s as f32 / 32768.0, resample_ratio, &state,
+            )?,
+            SampleFormat::F32 => build_input_stream(
+                &self.input_device, config, input_channels,
+                |s: f32| s, resample_ratio, &state,
+            )?,
             _ => return Err(anyhow!("不支持的采样格式: {:?}", sample_format)),
         };
 
@@ -215,38 +205,21 @@ impl AudioManager {
         let output_sample_rate = config.sample_rate;
         let output_channels = config.channels as usize;
 
-        let (tx, rx): (Sender<[f32; FRAME_SIZE]>, Receiver<[f32; FRAME_SIZE]>) = channel();
-        self.output_tx = Some(tx);
-
-        // 重采样比例：输出采样率 / 16kHz
         let resample_ratio = output_sample_rate as f64 / SAMPLE_RATE as f64;
 
-        // 共享状态：VecDeque 缓冲（pop_front O(1)）+ 重采样器
         let state = Arc::new(Mutex::new(OutputState::new()));
+        self.output_state = Some(state.clone());
 
         let stream = match sample_format {
-            SampleFormat::I16 => {
-                let state = state.clone();
-                self.output_device.build_output_stream(
-                    config,
-                    move |data: &mut [i16], _: &_| {
-                        fill_output(data, output_channels, resample_ratio, &state, &rx);
-                    },
-                    |err| warn!("输出流错误: {}", err),
-                    None,
-                )?
-            }
-            SampleFormat::F32 => {
-                let state = state.clone();
-                self.output_device.build_output_stream(
-                    config,
-                    move |data: &mut [f32], _: &_| {
-                        fill_output(data, output_channels, resample_ratio, &state, &rx);
-                    },
-                    |err| warn!("输出流错误: {}", err),
-                    None,
-                )?
-            }
+            SampleFormat::I16 => build_output_stream::<i16>(
+                &self.output_device, config, output_channels, resample_ratio, &state,
+            )?,
+            SampleFormat::F32 => build_output_stream::<f32>(
+                &self.output_device, config, output_channels, resample_ratio, &state,
+            )?,
+            SampleFormat::U16 => build_output_stream::<u16>(
+                &self.output_device, config, output_channels, resample_ratio, &state,
+            )?,
             _ => return Err(anyhow!("不支持的采样格式: {:?}", sample_format)),
         };
 
@@ -256,58 +229,103 @@ impl AudioManager {
         Ok(())
     }
 
-    /// 读取音频帧（从输入通道）
+    /// 从输入队列取一帧。
     pub fn read_frame(&self) -> Option<[f32; FRAME_SIZE]> {
-        self.input_rx.as_ref()?.try_recv().ok()
+        self.input_state.as_ref()?.lock().unwrap().queue.pop_front()
     }
 
-    /// 写入音频帧（到输出通道）
+    /// 写入输出队列（满丢最旧帧）。
     pub fn write_frame(&self, frame: [f32; FRAME_SIZE]) {
-        if let Some(tx) = &self.output_tx {
-            if tx.send(frame).is_err() {
-                warn!("输出通道已关闭");
-            }
+        if let Some(state) = &self.output_state {
+            // 显式 deref 以解锁字段级 disjoint borrow。
+            let st = &mut *state.lock().unwrap();
+            push_frame(&mut st.queue, &mut st.dropped, frame, "输出");
         }
     }
 
-    /// 停止音频采集和播放
-    ///
-    /// drop Stream 即停止回调。用于对话失败重连等待期间释放设备、避免
-    /// 输入回调持续往无界 channel 灌数据导致旧音频积压（重连后播放历史延迟）。
+    /// 停止流并清空队列，避免重连后回放历史积压。
     pub fn stop(&mut self) {
         self.input_stream = None;
         self.output_stream = None;
+        if let Some(state) = &self.input_state {
+            let mut st = state.lock().unwrap();
+            st.queue.clear();
+            st.buffer.clear();
+        }
+        if let Some(state) = &self.output_state {
+            let mut st = state.lock().unwrap();
+            st.queue.clear();
+            st.buffer.clear();
+        }
     }
 }
 
-/// 样本到 f32 的转换 trait（消除输出回调 I16/F32 重复）
-/// 继承 Copy：输出填充时单个样本转码一次后需复制到 channels 个槽，Copy 让赋值零成本。
-trait FromF32Sample: Copy {
-    fn from_f32_sample(v: f32) -> Self;
+/// 构建输入流；泛型样本类型消除 I16/F32 分支。
+fn build_input_stream<S>(
+    device: &Device,
+    config: StreamConfig,
+    channels: usize,
+    to_f32: fn(S) -> f32,
+    ratio: f64,
+    state: &Arc<Mutex<InputState>>,
+) -> Result<Stream>
+where
+    S: cpal::SizedSample + Copy + Send + 'static,
+{
+    let state = state.clone();
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[S], _: &_| {
+            process_input_chunk(data, channels, to_f32, ratio, &state);
+        },
+        |err| warn!("输入流错误: {}", err),
+        None,
+    )?;
+    Ok(stream)
 }
-impl FromF32Sample for i16 {
-    fn from_f32_sample(v: f32) -> Self {
-        (v * 32767.0) as i16
-    }
+
+/// 构建输出流；泛型样本类型消除 I16/F32/U16 分支。
+fn build_output_stream<T>(
+    device: &Device,
+    config: StreamConfig,
+    channels: usize,
+    ratio: f64,
+    state: &Arc<Mutex<OutputState>>,
+) -> Result<Stream>
+where
+    T: FromF32Sample + cpal::SizedSample + Send + 'static,
+{
+    let state = state.clone();
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &_| {
+            fill_output(data, channels, ratio, &state);
+        },
+        |err| warn!("输出流错误: {}", err),
+        None,
+    )?;
+    Ok(stream)
 }
-impl FromF32Sample for f32 {
+
+/// f32 → 输出样本的转换 trait。继承 Copy：单样本转码一次后展开至 channels 槽，零成本。
+trait FromF32Sample: Copy + FromSample<f32> {
     fn from_f32_sample(v: f32) -> Self {
-        v
+        <Self as FromSample<f32>>::from_sample_(v)
     }
 }
 
-/// 输入回调共用处理：多声道转单声道（复用 mono_buf）→ 重采样（复用 resampled）→ 入缓冲 → 取完整帧发送
+impl<T> FromF32Sample for T where T: Copy + FromSample<f32> {}
+
+/// 输入回调：混为单声道 → 重采样 → 入缓冲 → 满帧入队。
 fn process_input_chunk<S: Copy>(
     samples: &[S],
     channels: usize,
     to_f32: impl Fn(S) -> f32,
     ratio: f64,
     state: &Arc<Mutex<InputState>>,
-    tx: &Sender<[f32; FRAME_SIZE]>,
 ) {
     let mut s = state.lock().unwrap();
-    // deref 到 &mut InputState 以支持字段级 disjoint borrow
-    // （process 需 &mut resampler + &mono_buf + &mut resampled，同为结构体字段，disjoint 允许）
+    // 显式 deref 解锁字段级 disjoint borrow（resampler 与缓冲同属结构体字段）。
     let st = &mut *s;
     st.mono_buf.clear();
     if channels == 1 {
@@ -320,42 +338,46 @@ fn process_input_chunk<S: Copy>(
         );
     }
     st.resampler.process(&st.mono_buf, ratio, &mut st.resampled);
-    st.buffer.extend_from_slice(&st.resampled);
+    st.buffer.extend(st.resampled.iter().copied());
     while st.buffer.len() >= FRAME_SIZE {
-        // 用栈数组替代 Vec，避免每帧堆分配
+        // 栈数组收帧，免每帧堆分配；VecDeque::drain 仅移动所需元素。
         let mut frame = [0f32; FRAME_SIZE];
-        frame.copy_from_slice(&st.buffer[..FRAME_SIZE]);
-        st.buffer.drain(..FRAME_SIZE);
-        if tx.send(frame).is_err() {
-            warn!("音频通道已关闭");
-            return;
+        for (dst, src) in frame.iter_mut().zip(st.buffer.drain(..FRAME_SIZE)) {
+            *dst = src;
         }
+        push_frame(&mut st.queue, &mut st.dropped, frame, "输入");
     }
 }
 
-/// 输出回调：拉取数据 → 重采样（复用 resampled）→ 单声道入缓冲 → 输出时按 channels 展开
-///
-/// 关键优化：buffer 只存单声道样本（空间减半），输出填充时用 chunks_mut(channels)
-/// 让每个样本只转码一次再复制，避免旧实现提前 push_back channels 次 + 重复 from_f32_sample。
+/// 输出回调：取帧 → 重采样 → 单声道入缓冲 → 按 channels 展开填充。
+/// 缓冲仅存单声道（空间减半），展开时每样本转码一次即复制，避免重复转码。
 fn fill_output<T: FromF32Sample>(
     data: &mut [T],
     channels: usize,
     ratio: f64,
     state: &Arc<Mutex<OutputState>>,
-    rx: &Receiver<[f32; FRAME_SIZE]>,
 ) {
     let mut s = state.lock().unwrap();
     let st = &mut *s;
-    // 拉取所有待播放数据，重采样后入缓冲（单声道存储，输出时再展开）
-    while let Ok(chunk) = rx.try_recv() {
-        st.resampler.process(&chunk, ratio, &mut st.resampled);
+    while let Some(frame) = st.queue.pop_front() {
+        st.resampler.process(&frame, ratio, &mut st.resampled);
         st.buffer.extend(st.resampled.iter().copied());
     }
-    // 填充输出：每个单声道样本转码一次，复制到 channels 个输出槽（pop_front O(1)）
-    for chunk in data.chunks_mut(channels) {
-        let v = T::from_f32_sample(st.buffer.pop_front().unwrap_or(0.0));
-        for dst in chunk {
-            *dst = v;
+    // make_contiguous 后整块拷贝，替代逐样本 pop_front（48k 立体声下每秒约 10 万次调用 → 单次 memcpy）。
+    let frames_needed = data.len() / channels;
+    let avail = st.buffer.len().min(frames_needed);
+    if avail > 0 {
+        let contiguous = st.buffer.make_contiguous();
+        for (chunk, &v) in data.chunks_mut(channels).zip(contiguous[..avail].iter()) {
+            let s = T::from_f32_sample(v);
+            for dst in chunk {
+                *dst = s;
+            }
         }
+        st.buffer.drain(..avail);
+    }
+    // 欠载补静音。
+    for dst in &mut data[avail * channels..] {
+        *dst = T::from_f32_sample(0.0);
     }
 }

@@ -1,9 +1,7 @@
-//! 小智客户端 - Rust 极简实现
+//! xiaozhi-rs — 单进程全双工语音客户端。
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
 use log::info;
-use std::io::Write;
 
 mod audio;
 mod client;
@@ -17,98 +15,102 @@ use client::Client;
 use identity::DeviceIdentity;
 use ota::OtaConfig;
 
-#[derive(Parser)]
-#[command(name = "xiaozhi-rs")]
-#[command(about = "小智客户端", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// 启动客户端（自动激活+连接）
-    Start {
-        /// 跳过激活流程
-        #[arg(short, long)]
-        skip_activation: bool,
-    },
-    /// 显示设备信息
-    Info,
-    /// 清除设备身份（重新激活）
-    Reset,
-}
-
-#[tokio::main]
+// 单线程 runtime：业务仅为单一 select! 循环，音频回调驻留于系统线程，无调度器开销。
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // 安装 ring 作为 rustls 默认 crypto provider（reqwest rustls-no-provider 不含 provider）
-    // 必须在任何 HTTPS 请求前调用；已安装时 install_default 返回 Err，用 .ok() 忽略
+    // rustls 自带 ring provider 须在使用任意 HTTPS 调用前注册一次；重复安装返回 Err，可安全忽略。
     rustls::crypto::ring::default_provider().install_default().ok();
 
-    // 自定义日志格式：本地时间（UTC+8）+ 消息
-    // 使用 O(1) 日期算法，避免每次日志都循环减年份
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(|buf, record| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+    init_logger();
 
-            let local = now + 8 * 3600; // UTC+8
-            let days = (local / 86400) as i64;
-            let secs = local % 86400;
-
-            let (year, month, day) = civil_from_days(days);
-            let hour = (secs / 3600) as u8;
-            let min = ((secs % 3600) / 60) as u8;
-            let sec = (secs % 60) as u8;
-
-            writeln!(
-                buf,
-                "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}",
-                year, month, day, hour, min, sec,
-                record.args()
-            )
-        })
-        .init();
-
-    let cli = Cli::parse();
-
-    // 如果没有提供命令，显示帮助信息
-    if let Some(cmd) = cli.command {
-        match cmd {
-            Commands::Start { skip_activation } => {
-                run_with_signal(skip_activation).await?;
-            }
-            Commands::Info => {
-                show_device_info()?;
-            }
-            Commands::Reset => {
-                reset_device()?;
-            }
+    // 手写参数解析（仅三个子命令），弃用 clap 以消除其依赖树。
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        // 缺省子命令：进入对话。
+        None => {
+            print_usage();
+            println!();
+            println!("正在启动语音对话...");
+            println!("(按 Ctrl+C 退出)");
+            println!();
+            run_with_signal(false).await?;
         }
-    } else {
-        // 默认行为：启动客户端
-        println!("小智客户端 v0.1.0");
-        println!("用法: xiaozhi-rs <COMMAND>");
-        println!();
-        println!("Commands:");
-        println!("  start   启动语音对话");
-        println!("  info    显示设备信息");
-        println!("  reset   重置设备身份");
-        println!();
-        println!("正在启动语音对话...");
-        println!("(按 Ctrl+C 退出)");
-        println!();
-
-        run_with_signal(false).await?;
+        Some("start") => {
+            let skip_activation = args.any(|a| a == "-s" || a == "--skip-activation");
+            run_with_signal(skip_activation).await?;
+        }
+        Some("info") => show_device_info()?,
+        Some("reset") => reset_device()?,
+        Some("-h") | Some("--help") => print_usage(),
+        Some(other) => {
+            eprintln!("未知命令: {}", other);
+            print_usage();
+            std::process::exit(2);
+        }
     }
 
     Ok(())
 }
 
-/// Howard Hinnant 的 civil_from_days 算法：O(1) 将"自 epoch 起的天数"转为 (年, 月, 日)
-/// 替代旧实现的逐年/逐月循环，高频日志下显著降低开销
+fn print_usage() {
+    println!("小智客户端 v0.1.0");
+    println!("用法: xiaozhi-rs <COMMAND>");
+    println!();
+    println!("Commands:");
+    println!("  start   启动语音对话（-s/--skip-activation 跳过激活）");
+    println!("  info    显示设备信息");
+    println!("  reset   重置设备身份");
+}
+
+/// 零依赖日志前端，替代 env_logger（其正则/着色/模块过滤能力从未被使用）。
+/// 级别由 RUST_LOG 注入，宏展开处已受 max_level 静态裁剪。
+struct SimpleLogger;
+
+static LOGGER: SimpleLogger = SimpleLogger;
+
+impl log::Log for SimpleLogger {
+    // 不过滤 metadata；分级由 set_max_level 在宏展开处静态完成。
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+
+    // 时间戳取 UTC+8，日期由 civil_from_days 以 O(1) 闭式解算，避免历年循环。
+    fn log(&self, record: &log::Record) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let local = now + 8 * 3600; // UTC+8
+        let days = (local / 86400) as i64;
+        let secs = local % 86400;
+
+        let (year, month, day) = civil_from_days(days);
+        let hour = (secs / 3600) as u8;
+        let min = ((secs % 3600) / 60) as u8;
+        let sec = (secs % 60) as u8;
+
+        eprintln!(
+            "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}",
+            year, month, day, hour, min, sec,
+            record.args()
+        );
+    }
+
+    fn flush(&self) {}
+}
+
+/// 安装日志后端；RUST_LOG 缺省为 info。
+fn init_logger() {
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(log::LevelFilter::Info);
+    log::set_logger(&LOGGER).expect("日志初始化失败");
+    log::set_max_level(level);
+}
+
+/// 将"自 epoch 起的天数"闭式映射为 (年, 月, 日)（Howard Hinnant 的 civil_from_days，O(1)）。
 fn civil_from_days(z: i64) -> (i32, u8, u8) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -123,7 +125,7 @@ fn civil_from_days(z: i64) -> (i32, u8, u8) {
     (y, m, d)
 }
 
-/// 运行客户端，监听 Ctrl+C 优雅退出
+/// 以 Ctrl+C 为终止信号驱动客户端主循环。
 async fn run_with_signal(skip_activation: bool) -> Result<()> {
     tokio::select! {
         res = run_client(skip_activation) => res,
@@ -134,27 +136,23 @@ async fn run_with_signal(skip_activation: bool) -> Result<()> {
     }
 }
 
-/// 启动客户端：身份加载 → 激活 → 连接 → 对话
+/// 客户端生命周期：身份 → 激活 → 建连 → 对话。
 async fn run_client(skip_activation: bool) -> Result<()> {
     info!("正在启动小智客户端...");
 
-    // 1. 加载/创建设备身份
     let mut identity = DeviceIdentity::load_or_create()?;
 
-    // 如果跳过激活，使用测试 MAC 地址
     if skip_activation {
         identity.device_id = DeviceIdentity::get_test_mac_address();
         info!("使用测试 MAC 地址: {}", identity.device_id);
     }
 
-    // 2. OTA 拉取配置 + 激活
     let ota_config = ensure_activated(&mut identity, skip_activation).await?;
 
-    // 3. 连接并对话
     connect_and_run(&identity, &ota_config).await
 }
 
-/// 确保设备已激活，返回 OTA 配置
+/// 保证设备已激活，返回 OTA 配置；未激活则进入轮询授权流程。
 async fn ensure_activated(
     identity: &mut DeviceIdentity,
     skip_activation: bool,
@@ -175,7 +173,6 @@ async fn ensure_activated(
             info!("设备需要激活（尝试 {}/{}）", retry_count, MAX_RETRIES);
             info!("请访问 https://xiaozhi.me/ 输入激活码：{}", activation_data.code);
 
-            // 等待激活（60秒超时）
             match ota::wait_for_activation(
                 identity,
                 &activation_data.challenge,
@@ -197,7 +194,7 @@ async fn ensure_activated(
                 }
             }
         } else {
-            // 没有激活数据，表示已激活
+            // 无 activation 字段即视为已授权。
             return Ok(ota_config);
         }
     }
@@ -205,7 +202,7 @@ async fn ensure_activated(
     Ok(ota_config)
 }
 
-/// 连接 WebSocket 并开始对话
+/// 建立 WebSocket 并进入全双工对话。
 async fn connect_and_run(identity: &DeviceIdentity, ota_config: &OtaConfig) -> Result<()> {
     let ws_url = ota_config
         .websocket

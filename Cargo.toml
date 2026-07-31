@@ -8,15 +8,16 @@ readme = "README.md"
 
 [dependencies]
 # 异步运行时
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util", "signal"] }
 
 # WebSocket（rustls 纯 Rust TLS，无需系统 OpenSSL）
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
-futures-util = "0.3"
+# 仅用 split/SinkExt/StreamExt：关闭默认 features 精简编译
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
-# HTTP 客户端（OTA/激活）— rustls-no-provider + 手动安装 ring，避免 aws-lc-rs 的 cmake/NASM 依赖
-reqwest = { version = "0.13", features = ["json", "rustls-no-provider"], default-features = false }
-# rustls 直接依赖：为 reqwest 的 rustls-no-provider 安装 ring crypto provider
+# HTTP 客户端（OTA/激活）— ureq 轻量替代 reqwest，共享 rustls/ring，纯 Rust 跨平台
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+# rustls 直接依赖：为 tokio-tungstenite 安装 ring crypto provider（避免 aws-lc-rs 的 cmake/NASM 依赖）
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # 序列化
@@ -26,12 +27,8 @@ serde_json = "1"
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# 日志
+# 日志（手写极简 logger，见 main.rs，替代 env_logger）
 log = "0.4"
-env_logger = "0.11"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
 
 # 错误处理
 anyhow = "1"
@@ -39,10 +36,9 @@ anyhow = "1"
 # 目录
 directories = "6"
 
-# 加密
+# 加密（hex 编码为 ~8 行手写实现，见 identity.rs）
 sha2 = "0.11"
 hmac = "0.13"
-hex = "0.4"
 
 # 主机名
 hostname = "0.4"

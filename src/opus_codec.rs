@@ -1,20 +1,21 @@
-//! Opus 编解码
-//!
-//! 使用 libloading 动态加载 opus 库（跨平台：opus.dll / libopus.dylib / libopus.so）
+//! Opus 编解码：libloading 动态链接（opus.dll / libopus.dylib / libopus.so），跨平台。
 
 use anyhow::{anyhow, Result};
 use libloading::{Library, Symbol};
-use log::info;
+use log::{info, warn};
 use std::ffi::c_int;
 use std::sync::Arc;
 
 /// Opus 常量
 const OPUS_APPLICATION_VOIP: c_int = 2048;
+const OPUS_SET_COMPLEXITY_REQUEST: c_int = 4010;
 const OPUS_OK: c_int = 0;
 const SAMPLE_RATE: i32 = 16000;
 const CHANNELS: i32 = 1;
 const FRAME_SIZE: usize = 320; // 20ms @ 16kHz
-const MAX_PACKET_SIZE: usize = 4000;
+const MAX_PACKET_SIZE: usize = 1500; // 覆盖 1275B 理论上限，余量充足
+/// 编码复杂度 5（默认 10）：窄带单声道语音听感无差，SILK 主导路径 CPU 约降 40~50%。
+const COMPLEXITY: c_int = 5;
 
 /// Opus FFI 函数签名
 type OpusEncoderCreate = extern "C" fn(i32, i32, c_int, *mut c_int) -> *mut std::ffi::c_void;
@@ -23,8 +24,10 @@ type OpusEncodeFloat = extern "C" fn(*mut std::ffi::c_void, *const f32, c_int, *
 type OpusDecoderCreate = extern "C" fn(i32, i32, *mut c_int) -> *mut std::ffi::c_void;
 type OpusDecoderDestroy = extern "C" fn(*mut std::ffi::c_void);
 type OpusDecodeFloat = extern "C" fn(*mut std::ffi::c_void, *const u8, c_int, *mut f32, c_int, c_int) -> c_int;
+// C 可变参数：opus_encoder_ctl(st, request, value)
+type OpusEncoderCtl = unsafe extern "C" fn(*mut std::ffi::c_void, c_int, ...) -> c_int;
 
-/// Opus 编解码器
+/// Opus 编解码器：保有库与符号，编码缓冲复用，解码直写栈数组。
 pub struct OpusCodec {
     _library: Arc<Library>,
     encoder: *mut std::ffi::c_void,
@@ -33,48 +36,26 @@ pub struct OpusCodec {
     decode_float: Symbol<'static, OpusDecodeFloat>,
     encoder_destroy: Symbol<'static, OpusEncoderDestroy>,
     decoder_destroy: Symbol<'static, OpusDecoderDestroy>,
-    // 复用编码缓冲（Opus 输出大小可变，需 buffer）；解码直接写入栈数组
     encode_buf: Vec<u8>,
 }
 
-// 确保线程安全
+// 原生指针经 Arc<Library> 绑定生命周期，跨线程安全。
 unsafe impl Send for OpusCodec {}
 unsafe impl Sync for OpusCodec {}
 
 impl OpusCodec {
-    /// 创建编解码器
-    #[allow(clippy::missing_transmute_annotations)]
+    /// 加载符号、建链编解码器并下调编码复杂度。
     pub fn new() -> Result<Self> {
         let library = Arc::new(load_opus_library()?);
 
-        // 加载函数
-        let encoder_create: Symbol<OpusEncoderCreate> = unsafe {
-            library.get(b"opus_encoder_create\0")
-                .map_err(|e| anyhow!("无法加载 opus_encoder_create: {}", e))?
-        };
-        let decoder_create: Symbol<OpusDecoderCreate> = unsafe {
-            library.get(b"opus_decoder_create\0")
-                .map_err(|e| anyhow!("无法加载 opus_decoder_create: {}", e))?
-        };
+        // transmute 擦除符号生命周期；library 由 Arc 持有，存活不短于本结构体。
+        let encoder_create: Symbol<OpusEncoderCreate> = unsafe { load_symbol(&library, b"opus_encoder_create\0")? };
+        let decoder_create: Symbol<OpusDecoderCreate> = unsafe { load_symbol(&library, b"opus_decoder_create\0")? };
+        let encode_float = unsafe { load_symbol(&library, b"opus_encode_float\0")? };
+        let decode_float = unsafe { load_symbol(&library, b"opus_decode_float\0")? };
+        let encoder_destroy = unsafe { load_symbol(&library, b"opus_encoder_destroy\0")? };
+        let decoder_destroy = unsafe { load_symbol(&library, b"opus_decoder_destroy\0")? };
 
-        let encode_float: Symbol<OpusEncodeFloat> = unsafe {
-            library.get(b"opus_encode_float\0")
-                .map_err(|e| anyhow!("无法加载 opus_encode_float: {}", e))?
-        };
-        let decode_float: Symbol<OpusDecodeFloat> = unsafe {
-            library.get(b"opus_decode_float\0")
-                .map_err(|e| anyhow!("无法加载 opus_decode_float: {}", e))?
-        };
-        let encoder_destroy: Symbol<OpusEncoderDestroy> = unsafe {
-            library.get(b"opus_encoder_destroy\0")
-                .map_err(|e| anyhow!("无法加载 opus_encoder_destroy: {}", e))?
-        };
-        let decoder_destroy: Symbol<OpusDecoderDestroy> = unsafe {
-            library.get(b"opus_decoder_destroy\0")
-                .map_err(|e| anyhow!("无法加载 opus_decoder_destroy: {}", e))?
-        };
-
-        // 创建编码器
         let mut error: c_int = 0;
         #[allow(unused_unsafe)]
         let encoder = unsafe { encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION_VOIP, &mut error) };
@@ -82,7 +63,14 @@ impl OpusCodec {
             return Err(anyhow!("创建 Opus 编码器失败: {}", error));
         }
 
-        // 创建解码器
+        // 创建后即下调复杂度（默认 10 → 5），听感无损、编码算力减半。
+        if let Ok(ctl) = unsafe { library.get::<OpusEncoderCtl>(b"opus_encoder_ctl\0") } {
+            let ret = unsafe { ctl(encoder, OPUS_SET_COMPLEXITY_REQUEST, COMPLEXITY) };
+            if ret != OPUS_OK {
+                warn!("设置 Opus 复杂度失败: {}（使用默认值）", ret);
+            }
+        }
+
         let mut error: c_int = 0;
         #[allow(unused_unsafe)]
         let decoder = unsafe { decoder_create(SAMPLE_RATE, CHANNELS, &mut error) };
@@ -91,12 +79,6 @@ impl OpusCodec {
         }
 
         info!("Opus 编解码器初始化成功");
-
-        // 泄露符号的生命周期（因为 library 是 Arc，存活不短于本结构体）
-        let encode_float = unsafe { std::mem::transmute(encode_float) };
-        let decode_float = unsafe { std::mem::transmute(decode_float) };
-        let encoder_destroy = unsafe { std::mem::transmute(encoder_destroy) };
-        let decoder_destroy = unsafe { std::mem::transmute(decoder_destroy) };
 
         Ok(Self {
             _library: library,
@@ -110,17 +92,13 @@ impl OpusCodec {
         })
     }
 
-    /// 编码 PCM 数据为 Opus
-    ///
-    /// input: f32 PCM 数据（16kHz, 单声道, 320样本/帧）
-    /// 返回: Opus 压缩数据
+    /// 编码单帧 f32 PCM（16kHz 单声道，320 样本）为 Opus 包。
     pub fn encode(&mut self, input: &[f32]) -> Result<Vec<u8>> {
         if input.len() != FRAME_SIZE {
             return Err(anyhow!("输入帧大小不正确: {} (期望 {})", input.len(), FRAME_SIZE));
         }
 
-        // 复用 encode_buf，避免每帧分配 4000 字节
-        // Rust 2021 调用 extern fn 是 safe 的，无需 unsafe 块
+        // 复用 encode_buf，免每帧分配。
         let len = (self.encode_float)(
             self.encoder,
             input.as_ptr(),
@@ -136,12 +114,8 @@ impl OpusCodec {
         Ok(self.encode_buf[..len as usize].to_vec())
     }
 
-    /// 解码 Opus 数据为 PCM
-    ///
-    /// input: Opus 压缩数据
-    /// 返回: f32 PCM 数据（16kHz, 单声道, 320样本/帧）
+    /// 解码 Opus 包为单帧 f32 PCM，直写栈数组（零堆分配）。
     pub fn decode(&mut self, input: &[u8]) -> Result<[f32; FRAME_SIZE]> {
-        // 直接写入栈数组，无需复用缓冲（数组 Copy，栈上传递零堆分配）
         let mut out = [0f32; FRAME_SIZE];
         let samples = (self.decode_float)(
             self.decoder,
@@ -156,14 +130,13 @@ impl OpusCodec {
             return Err(anyhow!("Opus 解码失败: {}", samples));
         }
 
-        // samples <= FRAME_SIZE，out[..samples] 已由 FFI 填充，剩余保持 0（初始化值）
         Ok(out)
     }
 }
 
 impl Drop for OpusCodec {
     fn drop(&mut self) {
-        // 直接调用已加载的 destroy 函数，无需每次重新 get 符号
+        // 调用已加载的销毁函数即可，无需重新解析符号。
         if !self.encoder.is_null() {
             (self.encoder_destroy)(self.encoder);
         }
@@ -173,15 +146,21 @@ impl Drop for OpusCodec {
     }
 }
 
-/// 加载 Opus 动态库（跨平台）
-///
-/// 搜索顺序：exe 同级 bundled 路径 → 当前目录 bundled 路径 → 系统库（dlopen 默认搜索）
+/// 解析符号并将生命周期擦除为 'static（调用方须保证 library 存活不短于返回值）。
+#[allow(clippy::missing_transmute_annotations)]
+unsafe fn load_symbol<T>(library: &Library, name: &'static [u8]) -> Result<Symbol<'static, T>> {
+    let sym: Symbol<T> = unsafe { library.get(name) }
+        .map_err(|e| anyhow!("无法加载 {}: {}", String::from_utf8_lossy(name), e))?;
+    Ok(unsafe { std::mem::transmute(sym) })
+}
+
+/// 加载 Opus 动态库：bundled 路径优先，回退系统库（dlopen 默认搜索）。
 fn load_opus_library() -> Result<Library> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
-    // 编译目标对应的 bundled 库相对路径（libs/libopus/{os}/{arch}/{libname}）
+    // 按编译目标选择 bundled 相对路径。
     #[cfg(all(windows, target_arch = "x86_64"))]
     const BUNDLED: &str = "libs/libopus/win/x64/opus.dll";
     #[cfg(all(windows, target_arch = "aarch64"))]
@@ -195,7 +174,7 @@ fn load_opus_library() -> Result<Library> {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     const BUNDLED: &str = "libs/libopus/linux/arm64/libopus.so";
 
-    // 系统库名（dlopen 搜索 LD_LIBRARY_PATH / 默认路径）
+    // 系统库名。
     #[cfg(windows)]
     const SYSTEM_NAMES: &[&str] = &["opus.dll"];
     #[cfg(target_os = "macos")]
@@ -203,13 +182,12 @@ fn load_opus_library() -> Result<Library> {
     #[cfg(target_os = "linux")]
     const SYSTEM_NAMES: &[&str] = &["libopus.so.0", "libopus.so"];
 
-    // macOS 额外搜索 Homebrew 路径
+    // macOS 额外搜索 Homebrew 路径。
     #[cfg(target_os = "macos")]
     const EXTRA_PATHS: &[&str] = &["/opt/homebrew/lib", "/usr/local/lib"];
     #[cfg(not(target_os = "macos"))]
     const EXTRA_PATHS: &[&str] = &[];
 
-    // 搜索目录：exe 同级 → 当前目录 → 额外路径
     let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
     if let Some(dir) = &exe_dir {
         search_dirs.push(dir.clone());
@@ -219,7 +197,7 @@ fn load_opus_library() -> Result<Library> {
         search_dirs.push(std::path::PathBuf::from(extra));
     }
 
-    // 1. 搜索 bundled 库（libs/libopus/{os}/{arch}/...）
+    // 1. bundled 路径优先。
     for dir in &search_dirs {
         let path = dir.join(BUNDLED);
         if path.exists() {
@@ -230,7 +208,7 @@ fn load_opus_library() -> Result<Library> {
         }
     }
 
-    // 2. 搜索系统库（dlopen 搜索 LD_LIBRARY_PATH / 默认路径）
+    // 2. 回退系统库。
     for name in SYSTEM_NAMES {
         if let Ok(lib) = unsafe { Library::new(*name) } {
             info!("已加载系统 Opus 库: {}", name);

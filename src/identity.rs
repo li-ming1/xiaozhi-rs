@@ -1,6 +1,4 @@
-//! 设备身份管理
-//!
-//! 负责：MAC地址获取、UUID生成、序列号/HMAC生成、efuse缓存
+//! 设备身份：MAC 派生、UUID、序列号/HMAC 生成与 efuse 持久化。
 
 use anyhow::Result;
 use log::info;
@@ -10,36 +8,44 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use uuid::Uuid;
 
-/// 设备身份信息
+/// 设备身份凭证，同时作为 WebSocket 握手载荷。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceIdentity {
-    /// MAC地址（Device-Id）
     pub device_id: String,
-    /// 客户端ID（UUID v4）
     pub client_id: String,
-    /// 序列号
     pub serial_number: String,
-    /// HMAC密钥
     pub hmac_key: String,
-    /// 激活状态
     pub activation_status: bool,
-    /// efuse文件路径（不序列化）
     #[serde(skip)]
     pub efuse_path: PathBuf,
 }
 
-/// efuse JSON 结构（平铺字段）
+/// efuse 持久化结构；缺字段反序列化为空串/false，向后兼容旧文件。
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct EfuseData {
-    mac_address: Option<String>,
-    client_id: Option<String>,
-    serial_number: Option<String>,
-    hmac_key: Option<String>,
+    #[serde(default)]
+    mac_address: String,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    serial_number: String,
+    #[serde(default)]
+    hmac_key: String,
+    #[serde(default)]
     activation_status: bool,
 }
 
+/// 字节数组转十六进制（替代 hex crate）。
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{:02x}", b);
+        s
+    })
+}
+
 impl DeviceIdentity {
-    /// 加载或创建设备身份
+    /// 定位配置目录，存在则加载，否则生成并落盘。
     pub fn load_or_create() -> Result<Self> {
         let config_dir = directories::ProjectDirs::from("com", "xiaozhi", "xiaozhi-rs")
             .map(|dirs| dirs.config_dir().to_path_buf())
@@ -55,25 +61,33 @@ impl DeviceIdentity {
         }
     }
 
-    /// 从文件加载
+    /// 从文件加载；文件空/损坏则重建。
     fn load_from_file(efuse_path: &Path) -> Result<Self> {
         let content = fs::read_to_string(efuse_path)?;
-        
-        // 文件为空或无效，创建新身份
+
         if content.trim().is_empty() {
             return Self::create_new(efuse_path);
         }
-        
+
         let data: EfuseData = match serde_json::from_str(&content) {
             Ok(d) => d,
             Err(_) => return Self::create_new(efuse_path),
         };
 
-        let device_id = data.mac_address.clone().unwrap_or_else(Self::generate_mac_address);
-        // 持久化的 client_id 优先；缺失时才生成新的（向后兼容旧 efuse 文件）
-        let client_id = data.client_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
-        let serial_number = data.serial_number.clone().unwrap_or_default();
-        let hmac_key = data.hmac_key.clone().unwrap_or_default();
+        // 持久化 client_id 优先；缺失时回退 UUID（兼容旧文件）。
+        let client_id = if data.client_id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            data.client_id
+        };
+        // mac_address 缺失则派生本地 MAC，否则复用持久值。
+        let device_id = if data.mac_address.is_empty() {
+            Self::generate_mac_address()
+        } else {
+            data.mac_address
+        };
+        let serial_number = data.serial_number;
+        let hmac_key = data.hmac_key;
 
         let identity = DeviceIdentity {
             device_id,
@@ -88,27 +102,24 @@ impl DeviceIdentity {
         Ok(identity)
     }
 
-    /// 创建新身份
+    /// 首次运行：派生全部凭证并原子落盘。
     fn create_new(efuse_path: &Path) -> Result<Self> {
         info!("首次运行，正在生成设备身份...");
 
-        // 获取MAC地址
         let device_id = Self::generate_mac_address();
-
-        // 生成UUID
         let client_id = Uuid::new_v4().to_string();
 
-        // 生成序列号: SN-{MD5(mac)[:8]}-{mac_clean}
+        // 序列号 = SN-{hash[:8]}-{mac_clean}
         let mac_clean = device_id.replace(":", "").to_lowercase();
-        let hash = hex::encode(Sha256::digest(mac_clean.as_bytes()));
+        let hash = to_hex(&Sha256::digest(mac_clean.as_bytes()));
         let serial_number = format!("SN-{}-{}", hash[..8].to_uppercase(), mac_clean);
 
-        // 生成HMAC密钥
+        // HMAC 密钥绑定主机名+设备+客户端，防止凭证跨机复用。
         let hostname = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
         let hmac_input = format!("{}||{}||{}", hostname, device_id, client_id);
-        let hmac_key = hex::encode(Sha256::digest(hmac_input.as_bytes()));
+        let hmac_key = to_hex(&Sha256::digest(hmac_input.as_bytes()));
 
         let identity = DeviceIdentity {
             device_id,
@@ -119,53 +130,47 @@ impl DeviceIdentity {
             efuse_path: efuse_path.to_path_buf(),
         };
 
-        // 保存到文件
         identity.save()?;
 
         info!("已创建设备身份: {}", identity.device_id);
         Ok(identity)
     }
 
-    /// 获取MAC地址（跨平台统一实现）
+    /// 跨平台 MAC：取 UUID v4 随机字节，置本地管理/清多播位，规避全局地址冲突。
     fn generate_mac_address() -> String {
-        // 使用 UUID v4 的随机字节（基于 getrandom，密码学安全）
-        // 相比时间戳，避免同秒内多次调用产生冲突
         let bytes = *Uuid::new_v4().as_bytes();
-        // 第一字节：清多播位（bit0=0），设本地管理位（bit1=1），避免与全局唯一 MAC 冲突
         let b0 = (bytes[0] & 0xFE) | 0x02;
         format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             b0, bytes[1], bytes[2], bytes[3], bytes[4], bytes[5])
     }
 
-    /// 获取测试用 MAC 地址（服务器自动授权）
+    /// 测试用 MAC（服务器自动授权）。
     pub fn get_test_mac_address() -> String {
         "00:00:00:00:00:00".to_string()
     }
 
-    /// 检查是否已激活
     pub fn is_activated(&self) -> bool {
         self.activation_status
     }
 
-    /// 生成HMAC签名
+    /// 以 HMAC-SHA256 对挑战码签名（SimpleHmac 适配实现 Digest 的哈希）。
     pub fn generate_hmac_signature(&self, challenge: &str) -> String {
-        // hmac 0.13: SimpleHmac 适用于直接实现 Digest 的哈希（如 Sha256）
         use hmac::{KeyInit, Mac, SimpleHmac};
         type HmacSha256 = SimpleHmac<Sha256>;
 
         let mut mac = HmacSha256::new_from_slice(self.hmac_key.as_bytes())
             .expect("HMAC初始化失败");
         mac.update(challenge.as_bytes());
-        hex::encode(mac.finalize().into_bytes())
+        to_hex(&mac.finalize().into_bytes())
     }
 
-    /// 保存到文件
+    /// 原子写入：临时文件 rename 覆盖，避免半写损坏。
     fn save(&self) -> Result<()> {
         let data = EfuseData {
-            mac_address: Some(self.device_id.clone()),
-            client_id: Some(self.client_id.clone()),
-            serial_number: Some(self.serial_number.clone()),
-            hmac_key: Some(self.hmac_key.clone()),
+            mac_address: self.device_id.clone(),
+            client_id: self.client_id.clone(),
+            serial_number: self.serial_number.clone(),
+            hmac_key: self.hmac_key.clone(),
             activation_status: self.activation_status,
         };
 
@@ -176,8 +181,8 @@ impl DeviceIdentity {
 
         Ok(())
     }
-    
-    /// 标记为已激活
+
+    /// 标记已激活并落盘。
     pub fn set_activated(&mut self) -> Result<()> {
         self.activation_status = true;
         self.save()?;

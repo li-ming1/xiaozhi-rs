@@ -1,9 +1,9 @@
-//! JSON 消息类型定义
+//! 线上消息协议类型。
 
 use serde::{Deserialize, Serialize};
 
-/// 客户端发送的消息（仅保留实际构造的变体）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 客户端出站消息（仅序列化）。
+#[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Message {
@@ -27,32 +27,25 @@ pub enum Message {
     },
 }
 
-/// 服务器发送的消息（保留全部变体以反序列化服务器推送）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 服务器入站消息（仅反序列化；保留全部变体以匹配推送）。
+#[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum ServerMessage {
     Hello {
-        transport: String,
         session_id: String,
     },
 
     Tts {
         state: TtsState,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
     },
 
     Listen {
         state: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
     },
 
     Stt {
         text: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        state: Option<String>,
     },
 
     Llm {
@@ -74,13 +67,13 @@ pub enum ServerMessage {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Default)]
 pub struct Features {
     #[serde(default)]
     pub mcp: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct AudioParams {
     pub format: String,
     pub sample_rate: u32,
@@ -99,14 +92,16 @@ impl Default for AudioParams {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListenState {
     Start,
+    /// 协议保留（realtime 模式不发送）。
+    #[allow(dead_code)]
     Stop,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsState {
     Start,
@@ -118,7 +113,7 @@ pub enum TtsState {
 }
 
 impl Message {
-    /// 创建 hello 消息
+    /// 构造建连 Hello 消息。
     pub fn hello() -> Self {
         Message::Hello {
             version: 1,
