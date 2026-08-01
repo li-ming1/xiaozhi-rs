@@ -72,10 +72,24 @@ jobs:
           name: xiaozhi-rs-${{ matrix.name }}
           path: dist/xiaozhi-rs-${{ matrix.name }}.*
 
-      # ── Tag 推送时创建 GitHub Release ──
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
+  # ── Tag 推送时创建 GitHub Release ──
+  # 独立 job，等全部平台构建完成后再发布一次，
+  # 避免多 job 并行抢建同一 Release 引发 "Too many retries"。
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/xiaozhi-rs-${{ matrix.name }}.*
+          files: dist/*
           generate_release_notes: true
