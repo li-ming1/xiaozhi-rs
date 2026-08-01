@@ -428,7 +428,7 @@ fn process_input_chunk<S: Copy>(
 /// 输出回调：取帧 → 重采样 → 单声道入缓冲 → 按 channels 展开填充。
 /// 缓冲仅存单声道（空间减半），展开时每样本转码一次即复制，避免重复转码。
 /// 按需补充到目标深度、读游标 head 延迟压缩（稳态约 17 次回调才搬移一次）；
-/// 欠载时自上次样本线性斜坡到 0，消除硬切静音的咔哒。
+/// 欠载时自上次样本线性斜坡到 0，软切换为静音，避免硬切产生的瞬态爆音。
 fn fill_output<T: FromF32Sample>(
     data: &mut [T],
     channels: usize,
@@ -490,7 +490,7 @@ fn fill_output<T: FromF32Sample>(
         st.buffer.drain(..st.head);
         st.head = 0;
     }
-    // 欠载：斜坡段逐样本衰减，其余批量补 0（单次 fill 替代逐样本写，48k 立体声每回调最多省 960 次转码）。
+    // 欠载：斜坡段逐样本衰减至静音，其余批量补 0（单次 fill 替代逐样本写，48k 立体声每回调最多省 960 次转码）。
     let tail = &mut data[avail * channels..];
     let mut written = 0usize;
     if !tail.is_empty() {

@@ -35,10 +35,9 @@ async fn main() -> Result<()> {
             println!();
             run_with_signal(false).await?;
         }
-        Some("start") => {
-            let skip_activation = args.any(|a| a == "-s" || a == "--skip-activation");
-            run_with_signal(skip_activation).await?;
-        }
+        Some("start") => run_with_signal(false).await?,
+        // skip = 跳过激活直接启动。
+        Some("skip") => run_with_signal(true).await?,
         Some("info") => show_device_info()?,
         Some("reset") => reset_device()?,
         Some("-h") | Some("--help") => print_usage(),
@@ -57,7 +56,8 @@ fn print_usage() {
     println!("用法: xiaozhi-rs <COMMAND>");
     println!();
     println!("Commands:");
-    println!("  start   启动语音对话（-s/--skip-activation 跳过激活）");
+    println!("  start   启动语音对话");
+    println!("  skip    跳过激活直接启动");
     println!("  info    显示设备信息");
     println!("  reset   重置设备身份");
 }
