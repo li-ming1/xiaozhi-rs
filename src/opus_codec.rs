@@ -9,6 +9,11 @@ use std::sync::Arc;
 /// Opus 常量
 const OPUS_APPLICATION_VOIP: c_int = 2048;
 const OPUS_SET_COMPLEXITY_REQUEST: c_int = 4010;
+const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
+const OPUS_SET_SIGNAL_REQUEST: c_int = 4024;
+const OPUS_SIGNAL_VOICE: c_int = 3001;
+const OPUS_SET_INBAND_FEC_REQUEST: c_int = 4012;
+const OPUS_SET_DTX_REQUEST: c_int = 4016;
 const OPUS_OK: c_int = 0;
 const SAMPLE_RATE: i32 = 16000;
 const CHANNELS: i32 = 1;
@@ -16,6 +21,8 @@ const FRAME_SIZE: usize = 320; // 20ms @ 16kHz
 const MAX_PACKET_SIZE: usize = 1500; // 覆盖 1275B 理论上限，余量充足
 /// 编码复杂度 5（默认 10）：窄带单声道语音听感无差，SILK 主导路径 CPU 约降 40~50%。
 const COMPLEXITY: c_int = 5;
+/// 比特率 48 kbps：16kHz 语音接近听感透明（默认 ~24-32kbps 齿音/摩擦音有损）。
+const BITRATE: c_int = 48000;
 
 /// Opus FFI 函数签名
 type OpusEncoderCreate = extern "C" fn(i32, i32, c_int, *mut c_int) -> *mut std::ffi::c_void;
@@ -63,12 +70,24 @@ impl OpusCodec {
             return Err(anyhow!("创建 Opus 编码器失败: {}", error));
         }
 
-        // 创建后即下调复杂度（默认 10 → 5），听感无损、编码算力减半。
+        // 编码器调参：复杂度/比特率/信号类型/前向纠错/DTX 一次性下发。
+        // - 复杂度 5（默认 10）：听感无损、算力减半
+        // - 比特率 48kbps：16kHz 语音接近听感透明
+        // - 信号类型 VOICE：指导编码器对语音优化决策
+        // - inband FEC=1：把前一帧低码率冗余编入当前帧，服务器侧丢包可恢复
+        // - DTX=0：关闭静音段停止发送，避免说话间隙恢复时的前导 artifacts
         if let Ok(ctl) = unsafe { library.get::<OpusEncoderCtl>(b"opus_encoder_ctl\0") } {
-            let ret = unsafe { ctl(encoder, OPUS_SET_COMPLEXITY_REQUEST, COMPLEXITY) };
-            if ret != OPUS_OK {
-                warn!("设置 Opus 复杂度失败: {}（使用默认值）", ret);
-            }
+            let apply = |req: c_int, val: c_int, name: &str| {
+                let ret = unsafe { ctl(encoder, req, val) };
+                if ret != OPUS_OK {
+                    warn!("设置 Opus {} 失败: {}", name, ret);
+                }
+            };
+            apply(OPUS_SET_COMPLEXITY_REQUEST, COMPLEXITY, "复杂度");
+            apply(OPUS_SET_BITRATE_REQUEST, BITRATE, "比特率");
+            apply(OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_VOICE, "信号类型");
+            apply(OPUS_SET_INBAND_FEC_REQUEST, 1, "前向纠错");
+            apply(OPUS_SET_DTX_REQUEST, 0, "DTX");
         }
 
         let mut error: c_int = 0;
@@ -128,6 +147,26 @@ impl OpusCodec {
 
         if samples < 0 {
             return Err(anyhow!("Opus 解码失败: {}", samples));
+        }
+
+        Ok(out)
+    }
+
+    /// 丢包隐藏（PLC）：无数据到达时基于解码器内部状态外推一帧补偿，
+    /// 替代静音填充，避免断流处的可闻咔哒/空洞。
+    pub fn decode_plc(&mut self) -> Result<[f32; FRAME_SIZE]> {
+        let mut out = [0f32; FRAME_SIZE];
+        let samples = (self.decode_float)(
+            self.decoder,
+            std::ptr::null(),
+            0,
+            out.as_mut_ptr(),
+            FRAME_SIZE as c_int,
+            0,
+        );
+
+        if samples < 0 {
+            return Err(anyhow!("Opus PLC 失败: {}", samples));
         }
 
         Ok(out)

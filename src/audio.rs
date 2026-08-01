@@ -28,13 +28,21 @@ fn push_frame(queue: &mut VecDeque<[f32; FRAME_SIZE]>, dropped: &mut u64, frame:
 }
 
 /// Catmull-Rom 三次样条重采样器，跨块复用前一输入末样本作 y0，抑制边界高频伪影。
+/// 降采样（ratio<1）前置 sinc+hamming 低通 FIR，滤除高于目标奈奎斯特的成分，
+/// 否则高频会混叠回中频带，产生金属感与齿音毛糙——这是降采样音质损失的主因。
 struct Resampler {
     prev_last: f32,
+    lowpass: Vec<f32>,   // 降采样抗混叠 FIR 系数；ratio>=1 时空，跳过滤波
+    filtered: Vec<f32>,  // FIR 输出复用缓冲
 }
 
 impl Resampler {
-    fn new() -> Self {
-        Self { prev_last: 0.0 }
+    fn new(ratio: f64) -> Self {
+        Self {
+            prev_last: 0.0,
+            lowpass: if ratio < 1.0 { design_lowpass(ratio) } else { Vec::new() },
+            filtered: Vec::new(),
+        }
     }
 
     /// 重采样至复用缓冲（输出长度 = input.len() * ratio），全程零堆分配。
@@ -44,7 +52,19 @@ impl Resampler {
             return;
         }
 
-        let n = input.len();
+        // 降采样先低通抗混叠；升采样（ratio>=1）无混叠风险，直通。
+        let src: &[f32] = if !self.lowpass.is_empty() {
+            self.filtered.clear();
+            apply_fir(input, &self.lowpass, &mut self.filtered);
+            &self.filtered
+        } else {
+            input
+        };
+
+        let n = src.len();
+        if n == 0 {
+            return;
+        }
         let last = n - 1;
         let output_len = (n as f64 * ratio) as usize;
         output.reserve(output_len);
@@ -55,10 +75,10 @@ impl Resampler {
             let frac = (src_pos - src_idx as f64) as f32;
 
             // Catmull-Rom 四点；y0 以 prev_last 封头，y2/y3 越界钳位至末样本。
-            let y0 = if src_idx == 0 { self.prev_last } else { input[src_idx - 1] };
-            let y1 = input[src_idx];
-            let y2 = if src_idx < last { input[src_idx + 1] } else { input[last] };
-            let y3 = if src_idx + 1 < last { input[src_idx + 2] } else { input[last] };
+            let y0 = if src_idx == 0 { self.prev_last } else { src[src_idx - 1] };
+            let y1 = src[src_idx];
+            let y2 = if src_idx < last { src[src_idx + 1] } else { src[last] };
+            let y3 = if src_idx + 1 < last { src[src_idx + 2] } else { src[last] };
 
             let frac2 = frac * frac;
             let frac3 = frac2 * frac;
@@ -69,7 +89,54 @@ impl Resampler {
             output.push(a0 * frac3 + a1 * frac2 + a2 * frac + y1);
         }
 
-        self.prev_last = input[last];
+        self.prev_last = src[last];
+    }
+}
+
+/// 设计 sinc+hamming 窗低通 FIR，截止设在 0.8×目标奈奎斯特，归一化 DC 增益为 1。
+/// ratio = out_rate / in_rate（<1 降采样），cutoff 为相对输入采样率的归一化频率。
+fn design_lowpass(ratio: f64) -> Vec<f32> {
+    const TAPS: usize = 15; // 奇数，线性相位；旁瓣抑制与算力折中
+    let cutoff = ratio * 0.4; // 0.8 × 目标奈奎斯特（ratio/2），归一化相对输入采样率
+    let mid = (TAPS - 1) as f64 / 2.0;
+    let mut h = [0f32; TAPS];
+    for i in 0..TAPS {
+        let n = i as f64 - mid;
+        let sinc = if n.abs() < 1e-9 {
+            2.0 * cutoff
+        } else {
+            (2.0 * cutoff * std::f64::consts::PI * n).sin() / (std::f64::consts::PI * n)
+        };
+        let hamming = 0.54 - 0.46 * (2.0 * std::f64::consts::PI * n / (TAPS - 1) as f64).cos();
+        h[i] = (sinc * hamming) as f32;
+    }
+    // 归一化 DC 增益为 1，避免通带电平偏移。
+    let sum: f32 = h.iter().sum();
+    if sum > 0.0 {
+        for v in &mut h {
+            *v /= sum;
+        }
+    }
+    h.to_vec()
+}
+
+/// FIR 卷积，边界钳位（首尾样本重复），写入复用缓冲。
+fn apply_fir(input: &[f32], h: &[f32], output: &mut Vec<f32>) {
+    if input.is_empty() {
+        return;
+    }
+    let taps = h.len();
+    let half = (taps / 2) as isize;
+    let last = input.len() as isize - 1;
+    output.reserve(input.len());
+    for i in 0..input.len() {
+        let mut acc = 0f32;
+        let base = i as isize - half;
+        for j in 0..taps {
+            let idx = (base + j as isize).clamp(0, last) as usize;
+            acc += h[j] * input[idx];
+        }
+        output.push(acc);
     }
 }
 
@@ -84,12 +151,12 @@ struct InputState {
 }
 
 impl InputState {
-    fn new() -> Self {
+    fn new(ratio: f64) -> Self {
         Self {
             buffer: VecDeque::with_capacity(FRAME_SIZE * 4),
             queue: VecDeque::with_capacity(FRAME_QUEUE_CAP),
             dropped: 0,
-            resampler: Resampler::new(),
+            resampler: Resampler::new(ratio),
             mono_buf: Vec::new(),
             resampled: Vec::with_capacity(FRAME_SIZE * 2),
         }
@@ -106,12 +173,12 @@ struct OutputState {
 }
 
 impl OutputState {
-    fn new() -> Self {
+    fn new(ratio: f64) -> Self {
         Self {
             buffer: VecDeque::with_capacity(4096),
             queue: VecDeque::with_capacity(FRAME_QUEUE_CAP),
             dropped: 0,
-            resampler: Resampler::new(),
+            resampler: Resampler::new(ratio),
             resampled: Vec::with_capacity(FRAME_SIZE * 2),
         }
     }
@@ -170,7 +237,7 @@ impl AudioManager {
 
         let resample_ratio = SAMPLE_RATE as f64 / input_sample_rate as f64;
 
-        let state = Arc::new(Mutex::new(InputState::new()));
+        let state = Arc::new(Mutex::new(InputState::new(resample_ratio)));
         self.input_state = Some(state.clone());
 
         let stream = match sample_format {
@@ -207,7 +274,7 @@ impl AudioManager {
 
         let resample_ratio = output_sample_rate as f64 / SAMPLE_RATE as f64;
 
-        let state = Arc::new(Mutex::new(OutputState::new()));
+        let state = Arc::new(Mutex::new(OutputState::new(resample_ratio)));
         self.output_state = Some(state.clone());
 
         let stream = match sample_format {
