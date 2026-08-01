@@ -115,16 +115,28 @@ impl OpusCodec {
     }
 
     /// 解码 Opus 包为单帧 f32 PCM，直写栈数组（零堆分配）。
+    /// 传入空切片时执行 PLC（丢包隐藏）：data=NULL, len=0，由解码器内部状态重建当前帧。
     pub fn decode(&mut self, input: &[u8]) -> Result<[f32; FRAME_SIZE]> {
         let mut out = [0f32; FRAME_SIZE];
-        let samples = (self.decode_float)(
-            self.decoder,
-            input.as_ptr(),
-            input.len() as c_int,
-            out.as_mut_ptr(),
-            FRAME_SIZE as c_int,
-            0, // decode_fec
-        );
+        let samples = if input.is_empty() {
+            (self.decode_float)(
+                self.decoder,
+                std::ptr::null(),
+                0,
+                out.as_mut_ptr(),
+                FRAME_SIZE as c_int,
+                0, // decode_fec
+            )
+        } else {
+            (self.decode_float)(
+                self.decoder,
+                input.as_ptr(),
+                input.len() as c_int,
+                out.as_mut_ptr(),
+                FRAME_SIZE as c_int,
+                0, // decode_fec
+            )
+        };
 
         if samples < 0 {
             return Err(anyhow!("Opus 解码失败: {}", samples));

@@ -131,8 +131,12 @@ impl Client {
                                 Ok(decoded) => {
                                     self.audio.write_frame(decoded);
                                 }
-                                Err(e) => {
-                                    warn!("Opus 解码失败: {}", e);
+                                Err(_) => {
+                                    // 解码失败（丢包/损坏）：PLC 重建当前帧维持连续性，仍失败才丢弃。
+                                    match self.opus.decode(&[]) {
+                                        Ok(plc) => self.audio.write_frame(plc),
+                                        Err(e) => warn!("Opus 解码失败: {}", e),
+                                    }
                                 }
                             }
                         }
@@ -182,7 +186,11 @@ impl Client {
             ServerMessage::Tts { state: tts_state, text } => {
                 // start/stop 切换状态机；sentence_start 携带分句正文，流式落日志。
                 match tts_state {
-                    TtsState::Start => info!("AI 开始说话"),
+                    TtsState::Start => {
+                        info!("AI 开始说话");
+                        // 清空上一句残留播放缓冲，避免尾帧串入新句开头。
+                        self.audio.clear_playback();
+                    }
                     TtsState::Stop => info!("AI 说完，继续监听"),
                     TtsState::SentenceStart => {
                         if let Some(text) = text {

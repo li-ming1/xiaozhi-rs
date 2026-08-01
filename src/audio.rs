@@ -14,6 +14,8 @@ pub const FRAME_SIZE: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize;
 
 /// 抖动缓冲容量：25 帧 ≈ 500ms。余量过小会在网络突发/时钟漂移时丢新帧，引入可闻咔哒。
 const FRAME_QUEUE_CAP: usize = 25;
+/// 播放缓冲目标深度（帧数）：稳态约 60ms 存量，抗到达抖动；启动/突发期一次补足，避免首字欠载卡顿。
+const TARGET_FRAMES: usize = 4;
 
 /// 入队；溢出时丢最旧帧以封顶延迟，丢帧计数并限频告警（[DROP] 便于 grep）。
 fn push_frame(queue: &mut VecDeque<[f32; FRAME_SIZE]>, dropped: &mut u64, frame: [f32; FRAME_SIZE], side: &str) {
@@ -27,6 +29,15 @@ fn push_frame(queue: &mut VecDeque<[f32; FRAME_SIZE]>, dropped: &mut u64, frame:
     queue.push_back(frame);
 }
 
+/// Catmull-Rom 四点插值（Horner 求值，与原展开式数学等价，乘法由 5 次降为 3 次）。
+#[inline(always)]
+fn catmull_rom(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
+    let a0 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+    let a1 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    let a2 = -0.5 * y0 + 0.5 * y2;
+    ((a0 * t + a1) * t + a2) * t + y1
+}
+
 /// Catmull-Rom 三次样条重采样器，跨块复用前一输入末样本作 y0，抑制边界高频伪影。
 struct Resampler {
     prev_last: f32,
@@ -38,35 +49,64 @@ impl Resampler {
     }
 
     /// 重采样至复用缓冲（输出长度 = input.len() * ratio），全程零堆分配。
+    /// 源位置以增量累加免每样本除法；主循环剥离边界分支，利于自动向量化。
     fn process(&mut self, input: &[f32], ratio: f64, output: &mut Vec<f32>) {
+        let n = input.len();
+        let output_len = if n == 0 || ratio <= 0.0 { 0 } else { (n as f64 * ratio) as usize };
         output.clear();
-        if input.is_empty() || ratio <= 0.0 {
+        if output_len == 0 {
             return;
         }
-
-        let n = input.len();
-        let last = n - 1;
-        let output_len = (n as f64 * ratio) as usize;
         output.reserve(output_len);
 
-        for i in 0..output_len {
-            let src_pos = i as f64 / ratio;
-            let src_idx = src_pos.floor() as usize;
-            let frac = (src_pos - src_idx as f64) as f32;
+        let last = n - 1;
+        let inv_ratio = 1.0 / ratio;
+        let mut src_pos = 0.0f64;
+        let mut i = 0usize;
 
-            // Catmull-Rom 四点；y0 以 prev_last 封头，y2/y3 越界钳位至末样本。
+        // 前导段：src_idx == 0，y0 取上一块末样本封头（至多 ceil(ratio) 个输出样本）。
+        while i < output_len && (src_pos as usize) == 0 {
+            let t = (src_pos - (src_pos as usize) as f64) as f32;
+            output.push(catmull_rom(
+                self.prev_last,
+                input[0],
+                input[1.min(last)],
+                input[2.min(last)],
+                t,
+            ));
+            i += 1;
+            src_pos += inv_ratio;
+        }
+
+        // 主循环：src_idx ∈ [1, n-3]，四点均在界内，无边界分支。
+        while i < output_len {
+            let src_idx = src_pos as usize;
+            if src_idx + 2 >= n {
+                break;
+            }
+            let t = (src_pos - src_idx as f64) as f32;
+            output.push(catmull_rom(
+                input[src_idx - 1],
+                input[src_idx],
+                input[src_idx + 1],
+                input[src_idx + 2],
+                t,
+            ));
+            i += 1;
+            src_pos += inv_ratio;
+        }
+
+        // 尾部段：src_idx ∈ [n-2, n-1]，y2/y3 越界钳位至末样本。
+        while i < output_len {
+            let src_idx = src_pos as usize;
+            let t = (src_pos - src_idx as f64) as f32;
             let y0 = if src_idx == 0 { self.prev_last } else { input[src_idx - 1] };
-            let y1 = input[src_idx];
+            let y1 = input[src_idx.min(last)];
             let y2 = if src_idx < last { input[src_idx + 1] } else { input[last] };
             let y3 = if src_idx + 1 < last { input[src_idx + 2] } else { input[last] };
-
-            let frac2 = frac * frac;
-            let frac3 = frac2 * frac;
-            let a0 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
-            let a1 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
-            let a2 = -0.5 * y0 + 0.5 * y2;
-
-            output.push(a0 * frac3 + a1 * frac2 + a2 * frac + y1);
+            output.push(catmull_rom(y0, y1, y2, y3, t));
+            i += 1;
+            src_pos += inv_ratio;
         }
 
         self.prev_last = input[last];
@@ -96,13 +136,17 @@ impl InputState {
     }
 }
 
-/// 输出端共享状态：单声道缓冲 + 有界帧队列 + 重采样器，单次加锁。
+/// 输出端共享状态：单声道缓冲 + 有界帧队列 + 重采样器 + 欠载防咔哒状态，单次加锁。
 struct OutputState {
     buffer: VecDeque<f32>,  // 单声道，播放时按 channels 展开
     queue: VecDeque<[f32; FRAME_SIZE]>,
     dropped: u64,
     resampler: Resampler,
     resampled: Vec<f32>,
+    last_out: f32,       // 最近一次正常输出的样本
+    ramp_pending: bool,  // 正常输出后置 true，欠载时启动斜坡
+    ramp_left: usize,    // 剩余斜坡样本数
+    ramp_len: usize,     // 斜坡总长（5ms 按输出采样率折算），首次调用初始化
 }
 
 impl OutputState {
@@ -113,6 +157,10 @@ impl OutputState {
             dropped: 0,
             resampler: Resampler::new(),
             resampled: Vec::with_capacity(FRAME_SIZE * 2),
+            last_out: 0.0,
+            ramp_pending: false,
+            ramp_left: 0,
+            ramp_len: 0,
         }
     }
 }
@@ -243,6 +291,19 @@ impl AudioManager {
         }
     }
 
+    /// 清空播放缓冲并重置斜坡/重采样状态（TTS 开始前调用，防尾帧串扰与首字卡顿）。
+    pub fn clear_playback(&self) {
+        if let Some(state) = &self.output_state {
+            let mut st = state.lock().unwrap();
+            st.queue.clear();
+            st.buffer.clear();
+            st.ramp_pending = false;
+            st.ramp_left = 0;
+            st.last_out = 0.0;
+            st.resampler = Resampler::new();
+        }
+    }
+
     /// 停止流并清空队列，避免重连后回放历史积压。
     pub fn stop(&mut self) {
         self.input_stream = None;
@@ -330,27 +391,36 @@ fn process_input_chunk<S: Copy>(
     st.mono_buf.clear();
     if channels == 1 {
         st.mono_buf.extend(samples.iter().map(|x| to_f32(*x)));
+    } else if channels == 2 {
+        // 立体声特化：chunks_exact 免边界检查，平均以 0.5 乘法替代除法。
+        st.mono_buf.extend(
+            samples
+                .chunks_exact(2)
+                .map(|ch| (to_f32(ch[0]) + to_f32(ch[1])) * 0.5),
+        );
     } else {
         st.mono_buf.extend(
             samples
                 .chunks(channels)
-                .map(|ch| ch.iter().map(|x| to_f32(*x)).sum::<f32>() / channels as f32),
+                .map(|ch| ch.iter().map(|x| to_f32(*x)).sum::<f32>() * (1.0 / channels as f32)),
         );
     }
     st.resampler.process(&st.mono_buf, ratio, &mut st.resampled);
     st.buffer.extend(st.resampled.iter().copied());
     while st.buffer.len() >= FRAME_SIZE {
-        // 栈数组收帧，免每帧堆分配；VecDeque::drain 仅移动所需元素。
+        // 栈数组收帧：make_contiguous 后单次 memcpy（替代 drain 逐元素），免每帧堆分配。
         let mut frame = [0f32; FRAME_SIZE];
-        for (dst, src) in frame.iter_mut().zip(st.buffer.drain(..FRAME_SIZE)) {
-            *dst = src;
-        }
+        let contig = st.buffer.make_contiguous();
+        frame.copy_from_slice(&contig[..FRAME_SIZE]);
+        st.buffer.drain(..FRAME_SIZE);
         push_frame(&mut st.queue, &mut st.dropped, frame, "输入");
     }
 }
 
 /// 输出回调：取帧 → 重采样 → 单声道入缓冲 → 按 channels 展开填充。
 /// 缓冲仅存单声道（空间减半），展开时每样本转码一次即复制，避免重复转码。
+/// 每次回调最多消费一帧（20ms），到达抖动由队列吸收、缓冲不积压；
+/// 欠载时自上次样本线性斜坡到 0，消除硬切静音的咔哒。
 fn fill_output<T: FromF32Sample>(
     data: &mut [T],
     channels: usize,
@@ -359,25 +429,77 @@ fn fill_output<T: FromF32Sample>(
 ) {
     let mut s = state.lock().unwrap();
     let st = &mut *s;
-    while let Some(frame) = st.queue.pop_front() {
-        st.resampler.process(&frame, ratio, &mut st.resampled);
-        st.buffer.extend(st.resampled.iter().copied());
+    if st.ramp_len == 0 {
+        // 5ms 按输出采样率折算（16k 基准为 80 样本）。
+        st.ramp_len = ((80.0 * ratio) as usize).max(1);
+    }
+    // 按需补充到目标缓冲深度（3 帧 ≈ 60ms）：稳态每回调约补一帧，
+    // 启动/突发期一次补足目标深度，抗到达抖动，避免首字欠载卡顿。
+    let target_samples = (FRAME_SIZE as f64 * ratio * TARGET_FRAMES as f64) as usize;
+    while st.buffer.len() < target_samples {
+        match st.queue.pop_front() {
+            Some(frame) => {
+                st.resampler.process(&frame, ratio, &mut st.resampled);
+                st.buffer.extend(st.resampled.iter().copied());
+            }
+            None => break,
+        }
     }
     // make_contiguous 后整块拷贝，替代逐样本 pop_front（48k 立体声下每秒约 10 万次调用 → 单次 memcpy）。
     let frames_needed = data.len() / channels;
     let avail = st.buffer.len().min(frames_needed);
     if avail > 0 {
         let contiguous = st.buffer.make_contiguous();
-        for (chunk, &v) in data.chunks_mut(channels).zip(contiguous[..avail].iter()) {
-            let s = T::from_f32_sample(v);
-            for dst in chunk {
-                *dst = s;
+        if channels == 2 {
+            // 立体声特化：chunks_exact_mut + 定长切片模式解构，免索引边界检查。
+            for (pair, &v) in data.chunks_exact_mut(2).zip(contiguous[..avail].iter()) {
+                let s = T::from_f32_sample(v);
+                if let [l, r] = pair {
+                    *l = s;
+                    *r = s;
+                }
+                st.last_out = v;
+            }
+        } else {
+            for (chunk, &v) in data.chunks_mut(channels).zip(contiguous[..avail].iter()) {
+                let s = T::from_f32_sample(v);
+                for dst in chunk {
+                    *dst = s;
+                }
+                st.last_out = v;
             }
         }
         st.buffer.drain(..avail);
+        st.ramp_pending = true;
+        st.ramp_left = 0;
     }
-    // 欠载补静音。
-    for dst in &mut data[avail * channels..] {
-        *dst = T::from_f32_sample(0.0);
+    // 欠载：斜坡段逐样本衰减，其余批量补 0（单次 fill 替代逐样本写，48k 立体声每回调最多省 960 次转码）。
+    let tail = &mut data[avail * channels..];
+    let mut written = 0usize;
+    if !tail.is_empty() {
+        if st.ramp_left > 0 {
+            // 续上次未完成的斜坡。
+            let take = st.ramp_left.min(tail.len());
+            for dst in tail.iter_mut().take(take) {
+                st.ramp_left -= 1;
+                *dst = T::from_f32_sample(st.last_out * (st.ramp_left as f32 / st.ramp_len as f32));
+            }
+            written = take;
+        } else if st.ramp_pending {
+            st.ramp_pending = false;
+            if st.last_out.abs() > 1e-4 {
+                st.ramp_left = st.ramp_len - 1;
+                let take = st.ramp_left.min(tail.len());
+                for dst in tail.iter_mut().take(take) {
+                    st.ramp_left -= 1;
+                    *dst = T::from_f32_sample(st.last_out * (st.ramp_left as f32 / st.ramp_len as f32));
+                }
+                written = take;
+            }
+        }
+        if written < tail.len() {
+            let zero = T::from_f32_sample(0.0);
+            tail[written..].fill(zero);
+        }
     }
 }
