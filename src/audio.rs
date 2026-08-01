@@ -16,6 +16,8 @@ pub const FRAME_SIZE: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize;
 const FRAME_QUEUE_CAP: usize = 25;
 /// 播放缓冲目标深度（帧数）：稳态约 60ms 存量，抗到达抖动；启动/突发期一次补足，避免首字欠载卡顿。
 const TARGET_FRAMES: usize = 4;
+/// 输出缓冲读游标压缩阈值（样本）：head 达到该值才搬移一次，替代稳态下逐回调搬移。
+const COMPACT_THRESHOLD: usize = 8192;
 
 /// 入队；溢出时丢最旧帧以封顶延迟，丢帧计数并限频告警（[DROP] 便于 grep）。
 fn push_frame(queue: &mut VecDeque<[f32; FRAME_SIZE]>, dropped: &mut u64, frame: [f32; FRAME_SIZE], side: &str) {
@@ -130,37 +132,41 @@ impl InputState {
             queue: VecDeque::with_capacity(FRAME_QUEUE_CAP),
             dropped: 0,
             resampler: Resampler::new(),
-            mono_buf: Vec::new(),
-            resampled: Vec::with_capacity(FRAME_SIZE * 2),
+            mono_buf: Vec::with_capacity(FRAME_SIZE * 4),
+            resampled: Vec::with_capacity(FRAME_SIZE * 4),
         }
     }
 }
 
-/// 输出端共享状态：单声道缓冲 + 有界帧队列 + 重采样器 + 欠载防咔哒状态，单次加锁。
+/// 输出端共享状态：单声道连续缓冲（读游标 head 延迟压缩）+ 有界帧队列 + 重采样器 + 欠载防咔哒状态，单次加锁。
 struct OutputState {
-    buffer: VecDeque<f32>,  // 单声道，播放时按 channels 展开
+    buffer: Vec<f32>,     // 单声道连续存储，播放时按 channels 展开；head 为已消费游标
+    head: usize,          // 读游标：有效数据为 buffer[head..]，避免每回调搬移
     queue: VecDeque<[f32; FRAME_SIZE]>,
     dropped: u64,
     resampler: Resampler,
     resampled: Vec<f32>,
-    last_out: f32,       // 最近一次正常输出的样本
-    ramp_pending: bool,  // 正常输出后置 true，欠载时启动斜坡
-    ramp_left: usize,    // 剩余斜坡样本数
-    ramp_len: usize,     // 斜坡总长（5ms 按输出采样率折算），首次调用初始化
+    last_out: f32,        // 最近一次正常输出的样本
+    ramp_pending: bool,   // 正常输出后置 true，欠载时启动斜坡
+    ramp_left: usize,     // 剩余斜坡样本数
+    ramp_len: usize,      // 斜坡总长（5ms 按输出采样率折算），首次调用初始化
+    target_samples: usize, // 目标缓冲深度（稳态恒定），首次调用缓存
 }
 
 impl OutputState {
     fn new() -> Self {
         Self {
-            buffer: VecDeque::with_capacity(4096),
+            buffer: Vec::with_capacity(4096),
+            head: 0,
             queue: VecDeque::with_capacity(FRAME_QUEUE_CAP),
             dropped: 0,
             resampler: Resampler::new(),
-            resampled: Vec::with_capacity(FRAME_SIZE * 2),
+            resampled: Vec::with_capacity(FRAME_SIZE * 4),
             last_out: 0.0,
             ramp_pending: false,
             ramp_left: 0,
             ramp_len: 0,
+            target_samples: 0,
         }
     }
 }
@@ -297,6 +303,7 @@ impl AudioManager {
             let mut st = state.lock().unwrap();
             st.queue.clear();
             st.buffer.clear();
+            st.head = 0;
             st.ramp_pending = false;
             st.ramp_left = 0;
             st.last_out = 0.0;
@@ -317,6 +324,7 @@ impl AudioManager {
             let mut st = state.lock().unwrap();
             st.queue.clear();
             st.buffer.clear();
+            st.head = 0;
         }
     }
 }
@@ -419,7 +427,7 @@ fn process_input_chunk<S: Copy>(
 
 /// 输出回调：取帧 → 重采样 → 单声道入缓冲 → 按 channels 展开填充。
 /// 缓冲仅存单声道（空间减半），展开时每样本转码一次即复制，避免重复转码。
-/// 每次回调最多消费一帧（20ms），到达抖动由队列吸收、缓冲不积压；
+/// 按需补充到目标深度、读游标 head 延迟压缩（稳态约 17 次回调才搬移一次）；
 /// 欠载时自上次样本线性斜坡到 0，消除硬切静音的咔哒。
 fn fill_output<T: FromF32Sample>(
     data: &mut [T],
@@ -430,13 +438,13 @@ fn fill_output<T: FromF32Sample>(
     let mut s = state.lock().unwrap();
     let st = &mut *s;
     if st.ramp_len == 0 {
-        // 5ms 按输出采样率折算（16k 基准为 80 样本）。
+        // 5ms 按输出采样率折算（16k 基准为 80 样本）；目标深度一并缓存（稳态恒定）。
         st.ramp_len = ((80.0 * ratio) as usize).max(1);
+        st.target_samples = (FRAME_SIZE as f64 * ratio * TARGET_FRAMES as f64) as usize;
     }
-    // 按需补充到目标缓冲深度（3 帧 ≈ 60ms）：稳态每回调约补一帧，
+    // 按需补充到目标缓冲深度（≈ TARGET_FRAMES 帧）：稳态每回调约补一帧，
     // 启动/突发期一次补足目标深度，抗到达抖动，避免首字欠载卡顿。
-    let target_samples = (FRAME_SIZE as f64 * ratio * TARGET_FRAMES as f64) as usize;
-    while st.buffer.len() < target_samples {
+    while st.buffer.len() - st.head < st.target_samples {
         match st.queue.pop_front() {
             Some(frame) => {
                 st.resampler.process(&frame, ratio, &mut st.resampled);
@@ -445,14 +453,18 @@ fn fill_output<T: FromF32Sample>(
             None => break,
         }
     }
-    // make_contiguous 后整块拷贝，替代逐样本 pop_front（48k 立体声下每秒约 10 万次调用 → 单次 memcpy）。
+    // 读游标切片整块拷贝（免逐样本 pop_front）；head 后移，不立即搬移。
     let frames_needed = data.len() / channels;
-    let avail = st.buffer.len().min(frames_needed);
+    let avail = (st.buffer.len() - st.head).min(frames_needed);
     if avail > 0 {
-        let contiguous = st.buffer.make_contiguous();
-        if channels == 2 {
+        if channels == 1 {
+            for (dst, &v) in data.iter_mut().zip(st.buffer[st.head..st.head + avail].iter()) {
+                *dst = T::from_f32_sample(v);
+                st.last_out = v;
+            }
+        } else if channels == 2 {
             // 立体声特化：chunks_exact_mut + 定长切片模式解构，免索引边界检查。
-            for (pair, &v) in data.chunks_exact_mut(2).zip(contiguous[..avail].iter()) {
+            for (pair, &v) in data.chunks_exact_mut(2).zip(st.buffer[st.head..st.head + avail].iter()) {
                 let s = T::from_f32_sample(v);
                 if let [l, r] = pair {
                     *l = s;
@@ -461,7 +473,7 @@ fn fill_output<T: FromF32Sample>(
                 st.last_out = v;
             }
         } else {
-            for (chunk, &v) in data.chunks_mut(channels).zip(contiguous[..avail].iter()) {
+            for (chunk, &v) in data.chunks_mut(channels).zip(st.buffer[st.head..st.head + avail].iter()) {
                 let s = T::from_f32_sample(v);
                 for dst in chunk {
                     *dst = s;
@@ -469,9 +481,14 @@ fn fill_output<T: FromF32Sample>(
                 st.last_out = v;
             }
         }
-        st.buffer.drain(..avail);
+        st.head += avail;
         st.ramp_pending = true;
         st.ramp_left = 0;
+    }
+    // 延迟压缩：head 达阈值才搬移一次（稳态 48k 下约每 17 回调一次，替代逐回调 make_contiguous）。
+    if st.head >= COMPACT_THRESHOLD {
+        st.buffer.drain(..st.head);
+        st.head = 0;
     }
     // 欠载：斜坡段逐样本衰减，其余批量补 0（单次 fill 替代逐样本写，48k 立体声每回调最多省 960 次转码）。
     let tail = &mut data[avail * channels..];
