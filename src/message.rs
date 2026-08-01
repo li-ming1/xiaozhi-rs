@@ -38,6 +38,9 @@ pub enum ServerMessage {
 
     Tts {
         state: TtsState,
+        // sentence_start 携带分句正文；start/stop 无此字段。
+        #[serde(default)]
+        text: Option<String>,
     },
 
     Listen {
