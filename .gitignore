@@ -3,8 +3,7 @@ target/
 **/*.rs.bk
 *.pdb
 
-# Cargo
-Cargo.lock
+# Cargo（提交 Cargo.lock 以固定依赖版本，保证可复现构建）
 
 # IDE
 .vscode/
@@ -34,3 +33,5 @@ Thumbs.db
 # Project specific
 efuse.json
 dist/
+mqtt-udp_zh.md
+websocket_zh.md

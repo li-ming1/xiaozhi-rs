@@ -1,24 +1,40 @@
 [package]
 name = "xiaozhi-rs"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
-description = "小智客户端 - Rust 极简实现"
+description = "小智客户端 - Rust 实现（MQTT+UDP 主链路 / WebSocket 回退）"
 license = "MIT"
 readme = "README.md"
 
 [dependencies]
-# 异步运行时
-tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util", "signal"] }
+# 异步运行时：多线程，DSP/控制/收发独立调度
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+# 取消令牌
+tokio-util = { version = "0.7", features = ["rt"] }
 
-# WebSocket（rustls 纯 Rust TLS，无需系统 OpenSSL）
+# WebSocket（rustls 纯 Rust TLS）
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
-# 仅用 split/SinkExt/StreamExt：关闭默认 features 精简编译
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
-# HTTP 客户端（OTA/激活）— ureq 轻量替代 reqwest，共享 rustls/ring，纯 Rust 跨平台
-ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
-# rustls 直接依赖：为 tokio-tungstenite 安装 ring crypto provider（避免 aws-lc-rs 的 cmake/NASM 依赖）
+# HTTP 客户端（OTA/激活）— reqwest 共享 rustls/ring（rustls-no-provider 复用全局安装的 ring provider）
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "webpki-roots", "json"] }
+# rustls：为 tokio-tungstenite / reqwest / rumqttc 安装 ring crypto provider
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+# MQTT 客户端（use-rustls-no-provider：注入全局 ring provider 的 ClientConfig）
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
+# rustls 根证书（MQTT over TLS 用）
+webpki-roots = "0.26"
+
+# 无锁 SPSC 环形缓冲：CPAL 回调 <-> DSP worker
+rtrb = "0.3"
+
+# 高质量重采样（关闭默认 FFT feature）
+rubato = { version = "4.0", default-features = false }
+
+# AES-CTR（UDP 音频加密）
+aes = "0.9"
+ctr = "0.10"
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
@@ -27,39 +43,43 @@ serde_json = "1"
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# 日志（手写极简 logger，见 main.rs，替代 env_logger）
+# 日志
 log = "0.4"
 
 # 错误处理
 anyhow = "1"
+thiserror = "2"
 
 # 目录
 directories = "6"
 
-# 加密（hex 编码为 ~8 行手写实现，见 identity.rs）
+# 加密（HMAC 签名）
 sha2 = "0.11"
 hmac = "0.13"
 
 # 主机名
 hostname = "0.4"
 
-# HTTP（WebSocket Headers）
+# HTTP 类型（WebSocket Headers / 通用 URI）
 http = "1"
 tungstenite = "0.30"
 
 # 音频
 cpal = "0.18"
 
-# Opus 编解码（使用 libloading 加载预编译库）
+# Opus 编解码（保留 libloading 动态加载预编译库）
 libloading = "0.9"
 
+# Windows 未处理异常过滤器（诊断原生崩溃）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader"] }
+
 [profile.release]
-# 本项目音频 DSP（重采样/Opus）为计算密集型，整体提至 3；依赖库仍优化体积
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 
 [profile.release.package."*"]
-opt-level = "z"
+opt-level = 3
