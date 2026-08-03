@@ -44,12 +44,69 @@ fn to_hex(bytes: &[u8]) -> String {
     })
 }
 
+/// 应用配置目录（跨平台，替代 directories crate）：
+/// Windows `%APPDATA%\xiaozhi-rs`；macOS `~/Library/Application Support/xiaozhi-rs`；
+/// Linux `$XDG_CONFIG_HOME/xiaozhi-rs` 或 `~/.config/xiaozhi-rs`。
+fn app_config_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .map(|p| PathBuf::from(p).join("xiaozhi-rs"))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(|h| {
+                PathBuf::from(h)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("xiaozhi-rs")
+            })
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|d| d.join("xiaozhi-rs"))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+    #[cfg(not(any(windows, target_os = "macos", unix)))]
+    {
+        PathBuf::from(".")
+    }
+}
+
+/// 主机名（跨平台，替代 hostname crate；仅用于首次生成 HMAC 密钥并固化）。
+fn hostname_str() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+    #[cfg(not(any(windows, target_os = "macos", unix)))]
+    {
+        "unknown".to_string()
+    }
+}
+
 impl DeviceIdentity {
-    /// 定位配置目录，存在则加载，否则生成并落盘。
+    /// 定位配置目录（`%APPDATA%\xiaozhi-rs\efuse.json`），存在则加载，否则生成并落盘。
     pub fn load_or_create() -> Result<Self> {
-        let config_dir = directories::ProjectDirs::from("com", "xiaozhi", "xiaozhi-rs")
-            .map(|dirs| dirs.config_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let config_dir = app_config_dir();
 
         fs::create_dir_all(&config_dir)?;
         let efuse_path = config_dir.join("efuse.json");
@@ -74,8 +131,9 @@ impl DeviceIdentity {
             Err(_) => return Self::create_new(efuse_path),
         };
 
-        // 持久化 client_id 优先；缺失时回退 UUID（兼容旧文件）。
-        let client_id = if data.client_id.is_empty() {
+        // 持久化 client_id 优先；缺失时补一个 UUID（旧文件迁移场景）。
+        let client_id_missing = data.client_id.is_empty();
+        let client_id = if client_id_missing {
             Uuid::new_v4().to_string()
         } else {
             data.client_id
@@ -98,6 +156,13 @@ impl DeviceIdentity {
             efuse_path: efuse_path.to_path_buf(),
         };
 
+        // 补出的 client_id 必须落盘：否则每次启动都会生成不同 UUID，
+        // 且文件里始终看不到该字段。
+        if client_id_missing {
+            identity.save()?;
+            info!("已为设备身份补齐 client_id: {}", identity.client_id);
+        }
+
         info!("已加载设备身份: {}", identity.device_id);
         Ok(identity)
     }
@@ -115,9 +180,7 @@ impl DeviceIdentity {
         let serial_number = format!("SN-{}-{}", hash[..8].to_uppercase(), mac_clean);
 
         // HMAC 密钥绑定主机名+设备+客户端，防止凭证跨机复用。
-        let hostname = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+        let hostname = hostname_str();
         let hmac_input = format!("{}||{}||{}", hostname, device_id, client_id);
         let hmac_key = to_hex(&Sha256::digest(hmac_input.as_bytes()));
 

@@ -214,6 +214,8 @@ async fn send_loop(
     base_nonce: [u8; 16],
 ) {
     let mut local_sequence: u32 = 0;
+    // 加密与组包缓冲常驻复用，避免每帧堆分配。
+    let mut packet: Vec<u8> = Vec::with_capacity(UDP_MAX_PACKET);
     loop {
         tokio::select! {
             biased;
@@ -244,7 +246,7 @@ async fn send_loop(
                 let iv = hdr.build_iv(&base_nonce);
                 let mut encrypted = audio;
                 cipher.apply_keystream(&iv, &mut encrypted);
-                let mut packet = Vec::with_capacity(HEADER_SIZE + encrypted.len());
+                packet.clear();
                 packet.extend_from_slice(&iv);
                 packet.extend_from_slice(&encrypted);
                 if let Err(e) = udp.send(&packet).await {

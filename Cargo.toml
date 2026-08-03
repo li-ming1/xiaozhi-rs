@@ -7,8 +7,8 @@ license = "MIT"
 readme = "README.md"
 
 [dependencies]
-# 异步运行时：多线程，DSP/控制/收发独立调度
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+# 异步运行时：多线程，DSP/控制/收发独立调度（io-util 由依赖按需联合，无需显式启用）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 # 取消令牌
 tokio-util = { version = "0.7", features = ["rt"] }
 
@@ -40,8 +40,8 @@ ctr = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# UUID
-uuid = { version = "1", features = ["v4", "serde"] }
+# UUID（仅 v4 生成，序列化走 String，无需 serde feature）
+uuid = { version = "1", features = ["v4"] }
 
 # 日志
 log = "0.4"
@@ -50,15 +50,9 @@ log = "0.4"
 anyhow = "1"
 thiserror = "2"
 
-# 目录
-directories = "6"
-
 # 加密（HMAC 签名）
 sha2 = "0.11"
 hmac = "0.13"
-
-# 主机名
-hostname = "0.4"
 
 # HTTP 类型（WebSocket Headers / 通用 URI）
 http = "1"
@@ -78,7 +72,8 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "unwind"
+# abort：移除 unwind 表，显著减小体积。panic hook 仍会先执行（写退出原因日志）。
+panic = "abort"
 strip = true
 
 [profile.release.package."*"]

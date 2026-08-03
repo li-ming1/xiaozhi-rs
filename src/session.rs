@@ -12,7 +12,6 @@ use std::time::Instant;
 pub enum TransportKind {
     MqttUdp,
     WebSocket,
-    Scripted,
 }
 
 /// 会话纪元。

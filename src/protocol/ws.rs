@@ -1,9 +1,10 @@
-//! WebSocket 传输：v2 二进制协议（带时间戳，供服务端 AEC）为主，v1 原始 Opus 回退。
+//! WebSocket 传输：默认 v2 二进制协议（带时间戳，供服务端 AEC），可选 v3 精简头；
+//! v1 原始 Opus 回退。
 //!
 //! 协议要点（来自官方 websocket_zh.md）：
 //! - hello `version` 字段同时声明二进制协议版本（1=原始 / 2=BinaryProtocol2 / 3=BinaryProtocol3）。
 //! - 文本帧承载 JSON，二进制帧承载 Opus。
-//! - BinaryProtocol2（16 字节小端头 + payload，与 ESP32 原生 packed struct 一致）：
+//! - BinaryProtocol2（16 字节头）：
 //!   ```text
 //!   u16 version        // 2
 //!   u16 type           // 0=OPUS, 1=JSON（WS 下 JSON 走文本帧，故二进制 type 恒为 0）
@@ -12,9 +13,16 @@
 //!   u32 payload_size
 //!   u8  payload[]      // Opus
 //!   ```
+//! - BinaryProtocol3（4 字节头，官方新固件默认）：
+//!   ```text
+//!   u8  type           // 0=OPUS
+//!   u8  reserved       // 0
+//!   u16 payload_size   // htons（大端）
+//!   u8  payload[]      // Opus
+//!   ```
 //!
-//! 端序假设：ESP32 为小端且采用 packed struct memcpy，故 BinaryProtocol2 字段为小端。
-//! UDP 包头（见 crypto.rs）则协议文档明确为网络字节序（大端）。两者不同，切勿混用。
+//! 端序：v2 的 version/type/payload_size 用 htons/htonl（大端，实测服务器要求）；
+//! v3 的 payload_size 用 htons（大端）。UDP 包头（见 crypto.rs）同为网络字节序。
 
 use std::time::{Duration, Instant};
 
@@ -31,6 +39,7 @@ use crate::protocol::message::{AudioParams, ClientMessage, ServerMessage};
 use super::{ConnectParams, IncomingEvent, TransportHandles};
 
 const V2_HEADER_SIZE: usize = 16;
+const V3_HEADER_SIZE: usize = 4;
 const V2_TYPE_OPUS: u16 = 0;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const CONTROL_CHANNEL_CAP: usize = 16;
@@ -40,13 +49,19 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// WebSocket 传输。
 pub struct WsTransport {
-    /// 二进制协议版本：2 = BinaryProtocol2（时间戳，AEC），1 = 原始 Opus。
+    /// 二进制协议版本：2 = BinaryProtocol2（时间戳，AEC），3 = BinaryProtocol3（精简头），1 = 原始 Opus。
     pub binary_version: u16,
 }
 
 impl Default for WsTransport {
     fn default() -> Self {
-        Self { binary_version: 2 }
+        // 默认 v2（带 AEC 时间戳，已联调验证）；可用环境变量 XZ_WS_VERSION=1/2/3 切换。
+        let v = std::env::var("XZ_WS_VERSION")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .filter(|v| matches!(v, 1..=3))
+            .unwrap_or(2);
+        Self { binary_version: v }
     }
 }
 
@@ -72,7 +87,7 @@ impl WsTransport {
         ));
 
         // 接收任务。
-        tokio::spawn(recv_loop(receiver, incoming_tx.clone(), close_rx));
+        tokio::spawn(recv_loop(receiver, incoming_tx.clone(), close_rx, binary_version));
 
         Ok(TransportHandles {
             session_id,
@@ -130,6 +145,7 @@ async fn connect_and_handshake(
     let hello = match binary_version {
         1 => ClientMessage::hello_websocket_v1(),
         2 => ClientMessage::hello_websocket_v2(),
+        3 => ClientMessage::hello_websocket_v3(),
         v => {
             return Err(VoiceError::Protocol(format!(
                 "不支持的二进制协议版本: {}",
@@ -197,6 +213,20 @@ impl WsSender {
         frame.extend_from_slice(&0u32.to_be_bytes()); // reserved
         frame.extend_from_slice(&timestamp_ms.to_be_bytes());
         frame.extend_from_slice(&(opus.len() as u32).to_be_bytes());
+        frame.extend_from_slice(opus);
+        self.sink
+            .send(WsMessage::Binary(frame.into()))
+            .await
+            .map_err(|e| VoiceError::Transport(format!("音频发送失败: {}", e)))?;
+        Ok(())
+    }
+
+    async fn send_audio_v3(&mut self, opus: &[u8]) -> Result<()> {
+        // BinaryProtocol3：type=0、reserved=0、payload_size=htons(大端)。
+        let mut frame = Vec::with_capacity(V3_HEADER_SIZE + opus.len());
+        frame.push(0u8); // type: OPUS
+        frame.push(0u8); // reserved
+        frame.extend_from_slice(&(opus.len() as u16).to_be_bytes()); // payload_size (htons)
         frame.extend_from_slice(opus);
         self.sink
             .send(WsMessage::Binary(frame.into()))
@@ -282,11 +312,13 @@ async fn send_loop(
             }
             // 音频 latest-slot：取最新帧，过期帧已丢弃。
             opus = audio_slot.take() => {
-                let res = if binary_version == 2 {
-                    let ts = session_start.elapsed().as_millis() as u32;
-                    sender.send_audio_v2(&opus, ts).await
-                } else {
-                    sender.send_audio_raw(&opus).await
+                let res = match binary_version {
+                    2 => {
+                        let ts = session_start.elapsed().as_millis() as u32;
+                        sender.send_audio_v2(&opus, ts).await
+                    }
+                    3 => sender.send_audio_v3(&opus).await,
+                    _ => sender.send_audio_raw(&opus).await,
                 };
                 if let Err(e) = res {
                     warn!("WS 音频发送失败: {}", e);
@@ -310,11 +342,12 @@ async fn send_loop(
     }
 }
 
-/// 接收循环：文本→JSON，二进制→音频（v2 剥头 / v1 原始），断开→Closed。
+/// 接收循环：文本→JSON，二进制→音频（按版本剥头），断开→Closed。
 async fn recv_loop(
     mut receiver: WsReceiver,
     incoming_tx: mpsc::Sender<IncomingEvent>,
     mut close_rx: mpsc::Receiver<()>,
+    binary_version: u16,
 ) {
     loop {
         tokio::select! {
@@ -328,7 +361,7 @@ async fn recv_loop(
                         }
                     }
                     Ok(ReceivedMessage::Audio(data)) => {
-                        let payload = strip_binary_header(&data);
+                        let payload = strip_binary_header(&data, binary_version);
                         if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
                             break;
                         }
@@ -344,19 +377,105 @@ async fn recv_loop(
     }
 }
 
-/// 剥离二进制帧头：v2（16 字节大端头，version==2 且 payload_size 匹配）则剥头；
-/// 否则视为 v1 原始 Opus。
-fn strip_binary_header(data: &[u8]) -> Vec<u8> {
-    if data.len() >= V2_HEADER_SIZE {
-        let version = u16::from_be_bytes([data[0], data[1]]);
-        let payload_size = u32::from_be_bytes([
-            data[12], data[13], data[14], data[15],
-        ]) as usize;
-        if version == 2 && V2_HEADER_SIZE + payload_size == data.len() {
-            return data[V2_HEADER_SIZE..].to_vec();
+/// 剥离二进制帧头（按协商版本）：
+/// - v2：16 字节大端头（version==2 且 payload_size 匹配）则剥头；
+/// - v3：4 字节头（type==0 且 payload_size 匹配）则剥头；
+/// - v1 / 无法识别：原样返回（裸 Opus）。
+fn strip_binary_header(data: &[u8], binary_version: u16) -> Vec<u8> {
+    match binary_version {
+        2 => {
+            if data.len() >= V2_HEADER_SIZE {
+                let version = u16::from_be_bytes([data[0], data[1]]);
+                let payload_size =
+                    u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
+                if version == 2 && V2_HEADER_SIZE + payload_size == data.len() {
+                    return data[V2_HEADER_SIZE..].to_vec();
+                }
+            }
+            data.to_vec()
         }
+        3 => {
+            if data.len() >= V3_HEADER_SIZE {
+                let ty = data[0];
+                let payload_size = u16::from_be_bytes([data[2], data[3]]) as usize;
+                if ty == 0 && V3_HEADER_SIZE + payload_size == data.len() {
+                    return data[V3_HEADER_SIZE..].to_vec();
+                }
+            }
+            data.to_vec()
+        }
+        _ => data.to_vec(),
     }
-    data.to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 按 v3 规范构造一帧：type=0, reserved=0, payload_size=htons(len)。
+    fn build_v3_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(V3_HEADER_SIZE + payload.len());
+        frame.push(0u8);
+        frame.push(0u8);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn v3_header_is_4_bytes_with_big_endian_size() {
+        let payload = b"opus-data";
+        let frame = build_v3_frame(payload);
+        assert_eq!(frame.len(), V3_HEADER_SIZE + payload.len());
+        // type=0, reserved=0, payload_size 大端。
+        assert_eq!(frame[0], 0);
+        assert_eq!(frame[1], 0);
+        assert_eq!(
+            u16::from_be_bytes([frame[2], frame[3]]),
+            payload.len() as u16
+        );
+    }
+
+    #[test]
+    fn strip_v3_recovers_payload() {
+        let payload = b"decoded-opus-frame";
+        let frame = build_v3_frame(payload);
+        let out = strip_binary_header(&frame, 3);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn strip_v3_falls_back_to_raw_when_header_mismatch() {
+        // 头声明长度与实际不符 → 视为裸 Opus 原样返回。
+        let mut bad = build_v3_frame(b"abc");
+        bad[2] = 0xFF;
+        bad[3] = 0xFF;
+        let out = strip_binary_header(&bad, 3);
+        assert_eq!(out, bad);
+    }
+
+    #[test]
+    fn strip_v2_is_unchanged() {
+        // v2 头：version=2(大端), type=0, reserved, timestamp, payload_size。
+        let payload = b"v2-opus";
+        let mut frame = Vec::with_capacity(V2_HEADER_SIZE + payload.len());
+        frame.extend_from_slice(&2u16.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&12345u32.to_be_bytes());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        let out = strip_binary_header(&frame, 2);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn strip_v1_returns_raw() {
+        let raw = b"raw-opus";
+        assert_eq!(strip_binary_header(raw, 1), raw);
+        // v3 头对 v1 无意义，原样。
+        assert_eq!(strip_binary_header(build_v3_frame(b"x").as_slice(), 1), build_v3_frame(b"x"));
+    }
 }
 
 

@@ -18,8 +18,6 @@ pub enum ClientMessage {
         version: u8,
         #[serde(default, skip_serializing_if = "Features::is_empty")]
         features: Features,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        text_font: Option<TextFont>,
         transport: String,
         audio_params: AudioParams,
     },
@@ -30,18 +28,6 @@ pub enum ClientMessage {
         mode: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
-    },
-    Abort {
-        session_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
-    Mcp {
-        session_id: String,
-        payload: serde_json::Value,
-    },
-    Goodbye {
-        session_id: String,
     },
 }
 
@@ -57,14 +43,6 @@ impl Features {
     pub fn is_empty(&self) -> bool {
         !self.mcp && !self.glyph_push
     }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct TextFont {
-    pub bundle: String,
-    pub charset: String,
-    pub size: u16,
-    pub bpp: u8,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -91,7 +69,6 @@ impl Default for AudioParams {
 pub enum ListenState {
     Start,
     Stop,
-    Detect,
 }
 
 // ===================== 入站（服务器 → 设备） =====================
@@ -177,7 +154,6 @@ impl ClientMessage {
                 mcp: true,
                 glyph_push: false,
             },
-            text_font: None,
             transport: "websocket".to_string(),
             audio_params: AudioParams::default(),
         }
@@ -191,7 +167,19 @@ impl ClientMessage {
                 mcp: true,
                 glyph_push: false,
             },
-            text_font: None,
+            transport: "websocket".to_string(),
+            audio_params: AudioParams::default(),
+        }
+    }
+
+    /// WebSocket hello，二进制协议 v3（BinaryProtocol3，4 字节精简头，官方新固件默认）。
+    pub fn hello_websocket_v3() -> Self {
+        Self::Hello {
+            version: 3,
+            features: Features {
+                mcp: true,
+                glyph_push: false,
+            },
             transport: "websocket".to_string(),
             audio_params: AudioParams::default(),
         }
@@ -205,7 +193,6 @@ impl ClientMessage {
                 mcp: true,
                 glyph_push: false,
             },
-            text_font: None,
             transport: "udp".to_string(),
             audio_params: AudioParams::default(),
         }

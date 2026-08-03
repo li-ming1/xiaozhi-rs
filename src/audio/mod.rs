@@ -607,6 +607,11 @@ async fn capture_worker(
     let mut stats = CaptureStats::new();
     let mut agc = Agc::new();
     let mut vad = Vad::new();
+    // 热路径缓冲：每 2ms 批次读取、重采样输出、编码帧均在 worker 级复用，
+    // 避免每次循环堆分配（这是捕获路径的主要分配热点）。
+    let mut chunk: Vec<f32> = Vec::with_capacity(CAPTURE_BATCH);
+    let mut resample_out: Vec<f32> = Vec::with_capacity(CAPTURE_BATCH + 8);
+    let mut frame: Vec<f32> = Vec::with_capacity(ENCODER_FRAME_SIZE);
 
     loop {
         tokio::select! {
@@ -621,6 +626,9 @@ async fn capture_worker(
                     &mut resampler,
                     &mut opus,
                     &mut pending,
+                    &mut chunk,
+                    &mut resample_out,
+                    &mut frame,
                     &mut drift,
                     &mut window_count,
                     &mut window_start,
@@ -641,6 +649,9 @@ async fn process_capture_batch(
     resampler: &mut AsyncResampler,
     opus: &mut OpusCodec,
     pending: &mut Vec<f32>,
+    chunk: &mut Vec<f32>,
+    resample_out: &mut Vec<f32>,
+    frame: &mut Vec<f32>,
     drift: &mut DriftController,
     window_count: &mut u64,
     window_start: &mut Instant,
@@ -649,7 +660,7 @@ async fn process_capture_batch(
     vad: &mut Vad,
     encoded_tx: &LatestSlot<Vec<u8>>,
 ) {
-    let mut chunk: Vec<f32> = Vec::with_capacity(CAPTURE_BATCH);
+    chunk.clear();
     let mut any = false;
     while let Ok(s) = input.pop() {
         chunk.push(s);
@@ -665,9 +676,9 @@ async fn process_capture_batch(
     stats.samples += chunk.len() as u64;
     stats.sum_sq += chunk.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
 
-    let mut out = Vec::new();
-    resampler.process(&chunk, drift.ratio, &mut out);
-    pending.extend(out);
+    resample_out.clear();
+    resampler.process(chunk, drift.ratio, resample_out);
+    pending.extend_from_slice(resample_out);
 
     // 每 500ms：按窗口样本计数校正比率。
     if window_start.elapsed() >= DRIFT_PERIOD {
@@ -684,17 +695,18 @@ async fn process_capture_batch(
     // 组 60ms 帧：VAD 判定语音 → AGC 提升电平；静音 → 清零发送（保持上行
     // 连续，服务器 VAD 收到干净静音，不受背景噪声干扰）。
     while pending.len() >= ENCODER_FRAME_SIZE {
-        let mut frame: Vec<f32> = pending.drain(..ENCODER_FRAME_SIZE).collect();
-        let (rms, _) = frame_stats(&frame);
+        frame.clear();
+        frame.extend(pending.drain(..ENCODER_FRAME_SIZE));
+        let (rms, _) = frame_stats(frame);
         if vad.decide(rms) {
             stats.speech_frames += 1;
-            agc.process_frame(&mut frame);
+            agc.process_frame(frame);
             stats.agc_gain = agc.gain;
         } else {
             stats.silence_frames += 1;
             frame.fill(0.0);
         }
-        match opus.encode(&frame) {
+        match opus.encode(frame) {
             Ok(pkt) => {
                 stats.frames += 1;
                 encoded_tx.store(pkt).await;
@@ -758,6 +770,8 @@ async fn playback_worker(
     let mut drift = DriftController::new(nominal);
     let mut last_drift = Instant::now();
     let mut stats = PlaybackStats::new();
+    // 重采样输出缓冲常驻复用，避免每帧解码后堆分配。
+    let mut out_samples: Vec<f32> = Vec::with_capacity(960 * 3);
 
     loop {
         match rx.recv().await {
@@ -786,7 +800,7 @@ async fn playback_worker(
                 }
                 stats.last_pcm_len = pcm.len();
                 stats.last_needed = resampler.input_frames_next();
-                let mut out_samples = Vec::new();
+                out_samples.clear();
                 resampler.process(&pcm, drift.ratio, &mut out_samples);
                 stats.last_produced = out_samples.len();
                 if out_samples.is_empty() {

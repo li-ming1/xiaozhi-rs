@@ -9,7 +9,6 @@
 
 pub mod message;
 pub mod mqtt_udp;
-pub mod scripted;
 pub mod ws;
 
 use std::sync::Arc;
@@ -74,7 +73,6 @@ pub struct TransportHandles {
 pub enum TransportAdapter {
     WebSocket(ws::WsTransport),
     MqttUdp(mqtt_udp::MqttUdpTransport),
-    Scripted(scripted::ScriptedTransport),
 }
 
 impl TransportAdapter {
@@ -83,7 +81,6 @@ impl TransportAdapter {
         match self {
             TransportAdapter::WebSocket(t) => t.connect(params).await,
             TransportAdapter::MqttUdp(t) => t.connect(params).await,
-            TransportAdapter::Scripted(t) => t.connect(params).await,
         }
     }
 }

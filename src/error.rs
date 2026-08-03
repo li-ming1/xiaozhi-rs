@@ -49,18 +49,6 @@ pub enum VoiceError {
     Other(#[from] anyhow::Error),
 }
 
-impl VoiceError {
-    /// 是否为瞬态故障（值得退避重试）。
-    pub fn is_transient(&self) -> bool {
-        !matches!(
-            self,
-            VoiceError::AuthenticationFailed(_)
-                | VoiceError::InvalidConfig(_)
-                | VoiceError::Permanent(_)
-        )
-    }
-}
-
 pub type Result<T> = std::result::Result<T, VoiceError>;
 
 impl From<std::io::Error> for VoiceError {

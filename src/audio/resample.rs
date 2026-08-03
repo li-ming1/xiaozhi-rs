@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
-    Adjustable, Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, WindowFunction,
+    Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction,
 };
 
 use crate::error::{Result, VoiceError};
@@ -95,10 +95,6 @@ impl AsyncResampler {
         self.ratio
     }
 }
-
-// 保留 Indexing 引用以避免未使用导入告警。
-#[allow(unused_imports)]
-use Indexing as _Indexing;
 
 #[cfg(test)]
 mod tests {

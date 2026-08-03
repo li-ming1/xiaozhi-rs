@@ -4,7 +4,7 @@
 //! MQTT endpoint 由 OTA 下发或从 WebSocket URL 的 host 推导。
 
 use anyhow::{anyhow, Context, Result};
-use log::{debug, info, warn};
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -62,17 +62,24 @@ pub struct ActivationData {
     pub authorization_url: Option<String>,
 }
 
-fn build_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+/// 全局复用 HTTP 客户端（含连接池，激活重试时避免重复 TLS 握手）。
+fn client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c);
+    }
+    // 并发时可能重复构建，但仅首个成功者被保留，其余丢弃，无副作用。
+    let built = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
-        .context("构建 HTTP 客户端失败")
+        .context("构建 HTTP 客户端失败")?;
+    Ok(CLIENT.get_or_init(|| built))
 }
 
 /// 拉取 OTA 配置。
 pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
     info!("正在连接服务器（超时60秒）...");
-    let client = build_client()?;
+    let client = client()?;
 
     let payload = serde_json::json!({
         "application": {
@@ -90,7 +97,10 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
         .post(OTA_URL)
         .header("Device-Id", &identity.device_id)
         .header("Client-Id", &identity.client_id)
-        .header("User-Agent", "bread-compact-wifi/xiaozhi-rs-0.2.0")
+        .header(
+            "User-Agent",
+            format!("bread-compact-wifi/xiaozhi-rs-{}", env!("CARGO_PKG_VERSION")),
+        )
         .header("Accept-Language", "zh-CN")
         .json(&payload)
         .send()
@@ -123,7 +133,7 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
     }
 
     let config: OtaConfig = serde_json::from_str(&text).context("OTA 响应解析失败")?;
-    debug!("OTA 配置: {:?}", config);
+    // 不打印完整 config：其中含 mqtt.password / websocket.token，debug 级别也不应泄密。
 
     if config.activation.is_some() {
         warn!("设备需要激活");
@@ -135,7 +145,7 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
 
 /// 轮询激活完成（60s 超时，每 5s 一次）。
 pub async fn wait_for_activation(identity: &DeviceIdentity, challenge: &str) -> Result<()> {
-    let client = build_client()?;
+    let client = client()?;
     let hmac_signature = identity.generate_hmac_signature(challenge);
 
     let payload = serde_json::json!({

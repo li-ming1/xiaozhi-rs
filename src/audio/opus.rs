@@ -337,10 +337,6 @@ fn load_opus_library() -> Result<Library> {
     )))
 }
 
-// 保留 anyhow 以兼容旧错误路径。
-#[allow(unused_imports)]
-use anyhow as _anyhow;
-
 #[cfg(test)]
 mod tests {
     use super::*;

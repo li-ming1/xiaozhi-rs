@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
 }
 
 fn print_usage() {
-    println!("小智客户端 v0.2.0");
+    println!("小智客户端 v{}", env!("CARGO_PKG_VERSION"));
     println!("用法: xiaozhi-rs <COMMAND>");
     println!();
     println!("Commands:");

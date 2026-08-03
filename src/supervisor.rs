@@ -342,9 +342,6 @@ impl VoiceSupervisor {
         let adapter = match kind {
             TransportKind::MqttUdp => TransportAdapter::MqttUdp(MqttUdpTransport),
             TransportKind::WebSocket => TransportAdapter::WebSocket(WsTransport::default()),
-            TransportKind::Scripted => {
-                return Err(VoiceError::Permanent("运行时不应使用 Scripted 传输".into()))
-            }
         };
         let handles = adapter.connect(&params).await?;
         self.epoch = Some(SessionEpoch::new(handles.session_id.clone(), kind));
