@@ -61,8 +61,8 @@ tungstenite = "0.30"
 # 音频
 cpal = "0.18"
 
-# Opus 编解码（保留 libloading 动态加载预编译库）
-libloading = "0.9"
+# Opus 编解码（opusic-sys 内置绑定：默认 bundled 特性，构建期用 cmake 编译 libopus 并静态链接）
+opusic-sys = "0.7"
 
 # Windows 未处理异常过滤器（诊断原生崩溃）
 [target.'cfg(windows)'.dependencies]

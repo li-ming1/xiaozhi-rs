@@ -6,7 +6,7 @@
 
 - **双链路传输** — MQTT+UDP 主链路（AES-128-CTR 加密 + 序列号防重放），WebSocket v2 回退（二进制时间戳头，供服务端 AEC）；UDP 黑洞检测与 MQTT 熔断自动切换
 - **实时语音对话** — 官方协议标准 60ms 音频帧全双工实时双向流
-- **Opus 编解码** — 上行 16kHz/单声道/60ms，下行采样率服从服务器协商（16/24/48kHz）；动态加载本地 Opus 库
+- **Opus 编解码** — 上行 16kHz/单声道/60ms，下行采样率服从服务器协商（16/24/48kHz）；`opusic-sys` 构建期静态内置 libopus，运行时零外部依赖
 - **高质量重采样** — rubato 4.0 `AsyncSincFixedIn`（256-tap BlackmanHarris2），替代旧 Catmull-Rom；±1000ppm 时钟漂移实时补偿
 - **无锁实时管线** — CPAL 回调零锁零分配，捕获/播放独立 DSP worker，rtrb SPSC 环形缓冲
 - **自适应码率** — 按 10s 丢包窗口在 32/28/20kbps + FEC/DTX 间分级切换
@@ -29,7 +29,7 @@
 | Linux x64 | `xiaozhi-rs-linux-x64.tar.gz` |
 | Linux ARM64 | `xiaozhi-rs-linux-arm64.tar.gz` |
 
-每个包已内置对应平台的 Opus 库（`libs/libopus/`），解压后即可运行，无需额外安装。
+Opus 编解码器已由 `opusic-sys` 静态内置进可执行文件，解压后即可运行，无需部署任何动态库。
 
 ```bash
 # 启动语音对话（首次运行需激活，见下文"激活流程"）
@@ -50,7 +50,7 @@ sudo apt-get install -y libasound2-dev
 cargo build --release
 ```
 
-产物位于 `target/release/xiaozhi-rs`（Windows 为 `.exe`）。Opus 库在 `libs/libopus/` 下按 `{os}/{arch}/` 组织，运行时自动定位加载。
+产物位于 `target/release/xiaozhi-rs`（Windows 为 `.exe`）。libopus 由 `opusic-sys`（bundled）在构建期用 cmake 编译并静态链接，无需随包分发 Opus 库。
 
 推送 `v*` 标签即可触发 GitHub Actions 构建全部 6 个平台并发布 Release：
 

@@ -1,14 +1,21 @@
-//! Opus 编解码：libloading 动态链接（opus.dll / libopus.dylib / libopus.so）。
+//! Opus 编解码：opusic-sys 内置绑定（bundled，构建期用 cmake 编译 libopus 静态链接）。
 //!
 //! 编码器固定 16kHz/单声道/60ms（官方上行标准）；解码器采样率可配置
 //! （下行服从服务器 hello.audio_params，支持 16/24/48kHz）。
-//! 保留动态加载以支持跨平台 6 份预编译库。
+//! 不再动态加载外部 opus 库：libopus 由 opusic-sys 的 bundled 特性在构建期
+//! 通过 cmake 源码编译并直接静态链接进可执行文件，运行时无需部署 opus dll。
 
-use libloading::{Library, Symbol};
 use log::{debug, info, warn};
-use std::ffi::c_int;
+use opusic_sys::{
+    opus_decode_float, opus_decoder_create, opus_decoder_destroy, opus_encode_float,
+    opus_encoder_create, opus_encoder_destroy, opus_get_version_string, opus_strerror,
+    OpusDecoder, OpusEncoder, OPUS_APPLICATION_VOIP, OPUS_OK, OPUS_SET_BITRATE_REQUEST,
+    OPUS_SET_COMPLEXITY_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST,
+    OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST,
+};
+use std::ffi::{c_int, CStr};
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::Once;
 
 /// 崩溃诊断：最近一次执行的 opus 操作（供未处理异常过滤器读取）。
 pub(crate) static LAST_OPUS_CALL: AtomicU8 = AtomicU8::new(0);
@@ -19,19 +26,10 @@ pub(crate) const OPUS_CALL_CTL: u8 = 3;
 pub(crate) const OPUS_CALL_DESTROY: u8 = 4;
 /// 崩溃诊断：最近一次 opus_encoder_ctl 的请求号。
 pub(crate) static LAST_OPUS_CTL_REQUEST: AtomicU32 = AtomicU32::new(0);
-/// 进程级：库路径与版本信息只打印一次（编码器/解码器各实例化一次，避免刷屏）。
+/// 进程级：内置库版本信息只打印一次（编码器/解码器各实例化一次，避免刷屏）。
 static OPUS_LIB_INFO_ONCE: Once = Once::new();
 
 use crate::error::{Result, VoiceError};
-
-const OPUS_APPLICATION_VOIP: c_int = 2048;
-const OPUS_SET_COMPLEXITY_REQUEST: c_int = 4010;
-const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
-const OPUS_SET_VBR_REQUEST: c_int = 4006;
-const OPUS_SET_VBR_CONSTRAINT_REQUEST: c_int = 4005;
-const OPUS_SET_DTX_REQUEST: c_int = 4003;
-const OPUS_SET_INBAND_FEC_REQUEST: c_int = 4012;
-const OPUS_OK: c_int = 0;
 
 /// 上行采样率（官方固定）。
 pub const ENCODER_RATE: u32 = 16000;
@@ -43,14 +41,13 @@ const MAX_PACKET_SIZE: usize = 1500;
 /// 解码最大输出（60ms @ 48k 单声道）。
 const DECODE_MAX_SAMPLES: usize = 48_000 / 1000 * 60;
 
-type OpusEncoderCreate = extern "C" fn(i32, i32, c_int, *mut c_int) -> *mut std::ffi::c_void;
-type OpusEncoderDestroy = extern "C" fn(*mut std::ffi::c_void);
-type OpusEncodeFloat = extern "C" fn(*mut std::ffi::c_void, *const f32, c_int, *mut u8, c_int) -> c_int;
-type OpusDecoderCreate = extern "C" fn(i32, i32, *mut c_int) -> *mut std::ffi::c_void;
-type OpusDecoderDestroy = extern "C" fn(*mut std::ffi::c_void);
-type OpusDecodeFloat =
-    extern "C" fn(*mut std::ffi::c_void, *const u8, c_int, *mut f32, c_int, c_int) -> c_int;
-type OpusEncoderCtl = unsafe extern "C" fn(*mut std::ffi::c_void, c_int, ...) -> c_int;
+// opus_encoder_ctl 在 opusic-sys 中是 C 变参函数（`...`），stable Rust 无法直接调用；
+// 这里按固定 3 参数重新声明同一符号（x86-64/ARM64 调用约定下与变参调用 ABI 兼容，
+// 是本项目仅使用的一类请求：3 参数 ctl）。
+unsafe extern "C" {
+    #[link_name = "opus_encoder_ctl"]
+    fn opus_encoder_ctl_fixed(st: *mut OpusEncoder, request: c_int, arg: c_int) -> c_int;
+}
 
 /// 网络质量分级，驱动编码策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,14 +61,8 @@ pub enum NetworkGrade {
 }
 
 pub struct OpusCodec {
-    _library: Arc<Library>,
-    encoder: *mut std::ffi::c_void,
-    decoder: *mut std::ffi::c_void,
-    encode_float: Symbol<'static, OpusEncodeFloat>,
-    decode_float: Symbol<'static, OpusDecodeFloat>,
-    encoder_destroy: Symbol<'static, OpusEncoderDestroy>,
-    decoder_destroy: Symbol<'static, OpusDecoderDestroy>,
-    encoder_ctl: Option<Symbol<'static, OpusEncoderCtl>>,
+    encoder: *mut OpusEncoder,
+    decoder: *mut OpusDecoder,
     encode_buf: Vec<u8>,
     decode_buf: Vec<f32>,
     /// 下行采样率（解码器按此创建）。
@@ -83,47 +74,55 @@ pub struct OpusCodec {
 unsafe impl Send for OpusCodec {}
 unsafe impl Sync for OpusCodec {}
 
+/// 打印内置 libopus 版本（进程级一次）。
+fn log_opus_version() {
+    OPUS_LIB_INFO_ONCE.call_once(|| {
+        let v = unsafe { opus_get_version_string() };
+        if !v.is_null() {
+            let s = unsafe { CStr::from_ptr(v) };
+            info!(
+                "已加载内置 Opus 库（opusic-sys bundled 静态链接）: {}",
+                s.to_string_lossy()
+            );
+        } else {
+            info!("已加载内置 Opus 库（opusic-sys bundled 静态链接）");
+        }
+    });
+}
+
 impl OpusCodec {
     /// 创建编解码器：编码 16k/1ch，解码按 `decode_rate`。
     pub fn new(decode_rate: u32) -> Result<Self> {
-        let library = Arc::new(load_opus_library()?);
-
-        let encoder_create: Symbol<OpusEncoderCreate> =
-            unsafe { load_symbol(&library, b"opus_encoder_create\0")? };
-        let decoder_create: Symbol<OpusDecoderCreate> =
-            unsafe { load_symbol(&library, b"opus_decoder_create\0")? };
-        let encode_float: Symbol<OpusEncodeFloat> =
-            unsafe { load_symbol(&library, b"opus_encode_float\0")? };
-        let decode_float: Symbol<OpusDecodeFloat> =
-            unsafe { load_symbol(&library, b"opus_decode_float\0")? };
-        let encoder_destroy: Symbol<OpusEncoderDestroy> =
-            unsafe { load_symbol(&library, b"opus_encoder_destroy\0")? };
-        let decoder_destroy: Symbol<OpusDecoderDestroy> =
-            unsafe { load_symbol(&library, b"opus_decoder_destroy\0")? };
-        let encoder_ctl: Option<Symbol<'static, OpusEncoderCtl>> =
-            unsafe { load_symbol(&library, b"opus_encoder_ctl\0").ok() };
+        log_opus_version();
 
         let mut error: c_int = 0;
-        let encoder = encoder_create(ENCODER_RATE as i32, 1, OPUS_APPLICATION_VOIP, &mut error);
+        let encoder = unsafe {
+            opus_encoder_create(
+                ENCODER_RATE as c_int,
+                1,
+                OPUS_APPLICATION_VOIP,
+                &mut error,
+            )
+        };
         if error != OPUS_OK || encoder.is_null() {
-            return Err(VoiceError::Opus(format!("创建 Opus 编码器失败: {}", error)));
+            return Err(VoiceError::Opus(format!(
+                "创建 Opus 编码器失败: {}",
+                opus_error_desc(error)
+            )));
         }
 
         let mut error: c_int = 0;
-        let decoder = decoder_create(decode_rate as i32, 1, &mut error);
+        let decoder = unsafe { opus_decoder_create(decode_rate as c_int, 1, &mut error) };
         if error != OPUS_OK || decoder.is_null() {
-            return Err(VoiceError::Opus(format!("创建 Opus 解码器失败: {}", error)));
+            return Err(VoiceError::Opus(format!(
+                "创建 Opus 解码器失败: {}",
+                opus_error_desc(error)
+            )));
         }
 
         let mut codec = Self {
-            _library: library,
             encoder,
             decoder,
-            encode_float,
-            decode_float,
-            encoder_destroy,
-            decoder_destroy,
-            encoder_ctl,
             encode_buf: vec![0u8; MAX_PACKET_SIZE],
             decode_buf: vec![0f32; DECODE_MAX_SAMPLES],
             decode_rate: decode_rate as i32,
@@ -136,9 +135,10 @@ impl OpusCodec {
 
     /// 按网络分级调整编码参数。
     ///
-    /// 注意：当前禁用运行时调整 —— 捆绑/系统 opus.dll 在 `opus_encoder_ctl`
-    /// 的 FEC/DTX/VBR 约束请求上确定性崩溃（offset=0x8ce6）。待确认具体请求
-    /// 后再针对性恢复。上行保持 Good（32kbps VBR，FEC/DTX 关闭）。
+    /// 注意：当前禁用运行时调整 —— 旧捆绑/系统 opus.dll 在 `opus_encoder_ctl`
+    /// 的 FEC/DTX/VBR 约束请求上确定性崩溃（offset=0x8ce6）。现切换为 opusic-sys
+    /// 内置编译，ctl 请求号采用 libopus 官方定义，可择机恢复运行时调整；
+    /// 上行暂时保持 Good（32kbps VBR，FEC/DTX 关闭）。
     pub fn set_network_grade(&mut self, grade: NetworkGrade) {
         if self.grade == grade {
             return;
@@ -151,7 +151,6 @@ impl OpusCodec {
     }
 
     fn apply_encoder_config(&mut self, grade: NetworkGrade) {
-        let Some(ctl) = &self.encoder_ctl else { return };
         let (bitrate, vbr, constrained, fec, dtx) = match grade {
             NetworkGrade::Good => (32_000, 1, 0, 0, 0),
             NetworkGrade::Fair => (28_000, 1, 0, 1, 0),
@@ -159,26 +158,26 @@ impl OpusCodec {
         };
         LAST_OPUS_CALL.store(OPUS_CALL_CTL, Ordering::Relaxed);
         LAST_OPUS_CTL_REQUEST.store(OPUS_SET_BITRATE_REQUEST as u32, Ordering::Relaxed);
-        let _ = unsafe { ctl(self.encoder, OPUS_SET_BITRATE_REQUEST, bitrate) };
+        let _ = unsafe { opus_encoder_ctl_fixed(self.encoder, OPUS_SET_BITRATE_REQUEST, bitrate) };
         LAST_OPUS_CTL_REQUEST.store(OPUS_SET_VBR_REQUEST as u32, Ordering::Relaxed);
-        let _ = unsafe { ctl(self.encoder, OPUS_SET_VBR_REQUEST, vbr) };
+        let _ = unsafe { opus_encoder_ctl_fixed(self.encoder, OPUS_SET_VBR_REQUEST, vbr) };
         LAST_OPUS_CTL_REQUEST.store(OPUS_SET_VBR_CONSTRAINT_REQUEST as u32, Ordering::Relaxed);
-        let _ = unsafe { ctl(self.encoder, OPUS_SET_VBR_CONSTRAINT_REQUEST, constrained) };
+        let _ = unsafe {
+            opus_encoder_ctl_fixed(self.encoder, OPUS_SET_VBR_CONSTRAINT_REQUEST, constrained)
+        };
         LAST_OPUS_CTL_REQUEST.store(OPUS_SET_INBAND_FEC_REQUEST as u32, Ordering::Relaxed);
-        let _ = unsafe { ctl(self.encoder, OPUS_SET_INBAND_FEC_REQUEST, fec) };
+        let _ = unsafe { opus_encoder_ctl_fixed(self.encoder, OPUS_SET_INBAND_FEC_REQUEST, fec) };
         LAST_OPUS_CTL_REQUEST.store(OPUS_SET_DTX_REQUEST as u32, Ordering::Relaxed);
-        let _ = unsafe { ctl(self.encoder, OPUS_SET_DTX_REQUEST, dtx) };
+        let _ = unsafe { opus_encoder_ctl_fixed(self.encoder, OPUS_SET_DTX_REQUEST, dtx) };
         LAST_OPUS_CTL_REQUEST.store(0, Ordering::Relaxed);
         LAST_OPUS_CALL.store(OPUS_CALL_NONE, Ordering::Relaxed);
     }
 
     /// 设置编码复杂度（0-10），默认 10。
     pub fn set_complexity(&mut self, complexity: c_int) {
-        if let Some(ctl) = &self.encoder_ctl {
-            let ret = unsafe { ctl(self.encoder, OPUS_SET_COMPLEXITY_REQUEST, complexity) };
-            if ret != OPUS_OK {
-                warn!("设置 Opus 复杂度失败: {}（使用默认值）", ret);
-            }
+        let ret = unsafe { opus_encoder_ctl_fixed(self.encoder, OPUS_SET_COMPLEXITY_REQUEST, complexity) };
+        if ret != OPUS_OK {
+            warn!("设置 Opus 复杂度失败: {}（使用默认值）", opus_error_desc(ret));
         }
     }
 
@@ -192,16 +191,21 @@ impl OpusCodec {
             )));
         }
         LAST_OPUS_CALL.store(OPUS_CALL_ENCODE, Ordering::Relaxed);
-        let len = (self.encode_float)(
-            self.encoder,
-            input.as_ptr(),
-            ENCODER_FRAME_SIZE as c_int,
-            self.encode_buf.as_mut_ptr(),
-            MAX_PACKET_SIZE as c_int,
-        );
+        let len = unsafe {
+            opus_encode_float(
+                self.encoder,
+                input.as_ptr(),
+                ENCODER_FRAME_SIZE as c_int,
+                self.encode_buf.as_mut_ptr(),
+                MAX_PACKET_SIZE as c_int,
+            )
+        };
         LAST_OPUS_CALL.store(OPUS_CALL_NONE, Ordering::Relaxed);
         if len < 0 {
-            return Err(VoiceError::Opus(format!("Opus 编码失败: {}", len)));
+            return Err(VoiceError::Opus(format!(
+                "Opus 编码失败: {}",
+                opus_error_desc(len)
+            )));
         }
         Ok(self.encode_buf[..len as usize].to_vec())
     }
@@ -211,27 +215,34 @@ impl OpusCodec {
     pub fn decode(&mut self, input: &[u8], fec: bool) -> Result<Vec<f32>> {
         LAST_OPUS_CALL.store(OPUS_CALL_DECODE, Ordering::Relaxed);
         let samples = if input.is_empty() {
-            (self.decode_float)(
-                self.decoder,
-                std::ptr::null(),
-                0,
-                self.decode_buf.as_mut_ptr(),
-                DECODE_MAX_SAMPLES as c_int,
-                0,
-            )
+            unsafe {
+                opus_decode_float(
+                    self.decoder,
+                    std::ptr::null(),
+                    0,
+                    self.decode_buf.as_mut_ptr(),
+                    DECODE_MAX_SAMPLES as c_int,
+                    0,
+                )
+            }
         } else {
-            (self.decode_float)(
-                self.decoder,
-                input.as_ptr(),
-                input.len() as c_int,
-                self.decode_buf.as_mut_ptr(),
-                DECODE_MAX_SAMPLES as c_int,
-                fec as c_int,
-            )
+            unsafe {
+                opus_decode_float(
+                    self.decoder,
+                    input.as_ptr(),
+                    input.len() as c_int,
+                    self.decode_buf.as_mut_ptr(),
+                    DECODE_MAX_SAMPLES as c_int,
+                    fec as c_int,
+                )
+            }
         };
         LAST_OPUS_CALL.store(OPUS_CALL_NONE, Ordering::Relaxed);
         if samples < 0 {
-            return Err(VoiceError::Opus(format!("Opus 解码失败: {}", samples)));
+            return Err(VoiceError::Opus(format!(
+                "Opus 解码失败: {}",
+                opus_error_desc(samples)
+            )));
         }
         Ok(self.decode_buf[..samples as usize].to_vec())
     }
@@ -245,96 +256,24 @@ impl Drop for OpusCodec {
     fn drop(&mut self) {
         LAST_OPUS_CALL.store(OPUS_CALL_DESTROY, Ordering::Relaxed);
         if !self.encoder.is_null() {
-            (self.encoder_destroy)(self.encoder);
+            unsafe { opus_encoder_destroy(self.encoder) };
         }
         if !self.decoder.is_null() {
-            (self.decoder_destroy)(self.decoder);
+            unsafe { opus_decoder_destroy(self.decoder) };
         }
         LAST_OPUS_CALL.store(OPUS_CALL_NONE, Ordering::Relaxed);
     }
 }
 
-#[allow(clippy::missing_transmute_annotations)]
-unsafe fn load_symbol<T>(library: &Library, name: &'static [u8]) -> Result<Symbol<'static, T>> {
-    let sym: Symbol<T> = unsafe { library.get(name) }
-        .map_err(|e| VoiceError::Opus(format!("无法加载 {}: {}", String::from_utf8_lossy(name), e)))?;
-    Ok(unsafe { std::mem::transmute(sym) })
-}
-
-fn load_opus_library() -> Result<Library> {
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    const BUNDLED: &str = "libs/libopus/win/x64/opus.dll";
-    #[cfg(all(windows, target_arch = "aarch64"))]
-    const BUNDLED: &str = "libs/libopus/win/arm64/opus.dll";
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    const BUNDLED: &str = "libs/libopus/mac/x64/libopus.dylib";
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    const BUNDLED: &str = "libs/libopus/mac/arm64/libopus.dylib";
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    const BUNDLED: &str = "libs/libopus/linux/x64/libopus.so";
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    const BUNDLED: &str = "libs/libopus/linux/arm64/libopus.so";
-
-    #[cfg(windows)]
-    const SYSTEM_NAMES: &[&str] = &["opus.dll"];
-    #[cfg(target_os = "macos")]
-    const SYSTEM_NAMES: &[&str] = &["libopus.dylib"];
-    #[cfg(target_os = "linux")]
-    const SYSTEM_NAMES: &[&str] = &["libopus.so.0", "libopus.so"];
-
-    #[cfg(target_os = "macos")]
-    const EXTRA_PATHS: &[&str] = &["/opt/homebrew/lib", "/usr/local/lib"];
-    #[cfg(not(target_os = "macos"))]
-    const EXTRA_PATHS: &[&str] = &[];
-
-    // 候选路径优先级：
-    // 1) exe 同目录的捆绑库（部署形态：库与 exe 平级）；
-    // 2) 从 exe 目录向上逐级找仓库根下的 libs/libopus/...（开发形态）；
-    // 3) 当前目录；
-    // 4) 系统库。
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(dir) = &exe_dir {
-        candidates.push(dir.join(BUNDLED));
-        candidates.push(dir.join("opus.dll"));
-        // 从 exe 目录向上找仓库根。
-        let mut cur = dir.as_path().parent();
-        while let Some(d) = cur {
-            candidates.push(d.join(BUNDLED));
-            cur = d.parent();
-        }
+/// 将 opus 返回码转换为可读错误描述。
+fn opus_error_desc(code: c_int) -> String {
+    let s = unsafe { opus_strerror(code) };
+    if s.is_null() {
+        format!("opus 错误码 {}", code)
+    } else {
+        let desc = unsafe { CStr::from_ptr(s) }.to_string_lossy();
+        format!("{} ({})", desc, code)
     }
-    candidates.push(std::path::PathBuf::from(BUNDLED));
-    candidates.push(std::path::PathBuf::from("opus.dll"));
-    for extra in EXTRA_PATHS {
-        candidates.push(std::path::PathBuf::from(extra).join(BUNDLED));
-    }
-
-    for path in &candidates {
-        if path.exists()
-            && let Ok(lib) = unsafe { Library::new(path) }
-        {
-            // 库路径进程级只打印一次（编码器/解码器各实例化一次，避免刷屏）。
-            // 版本字符串不再打印：捆绑库返回 "libopus unknown"，无诊断价值。
-            OPUS_LIB_INFO_ONCE.call_once(|| {
-                info!("已加载 Opus 库: {}", path.display());
-            });
-            return Ok(lib);
-        }
-    }
-    for name in SYSTEM_NAMES {
-        if let Ok(lib) = unsafe { Library::new(*name) } {
-            OPUS_LIB_INFO_ONCE.call_once(|| {
-                warn!("未找到捆绑库，已加载系统 Opus 库: {}（建议部署捆绑库）", name);
-            });
-            return Ok(lib);
-        }
-    }
-    Err(VoiceError::Opus(format!(
-        "未找到 opus 库，请确保 {} 存在或安装系统 opus 库",
-        BUNDLED
-    )))
 }
 
 #[cfg(test)]

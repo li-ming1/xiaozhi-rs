@@ -18,15 +18,15 @@ jobs:
       matrix:
         include:
           # Windows
-          - { os: windows-latest,  target: x86_64-pc-windows-msvc,   name: windows-x64,   exe: xiaozhi-rs.exe, opus: win/x64/opus.dll }
-          - { os: windows-latest,  target: aarch64-pc-windows-msvc,  name: windows-arm64, exe: xiaozhi-rs.exe, opus: win/arm64/opus.dll }
+          - { os: windows-latest,  target: x86_64-pc-windows-msvc,   name: windows-x64,   exe: xiaozhi-rs.exe }
+          - { os: windows-latest,  target: aarch64-pc-windows-msvc,  name: windows-arm64, exe: xiaozhi-rs.exe }
           # macOS（macos-13 Intel runner 已于 2025-12-04 退役；统一用 arm64 runner，
           # x64 产物经 Rust 架构间交叉编译生成，x86_64-apple-darwin 无需额外工具链）
-          - { os: macos-latest,    target: x86_64-apple-darwin,      name: macos-x64,     exe: xiaozhi-rs,     opus: mac/x64/libopus.dylib }
-          - { os: macos-latest,    target: aarch64-apple-darwin,     name: macos-arm64,   exe: xiaozhi-rs,     opus: mac/arm64/libopus.dylib }
+          - { os: macos-latest,    target: x86_64-apple-darwin,      name: macos-x64,     exe: xiaozhi-rs }
+          - { os: macos-latest,    target: aarch64-apple-darwin,     name: macos-arm64,   exe: xiaozhi-rs }
           # Linux（ubuntu-24.04-arm = 原生 ARM64 runner，无需交叉编译）
-          - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,  name: linux-x64,     exe: xiaozhi-rs,     opus: linux/x64/libopus.so }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-arm64,  exe: xiaozhi-rs,     opus: linux/arm64/libopus.so }
+          - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,  name: linux-x64,     exe: xiaozhi-rs }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-arm64,  exe: xiaozhi-rs }
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -45,16 +45,14 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      # ── 打包：可执行文件 + opus 库 + README + LICENSE ──
+      # ── 打包：可执行文件（Opus 已由 opusic-sys 静态内置，无需再分发 opus 库）──
       - name: Package
         shell: bash
         run: |
           STAGE="dist/xiaozhi-rs-${{ matrix.name }}"
-          mkdir -p "$STAGE/libs/libopus/$(dirname '${{ matrix.opus }}')"
+          mkdir -p "$STAGE"
           # 可执行文件
           cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "$STAGE/"
-          # Opus 库（保持 libs/libopus/{os}/{arch}/{name} 目录结构）
-          cp "libs/libopus/${{ matrix.opus }}" "$STAGE/libs/libopus/${{ matrix.opus }}"
           # 文档
           cp README.md LICENSE "$STAGE/"
 
