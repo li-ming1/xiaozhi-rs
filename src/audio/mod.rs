@@ -39,10 +39,11 @@ const MAX_DRIFT_PPM: f64 = 1000.0;
 const RATE_LIMIT_PPM_S: f64 = 50.0;
 /// 输出环形缓冲容量（样本，单声道）：320ms @ 96kHz 余量。
 const OUTPUT_RING_SAMPLES: usize = 32 * 1024;
-/// 输入环形缓冲容量（样本，单声道）：100ms @ 96kHz 余量。
-const INPUT_RING_SAMPLES: usize = 16 * 1024;
-/// 捕获批次上限（样本）。
-const CAPTURE_BATCH: usize = 480;
+/// 输入环形缓冲容量（样本，单声道）：约 1s @ 48kHz，
+/// 吸收 WASAPI 采集回调的突发（burst）写入，避免 rtrb 满导致丢样本。
+const INPUT_RING_SAMPLES: usize = 48 * 1024;
+/// 捕获批次上限（样本）：一次循环尽量读空 rtrb，防 burst 丢样本。
+const CAPTURE_BATCH: usize = 4096;
 
 /// 下行到播放 worker 的消息。
 pub enum PlaybackMsg {
@@ -350,6 +351,12 @@ struct CaptureStats {
     samples: u64,
     sum_sq: f64,
     frames: u64,
+    /// 语音帧数（VAD 判定后发送）。
+    speech_frames: u64,
+    /// 静音帧数（VAD 判定后跳过）。
+    silence_frames: u64,
+    /// 最近一次 AGC 增益（线性）。
+    agc_gain: f32,
 }
 
 impl CaptureStats {
@@ -359,6 +366,9 @@ impl CaptureStats {
             samples: 0,
             sum_sq: 0.0,
             frames: 0,
+            speech_frames: 0,
+            silence_frames: 0,
+            agc_gain: 1.0,
         }
     }
 }
@@ -431,20 +441,34 @@ impl DriftController {
     }
 }
 
+/// 帧统计（RMS 与峰值）。
+fn frame_stats(frame: &[f32]) -> (f32, f32) {
+    if frame.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sum_sq = 0.0f64;
+    let mut peak = 0.0f32;
+    for &s in frame.iter() {
+        sum_sq += (s as f64) * (s as f64);
+        peak = peak.max(s.abs());
+    }
+    let rms = (sum_sq / frame.len() as f64).sqrt() as f32;
+    (rms, peak)
+}
+
 /// 上行自动增益控制（AGC）。
 ///
-/// 目的：用户语音电平偏低（日志实测 RMS 仅 -30~-55dBFS）导致服务器
-/// ASR/VAD 难以触发。本 AGC 把语音帧 RMS 提升到目标电平（约 -24dBFS），
-/// 静音帧不放大（保持底噪不被抬高），增益平滑更新并做软限幅防爆音。
-/// 不改动发送行为（静音帧仍原样上行），风险最低。
+/// 目的：用户语音电平偏低导致服务器 ASR/VAD 难以触发。本 AGC 把语音帧
+/// RMS 提升到目标电平（约 -21dBFS，上限 36dB），静音帧不放大，增益平滑
+/// 更新，并按帧峰值限幅防止过载削波。
 struct Agc {
     /// 当前增益（线性）。
     gain: f32,
-    /// 视为语音的最小 RMS（≈ -62dBFS）。
+    /// 视为语音的最小 RMS（≈ -66dBFS）。
     voice_threshold: f32,
-    /// 语音帧目标 RMS（≈ -24.4dBFS）。
+    /// 语音帧目标 RMS（≈ -21dBFS）。
     target_rms: f32,
-    /// 最大增益（线性，30dB）。
+    /// 最大增益（线性，36dB）。
     max_gain: f32,
 }
 
@@ -452,9 +476,9 @@ impl Agc {
     fn new() -> Self {
         Self {
             gain: 1.0,
-            voice_threshold: 0.0008,
-            target_rms: 0.06,
-            max_gain: 32.0,
+            voice_threshold: 0.0005,
+            target_rms: 0.09,
+            max_gain: 64.0,
         }
     }
 
@@ -463,18 +487,17 @@ impl Agc {
         if frame.is_empty() {
             return;
         }
-        let mut sum_sq = 0.0f64;
-        for &s in frame.iter() {
-            sum_sq += (s as f64) * (s as f64);
-        }
-        let rms = (sum_sq / frame.len() as f64).sqrt() as f32;
+        let (rms, peak) = frame_stats(frame);
         if rms >= self.voice_threshold {
-            let target = (self.target_rms / rms).clamp(1.0, self.max_gain);
+            let mut target = (self.target_rms / rms).clamp(1.0, self.max_gain);
+            // 峰值防削波：增益上限不超过 0.85/peak，避免过载失真。
+            if peak > 0.0 {
+                target = target.min(0.85 / peak);
+            }
             // 升增益快、降增益慢，避免抽泣声/爆音。
             let alpha = if target > self.gain { 0.5 } else { 0.2 };
             self.gain += (target - self.gain) * alpha;
             let g = self.gain;
-            // 软限幅，防过载失真。
             for s in frame.iter_mut() {
                 *s = (*s * g).clamp(-0.98, 0.98);
             }
@@ -482,6 +505,74 @@ impl Agc {
             // 静音帧：不放大（底噪不被抬高），内部增益缓慢回落待命。
             self.gain += (1.0 - self.gain) * 0.1;
         }
+    }
+}
+
+/// 语音活动检测（静音抑制）。
+///
+/// 静音帧不编码、不上行，只发送语音帧，降低背景噪声对服务器 VAD/ASR 的
+/// 干扰（服务器端 VAD 阈值不会因持续噪声被抬升）。自适应噪声底 + 滞回 +
+/// 尾随缓冲（hangover 1.2s），参数取保守方向（宁多勿漏，避免吞字）。
+struct Vad {
+    /// 当前是否处于语音段。
+    speech: bool,
+    /// 已连续低于释放阈值的帧数。
+    hangover: u32,
+    /// 噪声底估计（EMA，仅静音段更新）。
+    noise_floor: f32,
+    /// 相对噪声底的触发阈值（dB）。
+    on_db: f32,
+    /// 相对噪声底的释放阈值（dB）。
+    off_db: f32,
+    /// 语音结束后的尾随帧数（1.2s @ 60ms）。
+    hangover_frames: u32,
+    /// 触发绝对下限（≈ -68dBFS）。
+    min_on: f32,
+    /// 释放绝对下限（≈ -74dBFS）。
+    min_off: f32,
+}
+
+impl Vad {
+    fn new() -> Self {
+        Self {
+            speech: false,
+            hangover: 0,
+            // 初始噪声底取很低值（-80dBFS），使触发阈值从一开始就是
+            // 绝对下限 min_on，启动后即使立刻说话也不会被吞。
+            noise_floor: 0.0001,
+            on_db: 8.0,
+            off_db: 4.0,
+            hangover_frames: 20,
+            min_on: 0.0004,
+            min_off: 0.0002,
+        }
+    }
+
+    /// 输入一帧 RMS，返回是否应发送该帧（true=语音，false=静音跳过）。
+    fn decide(&mut self, rms: f32) -> bool {
+        let on = (self.noise_floor * 10f32.powf(self.on_db / 20.0)).max(self.min_on);
+        let off = (self.noise_floor * 10f32.powf(self.off_db / 20.0)).max(self.min_off);
+        if self.speech {
+            if rms < off {
+                self.hangover += 1;
+                if self.hangover >= self.hangover_frames {
+                    self.speech = false;
+                    self.hangover = 0;
+                }
+            } else {
+                self.hangover = 0;
+            }
+        } else {
+            // 静音段：慢跟噪声底（仅低电平观测进入，避免语音污染）。
+            if rms < on {
+                self.noise_floor = self.noise_floor * 0.98 + rms * 0.02;
+            }
+            if rms >= on {
+                self.speech = true;
+                self.hangover = 0;
+            }
+        }
+        self.speech
     }
 }
 
@@ -515,6 +606,7 @@ async fn capture_worker(
     let mut window_start = Instant::now();
     let mut stats = CaptureStats::new();
     let mut agc = Agc::new();
+    let mut vad = Vad::new();
 
     loop {
         tokio::select! {
@@ -534,6 +626,7 @@ async fn capture_worker(
                     &mut window_start,
                     &mut stats,
                     &mut agc,
+                    &mut vad,
                     &encoded_tx,
                 ).await;
             }
@@ -553,6 +646,7 @@ async fn process_capture_batch(
     window_start: &mut Instant,
     stats: &mut CaptureStats,
     agc: &mut Agc,
+    vad: &mut Vad,
     encoded_tx: &LatestSlot<Vec<u8>>,
 ) {
     let mut chunk: Vec<f32> = Vec::with_capacity(CAPTURE_BATCH);
@@ -587,10 +681,19 @@ async fn process_capture_batch(
         *window_start = Instant::now();
     }
 
-    // 组 60ms 帧：AGC 提升语音电平后编码。
+    // 组 60ms 帧：VAD 判定语音 → AGC 提升电平；静音 → 清零发送（保持上行
+    // 连续，服务器 VAD 收到干净静音，不受背景噪声干扰）。
     while pending.len() >= ENCODER_FRAME_SIZE {
         let mut frame: Vec<f32> = pending.drain(..ENCODER_FRAME_SIZE).collect();
-        agc.process_frame(&mut frame);
+        let (rms, _) = frame_stats(&frame);
+        if vad.decide(rms) {
+            stats.speech_frames += 1;
+            agc.process_frame(&mut frame);
+            stats.agc_gain = agc.gain;
+        } else {
+            stats.silence_frames += 1;
+            frame.fill(0.0);
+        }
         match opus.encode(&frame) {
             Ok(pkt) => {
                 stats.frames += 1;
@@ -609,12 +712,20 @@ async fn process_capture_batch(
         };
         let db = if rms > 1e-9 { 20.0 * rms.log10() } else { -120.0 };
         debug!(
-            "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 编码帧={}",
-            db, stats.samples, stats.frames
+            "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 编码帧={} (语音{} 静音{}), AGC增益={:.1}x",
+            db,
+            stats.samples,
+            stats.frames,
+            stats.speech_frames,
+            stats.silence_frames,
+            stats.agc_gain
         );
         stats.samples = 0;
         stats.sum_sq = 0.0;
         stats.frames = 0;
+        stats.speech_frames = 0;
+        stats.silence_frames = 0;
+        stats.agc_gain = 1.0;
         stats.flush_at = Instant::now();
     }
 }
@@ -766,5 +877,74 @@ fn write_samples(
     }
     if occupancy_ms < 10.0 {
         buf.on_underrun();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一帧：幅度 `amp`、长度 960 的正弦波（避免 DC 偏差）。
+    fn make_frame(amp: f32, len: usize) -> Vec<f32> {
+        (0..len).map(|i| (i as f32 * 0.05).sin() * amp).collect()
+    }
+
+    #[test]
+    fn agc_raises_weak_voice_to_target() {
+        // 弱语音约 -58dBFS（amp=0.0018，正弦 RMS=amp/√2）。
+        let mut agc = Agc::new();
+        let mut last_db = -120.0f64;
+        // 模拟生产：每帧独立输入，多帧让增益收敛。
+        for _ in 0..12 {
+            let mut frame = make_frame(0.0018, ENCODER_FRAME_SIZE);
+            agc.process_frame(&mut frame);
+            let (rms, peak) = frame_stats(&frame);
+            last_db = 20.0 * (rms as f64).log10();
+            assert!(peak <= 0.99, "AGC 后峰值 {} 异常（削波）", peak);
+        }
+        // 收敛后应提升到目标附近（> -30dBFS）。
+        assert!(last_db > -30.0, "AGC 后 RMS {}dBFS 仍过低", last_db);
+    }
+
+    #[test]
+    fn agc_does_not_amplify_silence() {
+        let mut frame = make_frame(0.00003, ENCODER_FRAME_SIZE); // -90dBFS
+        let mut agc = Agc::new();
+        agc.gain = 20.0; // 模拟此前语音拉高增益
+        agc.process_frame(&mut frame);
+        let (rms, _) = frame_stats(&frame);
+        // 静音帧不放大：RMS 保持极低。
+        assert!(rms < 0.0001, "静音帧被放大: RMS={}", rms);
+    }
+
+    #[test]
+    fn vad_triggers_on_speech_and_releases_after_silence() {
+        let mut vad = Vad::new();
+        // 静音（-80dBFS）不触发。
+        assert!(!vad.decide(0.0001));
+        // 语音（-45dBFS）立即触发。
+        assert!(vad.decide(0.0056));
+        // 词间停顿（-50dBFS，仍高于释放阈值）不释放。
+        assert!(vad.decide(0.003));
+        // 尾随：刚进入静音时仍发送（hangover 防切词）。
+        assert!(vad.decide(0.00008));
+        // 持续静音最终释放。
+        let mut released = false;
+        for _ in 0..40 {
+            if !vad.decide(0.00008) {
+                released = true;
+                break;
+            }
+        }
+        assert!(released, "持续静音未释放");
+        // 释放后新语音再次触发。
+        assert!(vad.decide(0.0056));
+    }
+
+    #[test]
+    fn vad_does_not_swallow_soft_speech_at_startup() {
+        // 启动即说话（-55dBFS），阈值应从 min_on 起步，不应吞帧。
+        let mut vad = Vad::new();
+        assert!(vad.decide(0.0018), "启动即说话被 VAD 吞掉");
     }
 }

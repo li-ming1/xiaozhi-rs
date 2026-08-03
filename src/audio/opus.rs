@@ -5,10 +5,10 @@
 //! 保留动态加载以支持跨平台 6 份预编译库。
 
 use libloading::{Library, Symbol};
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 /// 崩溃诊断：最近一次执行的 opus 操作（供未处理异常过滤器读取）。
 pub(crate) static LAST_OPUS_CALL: AtomicU8 = AtomicU8::new(0);
@@ -19,6 +19,8 @@ pub(crate) const OPUS_CALL_CTL: u8 = 3;
 pub(crate) const OPUS_CALL_DESTROY: u8 = 4;
 /// 崩溃诊断：最近一次 opus_encoder_ctl 的请求号。
 pub(crate) static LAST_OPUS_CTL_REQUEST: AtomicU32 = AtomicU32::new(0);
+/// 进程级：库路径与版本信息只打印一次（编码器/解码器各实例化一次，避免刷屏）。
+static OPUS_LIB_INFO_ONCE: Once = Once::new();
 
 use crate::error::{Result, VoiceError};
 
@@ -113,17 +115,6 @@ impl OpusCodec {
             return Err(VoiceError::Opus(format!("创建 Opus 解码器失败: {}", error)));
         }
 
-        // 版本校验：打印实际加载的 libopus 版本，便于诊断崩溃来源。
-        if let Ok(version_fn) =
-            unsafe { load_symbol::<extern "C" fn() -> *const std::ffi::c_char>(&library, b"opus_get_version_string\0") }
-        {
-            let v = version_fn();
-            if !v.is_null() {
-                let cstr = unsafe { std::ffi::CStr::from_ptr(v) };
-                info!("Opus 库版本: {}", cstr.to_string_lossy());
-            }
-        }
-
         let mut codec = Self {
             _library: library,
             encoder,
@@ -139,7 +130,7 @@ impl OpusCodec {
             grade: NetworkGrade::Good,
         };
         codec.apply_encoder_config(NetworkGrade::Good);
-        info!("Opus 编解码器初始化成功（解码 {}Hz）", decode_rate);
+        debug!("Opus 编解码器初始化成功（解码 {}Hz）", decode_rate);
         Ok(codec)
     }
 
@@ -324,13 +315,19 @@ fn load_opus_library() -> Result<Library> {
         if path.exists()
             && let Ok(lib) = unsafe { Library::new(path) }
         {
-            info!("已加载 Opus 库: {}", path.display());
+            // 库路径进程级只打印一次（编码器/解码器各实例化一次，避免刷屏）。
+            // 版本字符串不再打印：捆绑库返回 "libopus unknown"，无诊断价值。
+            OPUS_LIB_INFO_ONCE.call_once(|| {
+                info!("已加载 Opus 库: {}", path.display());
+            });
             return Ok(lib);
         }
     }
     for name in SYSTEM_NAMES {
         if let Ok(lib) = unsafe { Library::new(*name) } {
-            warn!("未找到捆绑库，已加载系统 Opus 库: {}（建议部署捆绑库）", name);
+            OPUS_LIB_INFO_ONCE.call_once(|| {
+                warn!("未找到捆绑库，已加载系统 Opus 库: {}（建议部署捆绑库）", name);
+            });
             return Ok(lib);
         }
     }
