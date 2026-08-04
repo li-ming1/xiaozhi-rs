@@ -204,17 +204,20 @@ impl AudioManager {
         self.playback_grade_tx = None;
     }
 
-    /// 下行发送端。
+    /// 下行发送端。忽略返回值会导致下行静默失效。
+    #[must_use]
     pub fn playback_sender(&self) -> Option<mpsc::Sender<PlaybackMsg>> {
         self.playback_tx.clone()
     }
 
-    /// 捕获侧网络分级控制端（更新 Opus 编码策略）。
+    /// 捕获侧网络分级控制端（更新 Opus 编码策略）。忽略返回值会导致分级链路失效。
+    #[must_use]
     pub fn grade_sender(&self) -> Option<mpsc::Sender<NetworkGrade>> {
         self.grade_tx.clone()
     }
 
-    /// 播放侧网络分级控制端（更新解码 FEC 策略）。
+    /// 播放侧网络分级控制端（更新解码 FEC 策略）。忽略返回值会导致分级链路失效。
+    #[must_use]
     pub fn playback_grade_sender(&self) -> Option<mpsc::Sender<NetworkGrade>> {
         self.playback_grade_tx.clone()
     }

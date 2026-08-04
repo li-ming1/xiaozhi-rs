@@ -58,7 +58,9 @@ impl Backoff {
     }
 
     fn next(&mut self) -> Duration {
-        self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.rng = self.rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         // shift 恒 ≤ 8，`1 << shift` 不会溢出。
         let exp = self.base.saturating_mul(1u32 << self.attempt.min(8));
         let upper = exp.min(self.cap);

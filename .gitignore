@@ -1,9 +1,7 @@
-# Rust
+# Rust（Cargo.lock 已提交，固定依赖保证可复现构建）
 target/
 **/*.rs.bk
 *.pdb
-
-# Cargo（提交 Cargo.lock 以固定依赖版本，保证可复现构建）
 
 # IDE
 .vscode/
@@ -22,17 +20,10 @@ Thumbs.db
 *.so
 *.dylib
 
-# 但保留 libs/ 下的预编译依赖（opus 库随仓库分发）
-!libs/**/*.dll
-!libs/**/*.so
-!libs/**/*.dylib
-
 # Logs
 *.log
 
 # Project specific
-efuse.json
-dist/
 mqtt-udp_zh.md
 websocket_zh.md
 AGENTS.md

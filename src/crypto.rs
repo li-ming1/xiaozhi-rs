@@ -113,8 +113,8 @@ mod tests {
             flags: 0x00,
             payload_len: 0x1234,
             ssrc: 0,
-            timestamp: 0xDEADBEEF,
-            sequence: 0x00000007,
+            timestamp: 0xDEAD_BEEF,
+            sequence: 0x0000_0007,
         };
         let iv = h.build_iv(&base);
         // type/flags/ssrc 区保留 base nonce，其余为覆写区。
