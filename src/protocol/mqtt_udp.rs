@@ -112,7 +112,6 @@ impl MqttUdpTransport {
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
         let (audio_tx, audio_rx) = super::LatestSlot::<Vec<u8>>::new().pipe();
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
-        let (close_tx, _close_rx) = mpsc::channel(1);
 
         // 出站任务：控制走 MQTT，音频走 UDP（加密）。
         let mqtt_send_client = client.clone();
@@ -139,7 +138,6 @@ impl MqttUdpTransport {
             control_tx,
             audio_tx,
             incoming_rx,
-            close_tx,
         })
     }
 }

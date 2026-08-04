@@ -40,10 +40,6 @@ pub enum VoiceError {
     #[error("超时: {0}")]
     Timeout(String),
 
-    /// 永久性错误：不应重试。
-    #[error("永久错误: {0}")]
-    Permanent(String),
-
     /// 其他未分类错误。
     #[error(transparent)]
     Other(#[from] anyhow::Error),

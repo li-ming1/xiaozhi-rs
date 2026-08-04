@@ -1,6 +1,6 @@
 //! `VoiceSupervisor`：连接生命周期状态机。
 //!
-//! 状态流转固定为 `Bootstrap -> SelectTransport -> Connect -> Negotiate -> Streaming -> Backoff`。
+//! 状态流转固定为 `Bootstrap -> SelectTransport -> Connect -> Streaming -> Backoff`。
 //! 网络瞬断、设备热插拔与临时服务故障均在内部恢复；认证失败立即失效并刷新。
 //!
 //! 关键策略（重构方案）：
@@ -34,7 +34,6 @@ enum State {
     Bootstrap,
     SelectTransport,
     Connect,
-    Negotiate,
     Streaming,
     Backoff,
 }
@@ -226,7 +225,7 @@ impl VoiceSupervisor {
         loop {
             if self.shutdown.is_cancelled() {
                 info!("收到停机信号，退出监督循环");
-                self.cleanup();
+                self.cleanup_session();
                 return Ok(());
             }
             // 心跳：进程静默死亡时，最后一行日志能定位死亡瞬间的状态。
@@ -243,18 +242,14 @@ impl VoiceSupervisor {
                     self.select_transport();
                     State::Connect
                 }
-                State::Connect => {
-                    self.state = State::Negotiate;
-                    match self.connect().await {
-                        Ok(()) => State::Streaming,
-                        Err(e) => {
-                            warn!("连接失败: {}", e);
-                            self.on_connect_error(&e);
-                            State::Backoff
-                        }
+                State::Connect => match self.connect().await {
+                    Ok(()) => State::Streaming,
+                    Err(e) => {
+                        warn!("连接失败: {}", e);
+                        self.on_connect_error(&e);
+                        State::Backoff
                     }
-                }
-                State::Negotiate => State::Streaming,
+                },
                 State::Streaming => match self.stream().await {
                     // 会话正常结束（goodbye）也保持运行：回到传输选择，不退出进程。
                     Ok(()) => {
@@ -274,7 +269,7 @@ impl VoiceSupervisor {
                     tokio::select! {
                         _ = sleep(delay) => {}
                         _ = self.shutdown.cancelled() => {
-                            self.cleanup();
+                            self.cleanup_session();
                             return Ok(());
                         }
                     }
@@ -435,11 +430,16 @@ impl VoiceSupervisor {
                         downlink_frames = 0;
                         downlink_diag = Instant::now();
                     }
-                    // 网络分级（10s 窗口）。
+                    // 网络分级（10s 窗口）：同时下发捕获侧（编码策略）与播放侧（FEC 解码）。
                     if last_grade_check.elapsed() >= Duration::from_secs(10) {
                         let grade = loss.grade;
-                        if let Some(tx) = self.audio.as_ref().and_then(|a| a.grade_sender()) {
-                            let _ = tx.send(grade).await;
+                        if let Some(a) = self.audio.as_ref() {
+                            if let Some(tx) = a.grade_sender() {
+                                let _ = tx.send(grade).await;
+                            }
+                            if let Some(tx) = a.playback_grade_sender() {
+                                let _ = tx.send(grade).await;
+                            }
                         }
                         last_grade_check = Instant::now();
                     }
@@ -447,7 +447,7 @@ impl VoiceSupervisor {
                 incoming = handles.incoming_rx.recv() => {
                     match incoming {
                         Some(IncomingEvent::Json(msg)) => {
-                            match handle_json(msg, &handles, &mut tts_active, &mut sentence_has_media, &mut tts_started_at, self.audio.as_ref()).await {
+                            match handle_json(msg, &mut tts_active, &mut sentence_has_media, &mut tts_started_at, self.audio.as_ref()).await {
                                 Ok(Some(())) => break Ok(()),   // goodbye
                                 Ok(None) => {}
                                 Err(e) => break Err(e),
@@ -527,10 +527,6 @@ impl VoiceSupervisor {
         self.epoch = None;
         self.handles = None;
     }
-
-    fn cleanup(&mut self) {
-        self.cleanup_session();
-    }
 }
 
 /// 由 OTA 配置推导 MQTT 参数。
@@ -588,7 +584,6 @@ fn derive_mqtt(m: &OtaMqttConfig, ws_url: &str, client_id: &str) -> MqttParams {
 /// 处理服务器 JSON 消息。返回 Some(()) 表示会话应结束（goodbye）。
 async fn handle_json(
     msg: ServerMessage,
-    handles: &TransportHandles,
     tts_active: &mut bool,
     sentence_has_media: &mut bool,
     tts_started_at: &mut Option<Instant>,
@@ -640,6 +635,5 @@ async fn handle_json(
         }
         ServerMessage::Unknown => {}
     }
-    let _ = handles;
     Ok(None)
 }

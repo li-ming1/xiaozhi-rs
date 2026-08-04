@@ -35,3 +35,4 @@ efuse.json
 dist/
 mqtt-udp_zh.md
 websocket_zh.md
+AGENTS.md

@@ -74,7 +74,6 @@ impl WsTransport {
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
         let (audio_tx_slot, audio_rx_slot) = super::LatestSlot::<Vec<u8>>::new().pipe();
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
-        let (close_tx, close_rx) = mpsc::channel(1);
 
         // 发送任务：控制（文本 JSON）、音频（二进制 v2/v1）、心跳 Ping。
         let session_start = Instant::now();
@@ -87,7 +86,7 @@ impl WsTransport {
         ));
 
         // 接收任务。
-        tokio::spawn(recv_loop(receiver, incoming_tx.clone(), close_rx, binary_version));
+        tokio::spawn(recv_loop(receiver, incoming_tx.clone(), binary_version));
 
         Ok(TransportHandles {
             session_id,
@@ -95,7 +94,6 @@ impl WsTransport {
             control_tx,
             audio_tx: audio_tx_slot,
             incoming_rx,
-            close_tx,
         })
     }
 }
@@ -346,32 +344,25 @@ async fn send_loop(
 async fn recv_loop(
     mut receiver: WsReceiver,
     incoming_tx: mpsc::Sender<IncomingEvent>,
-    mut close_rx: mpsc::Receiver<()>,
     binary_version: u16,
 ) {
     loop {
-        tokio::select! {
-            biased;
-            _ = close_rx.recv() => break,
-            msg = receiver.receive() => {
-                match msg {
-                    Ok(ReceivedMessage::Json(srv)) => {
-                        if incoming_tx.send(IncomingEvent::Json(srv)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(ReceivedMessage::Audio(data)) => {
-                        let payload = strip_binary_header(&data, binary_version);
-                        if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("WS 接收错误: {}", e);
-                        let _ = incoming_tx.send(IncomingEvent::Closed).await;
-                        break;
-                    }
+        match receiver.receive().await {
+            Ok(ReceivedMessage::Json(srv)) => {
+                if incoming_tx.send(IncomingEvent::Json(srv)).await.is_err() {
+                    break;
                 }
+            }
+            Ok(ReceivedMessage::Audio(data)) => {
+                let payload = strip_binary_header(&data, binary_version);
+                if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!("WS 接收错误: {}", e);
+                let _ = incoming_tx.send(IncomingEvent::Closed).await;
+                break;
             }
         }
     }

@@ -64,6 +64,7 @@ pub struct AudioManager {
     workers: Vec<JoinHandle<()>>,
     playback_tx: Option<mpsc::Sender<PlaybackMsg>>,
     grade_tx: Option<mpsc::Sender<NetworkGrade>>,
+    playback_grade_tx: Option<mpsc::Sender<NetworkGrade>>,
 }
 
 impl AudioManager {
@@ -86,6 +87,7 @@ impl AudioManager {
             workers: Vec::new(),
             playback_tx: None,
             grade_tx: None,
+            playback_grade_tx: None,
         })
     }
 
@@ -179,6 +181,7 @@ impl AudioManager {
 
         let (playback_tx, playback_rx) = mpsc::channel::<PlaybackMsg>(32);
         let (grade_tx, grade_rx) = mpsc::channel::<NetworkGrade>(4);
+        let (playback_grade_tx, playback_grade_rx) = mpsc::channel::<NetworkGrade>(4);
         self.workers.push(tokio::spawn(capture_worker(
             in_consumer,
             encoded_tx,
@@ -187,6 +190,7 @@ impl AudioManager {
         )));
         self.workers.push(tokio::spawn(playback_worker(
             playback_rx,
+            playback_grade_rx,
             out_producer,
             server_rate,
             output_rate,
@@ -198,6 +202,7 @@ impl AudioManager {
         self.output_stream = Some(output_stream);
         self.playback_tx = Some(playback_tx);
         self.grade_tx = Some(grade_tx);
+        self.playback_grade_tx = Some(playback_grade_tx);
         Ok(())
     }
 
@@ -210,6 +215,7 @@ impl AudioManager {
         }
         self.playback_tx = None;
         self.grade_tx = None;
+        self.playback_grade_tx = None;
     }
 
     /// 下行发送端。
@@ -217,9 +223,14 @@ impl AudioManager {
         self.playback_tx.clone()
     }
 
-    /// 网络分级控制端（更新 Opus 编码策略）。
+    /// 捕获侧网络分级控制端（更新 Opus 编码策略）。
     pub fn grade_sender(&self) -> Option<mpsc::Sender<NetworkGrade>> {
         self.grade_tx.clone()
+    }
+
+    /// 播放侧网络分级控制端（更新解码 FEC 策略）。
+    pub fn playback_grade_sender(&self) -> Option<mpsc::Sender<NetworkGrade>> {
+        self.playback_grade_tx.clone()
     }
 }
 
@@ -745,6 +756,7 @@ async fn process_capture_batch(
 /// 播放 DSP worker：Opus → 解码（服务器率）→ 设备率 → rtrb。
 async fn playback_worker(
     mut rx: mpsc::Receiver<PlaybackMsg>,
+    mut grade_rx: mpsc::Receiver<NetworkGrade>,
     mut out: Producer<f32>,
     server_rate: u32,
     output_rate: u32,
@@ -770,55 +782,60 @@ async fn playback_worker(
     let mut drift = DriftController::new(nominal);
     let mut last_drift = Instant::now();
     let mut stats = PlaybackStats::new();
+    // 当前网络分级（弱网时解码启用 FEC 前向纠错）。
+    let mut grade = NetworkGrade::Good;
     // 重采样输出缓冲常驻复用，避免每帧解码后堆分配。
     let mut out_samples: Vec<f32> = Vec::with_capacity(960 * 3);
 
     loop {
-        match rx.recv().await {
-            Some(PlaybackMsg::Audio(opus)) => {
-                stats.received += 1;
-                buf.observe_arrival(Instant::now());
-                let (pcm, used_plc) = match decoder.decode(&opus, false) {
-                    Ok(p) => (p, false),
-                    Err(e) => {
-                        stats.decoded_fail += 1;
-                        debug!("Opus 解码失败(len={}): {}", opus.len(), e);
-                        match decoder.decode(&[], false) {
-                            Ok(p) => {
-                                stats.plc += 1;
-                                (p, true)
-                            }
-                            Err(e2) => {
-                                warn!("Opus 解码与 PLC 均失败: {}", e2);
-                                continue;
-                            }
-                        }
-                    }
-                };
-                if !used_plc {
-                    stats.decoded_ok += 1;
+        tokio::select! {
+            g = grade_rx.recv() => {
+                if let Some(g) = g {
+                    grade = g;
                 }
-                stats.last_pcm_len = pcm.len();
-                stats.last_needed = resampler.input_frames_next();
-                out_samples.clear();
-                resampler.process(&pcm, drift.ratio, &mut out_samples);
-                stats.last_produced = out_samples.len();
-                if out_samples.is_empty() {
-                    stats.zero_produced += 1;
-                }
-                let before = out.slots();
-                write_samples(
-                    &mut out,
-                    &out_samples,
-                    output_rate,
-                    &mut buf,
-                    OUTPUT_RING_SAMPLES,
-                );
-                stats.written += before.saturating_sub(out.slots()) as u64;
-                buf.on_play_start();
             }
-            Some(PlaybackMsg::Flush) => buf.reset(),
-            Some(PlaybackMsg::Shutdown) | None => break,
+            msg = rx.recv() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    PlaybackMsg::Audio(opus) => {
+                        stats.received += 1;
+                        buf.observe_arrival(Instant::now());
+                        let (pcm, used_plc) = match decoder.decode(&opus, grade != NetworkGrade::Good) {
+                            Ok(p) => (p, false),
+                            Err(e) => {
+                                stats.decoded_fail += 1;
+                                debug!("Opus 解码失败(len={}): {}", opus.len(), e);
+                                match decoder.decode(&[], false) {
+                                    Ok(p) => {
+                                        stats.plc += 1;
+                                        (p, true)
+                                    }
+                                    Err(e2) => {
+                                        warn!("Opus 解码与 PLC 均失败: {}", e2);
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+                        if !used_plc {
+                            stats.decoded_ok += 1;
+                        }
+                        stats.last_pcm_len = pcm.len();
+                        stats.last_needed = resampler.input_frames_next();
+                        out_samples.clear();
+                        resampler.process(&pcm, drift.ratio, &mut out_samples);
+                        stats.last_produced = out_samples.len();
+                        if out_samples.is_empty() {
+                            stats.zero_produced += 1;
+                        }
+                        let before = out.slots();
+                        write_samples(&mut out, &out_samples, output_rate, OUTPUT_RING_SAMPLES);
+                        stats.written += before.saturating_sub(out.slots()) as u64;
+                    }
+                    PlaybackMsg::Flush => buf.reset(),
+                    PlaybackMsg::Shutdown => break,
+                }
+            }
         }
 
         if stats.flush_at.elapsed() >= Duration::from_secs(2) {
@@ -862,7 +879,6 @@ fn write_samples(
     out: &mut Producer<f32>,
     samples: &[f32],
     output_rate: u32,
-    buf: &mut PlaybackBuffer,
     capacity: usize,
 ) {
     let free = out.slots();
@@ -888,9 +904,6 @@ fn write_samples(
             }
             Err(_) => break,
         }
-    }
-    if occupancy_ms < 10.0 {
-        buf.on_underrun();
     }
 }
 

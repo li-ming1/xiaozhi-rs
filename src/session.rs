@@ -5,7 +5,6 @@
 //! 具体状态由各传输/worker 持有并在新建纪元时重建。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 /// 传输类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +19,6 @@ pub struct SessionEpoch {
     pub id: u64,
     pub session_id: String,
     pub transport: TransportKind,
-    pub created: Instant,
 }
 
 static EPOCH_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -31,7 +29,6 @@ impl SessionEpoch {
             id: EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed),
             session_id,
             transport,
-            created: Instant::now(),
         }
     }
 }

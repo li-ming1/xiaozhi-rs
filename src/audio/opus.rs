@@ -65,8 +65,6 @@ pub struct OpusCodec {
     decoder: *mut OpusDecoder,
     encode_buf: Vec<u8>,
     decode_buf: Vec<f32>,
-    /// 下行采样率（解码器按此创建）。
-    decode_rate: i32,
     /// 当前网络分级。
     grade: NetworkGrade,
 }
@@ -125,7 +123,6 @@ impl OpusCodec {
             decoder,
             encode_buf: vec![0u8; MAX_PACKET_SIZE],
             decode_buf: vec![0f32; DECODE_MAX_SAMPLES],
-            decode_rate: decode_rate as i32,
             grade: NetworkGrade::Good,
         };
         codec.apply_encoder_config(NetworkGrade::Good);
@@ -133,21 +130,20 @@ impl OpusCodec {
         Ok(codec)
     }
 
-    /// 按网络分级调整编码参数。
+    /// 按网络分级调整编码参数（32/28/20kbps + FEC/DTX）。
     ///
-    /// 注意：当前禁用运行时调整 —— 旧捆绑/系统 opus.dll 在 `opus_encoder_ctl`
-    /// 的 FEC/DTX/VBR 约束请求上确定性崩溃（offset=0x8ce6）。现切换为 opusic-sys
-    /// 内置编译，ctl 请求号采用 libopus 官方定义，可择机恢复运行时调整；
-    /// 上行暂时保持 Good（32kbps VBR，FEC/DTX 关闭）。
+    /// libopus 已由 opusic-sys 静态内置（bundled），`opus_encoder_ctl` 采用
+    /// libopus 官方请求号，运行时调整安全，无历史 opus.dll 崩溃问题。
     pub fn set_network_grade(&mut self, grade: NetworkGrade) {
         if self.grade == grade {
             return;
         }
-        warn!(
-            "网络分级变化 {:?} -> {:?}（当前禁用运行时调整，避免 opus_ctl 崩溃）",
+        info!(
+            "网络分级变化 {:?} -> {:?}，调整编码策略",
             self.grade, grade
         );
         self.grade = grade;
+        self.apply_encoder_config(grade);
     }
 
     fn apply_encoder_config(&mut self, grade: NetworkGrade) {
@@ -156,19 +152,19 @@ impl OpusCodec {
             NetworkGrade::Fair => (28_000, 1, 0, 1, 0),
             NetworkGrade::Poor => (20_000, 0, 1, 1, 1),
         };
-        LAST_OPUS_CALL.store(OPUS_CALL_CTL, Ordering::Relaxed);
-        LAST_OPUS_CTL_REQUEST.store(OPUS_SET_BITRATE_REQUEST as u32, Ordering::Relaxed);
-        let _ = unsafe { opus_encoder_ctl_fixed(self.encoder, OPUS_SET_BITRATE_REQUEST, bitrate) };
-        LAST_OPUS_CTL_REQUEST.store(OPUS_SET_VBR_REQUEST as u32, Ordering::Relaxed);
-        let _ = unsafe { opus_encoder_ctl_fixed(self.encoder, OPUS_SET_VBR_REQUEST, vbr) };
-        LAST_OPUS_CTL_REQUEST.store(OPUS_SET_VBR_CONSTRAINT_REQUEST as u32, Ordering::Relaxed);
-        let _ = unsafe {
-            opus_encoder_ctl_fixed(self.encoder, OPUS_SET_VBR_CONSTRAINT_REQUEST, constrained)
+        let set = |request: c_int, value: c_int| {
+            LAST_OPUS_CTL_REQUEST.store(request as u32, Ordering::Relaxed);
+            let ret = unsafe { opus_encoder_ctl_fixed(self.encoder, request, value) };
+            if ret != OPUS_OK {
+                warn!("opus_encoder_ctl({}) 失败: {}", request, opus_error_desc(ret));
+            }
         };
-        LAST_OPUS_CTL_REQUEST.store(OPUS_SET_INBAND_FEC_REQUEST as u32, Ordering::Relaxed);
-        let _ = unsafe { opus_encoder_ctl_fixed(self.encoder, OPUS_SET_INBAND_FEC_REQUEST, fec) };
-        LAST_OPUS_CTL_REQUEST.store(OPUS_SET_DTX_REQUEST as u32, Ordering::Relaxed);
-        let _ = unsafe { opus_encoder_ctl_fixed(self.encoder, OPUS_SET_DTX_REQUEST, dtx) };
+        LAST_OPUS_CALL.store(OPUS_CALL_CTL, Ordering::Relaxed);
+        set(OPUS_SET_BITRATE_REQUEST, bitrate);
+        set(OPUS_SET_VBR_REQUEST, vbr);
+        set(OPUS_SET_VBR_CONSTRAINT_REQUEST, constrained);
+        set(OPUS_SET_INBAND_FEC_REQUEST, fec);
+        set(OPUS_SET_DTX_REQUEST, dtx);
         LAST_OPUS_CTL_REQUEST.store(0, Ordering::Relaxed);
         LAST_OPUS_CALL.store(OPUS_CALL_NONE, Ordering::Relaxed);
     }
@@ -245,10 +241,6 @@ impl OpusCodec {
             )));
         }
         Ok(self.decode_buf[..samples as usize].to_vec())
-    }
-
-    pub fn decode_rate(&self) -> u32 {
-        self.decode_rate as u32
     }
 }
 

@@ -89,11 +89,6 @@ impl AsyncResampler {
     pub fn input_frames_next(&self) -> usize {
         self.resampler.input_frames_next()
     }
-
-    /// 当前比例。
-    pub fn ratio(&self) -> f64 {
-        self.ratio
-    }
 }
 
 #[cfg(test)]

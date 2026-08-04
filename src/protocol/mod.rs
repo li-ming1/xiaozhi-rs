@@ -65,8 +65,6 @@ pub struct TransportHandles {
     pub audio_tx: LatestSlot<Vec<u8>>,
     /// 入站事件流。
     pub incoming_rx: mpsc::Receiver<IncomingEvent>,
-    /// 传输关闭信号（用于通知监督循环停止向已断开的传输推送）。
-    pub close_tx: mpsc::Sender<()>,
 }
 
 /// 传输适配器闭集：枚举即静态分派，无 dyn / 无 async_trait。
@@ -123,11 +121,6 @@ impl<T> LatestSlot<T> {
             }
             self.notify.notified().await;
         }
-    }
-
-    /// 非阻塞尝试取走。
-    pub async fn try_take(&self) -> Option<T> {
-        self.inner.lock().await.take()
     }
 }
 
