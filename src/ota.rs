@@ -183,13 +183,13 @@ pub async fn wait_for_activation(identity: &DeviceIdentity, challenge: &str) -> 
                     return Ok(());
                 }
                 202 => {
-                    let remaining = (MAX_POLLS - attempt) * 5;
+                    let remaining = (MAX_POLLS - attempt) * POLL_INTERVAL.as_secs() as u32;
                     info!("等待用户输入验证码...（剩余{}秒）", remaining);
                 }
                 status => warn!("服务器返回状态码: {}", status),
             },
             Err(_) => {
-                let remaining = (MAX_POLLS - attempt) * 5;
+                let remaining = (MAX_POLLS - attempt) * POLL_INTERVAL.as_secs() as u32;
                 info!(
                     "网络请求失败，{}秒后重试...（剩余{}秒）",
                     POLL_INTERVAL.as_secs(),

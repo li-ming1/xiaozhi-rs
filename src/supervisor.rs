@@ -26,12 +26,17 @@ use crate::protocol::ws::WsTransport;
 use crate::protocol::{
     ConnectParams, IncomingEvent, MqttParams, TransportAdapter, TransportHandles,
 };
-use crate::session::{SessionEpoch, TransportKind};
+
+/// 传输类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportKind {
+    MqttUdp,
+    WebSocket,
+}
 
 /// 状态机。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    Bootstrap,
     SelectTransport,
     Connect,
     Streaming,
@@ -59,8 +64,8 @@ impl Backoff {
     fn next(&mut self) -> Duration {
         // 简单 LCG。
         self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let shift = self.attempt.min(8) as u32;
-        let exp = self.base.saturating_mul(1u32.checked_shl(shift).unwrap_or(1));
+        // shift 恒 ≤ 8，`1 << shift` 不会溢出。
+        let exp = self.base.saturating_mul(1u32 << self.attempt.min(8));
         let upper = exp.min(self.cap);
         let range_ms = upper.as_millis().max(1) as u64;
         let jitter_ms = self.rng % range_ms;
@@ -196,8 +201,9 @@ pub struct VoiceSupervisor {
     mqtt_circuit: CircuitBreaker,
     /// 主链路偏好（MQTT+UDP）。熔断或黑洞时暂时切换 WebSocket。
     prefer_mqtt: bool,
-    epoch: Option<SessionEpoch>,
-    /// 当前纪元建连后的统一句柄（由 Connect 状态交给 Streaming 状态，禁止重复建连）。
+    /// 当前会话的传输类型（每次建连重建，标记"纪元"）。
+    epoch: Option<TransportKind>,
+    /// 当前会话建连后的统一句柄（由 Connect 状态交给 Streaming 状态，禁止重复建连）。
     handles: Option<TransportHandles>,
 }
 
@@ -208,7 +214,7 @@ impl VoiceSupervisor {
             identity,
             ota,
             shutdown,
-            state: State::Bootstrap,
+            state: State::SelectTransport,
             audio,
             backoff: Backoff::new(),
             mqtt_circuit: CircuitBreaker::new(),
@@ -220,7 +226,7 @@ impl VoiceSupervisor {
 
     /// 主循环。
     pub async fn run(&mut self) -> Result<()> {
-        self.state = State::Bootstrap;
+        info!("监督器启动");
         let mut heartbeat = Instant::now();
         loop {
             if self.shutdown.is_cancelled() {
@@ -234,10 +240,6 @@ impl VoiceSupervisor {
                 heartbeat = Instant::now();
             }
             self.state = match self.state {
-                State::Bootstrap => {
-                    info!("监督器启动");
-                    State::SelectTransport
-                }
                 State::SelectTransport => {
                     self.select_transport();
                     State::Connect
@@ -279,20 +281,22 @@ impl VoiceSupervisor {
         }
     }
 
+    /// MQTT+UDP 链路可用（OTA 已下发且熔断器未打开）。
+    fn mqtt_available(&self) -> bool {
+        self.prefer_mqtt && self.ota.mqtt.is_some() && !self.mqtt_circuit.is_open()
+    }
+
     /// 选择传输：MQTT+UDP 优先（未熔断），否则 WebSocket。
     fn select_transport(&mut self) {
-        let mqtt_ok = self.ota.mqtt.is_some() && !self.mqtt_circuit.is_open();
-        if self.prefer_mqtt && mqtt_ok {
+        if self.mqtt_available() {
             info!("选择传输: MQTT+UDP（主链路）");
         } else {
             info!("选择传输: WebSocket（回退）");
         }
-        self.state = State::SelectTransport;
     }
 
     fn current_transport_kind(&self) -> TransportKind {
-        let mqtt_ok = self.ota.mqtt.is_some() && !self.mqtt_circuit.is_open();
-        if self.prefer_mqtt && mqtt_ok {
+        if self.mqtt_available() {
             TransportKind::MqttUdp
         } else {
             TransportKind::WebSocket
@@ -339,7 +343,7 @@ impl VoiceSupervisor {
             TransportKind::WebSocket => TransportAdapter::WebSocket(WsTransport::default()),
         };
         let handles = adapter.connect(&params).await?;
-        self.epoch = Some(SessionEpoch::new(handles.session_id.clone(), kind));
+        self.epoch = Some(kind);
         self.handles = Some(handles);
         self.backoff.on_success();
         self.mqtt_circuit.on_stable();
@@ -361,11 +365,7 @@ impl VoiceSupervisor {
 
     /// 流式会话。句柄来自 Connect 状态（`self.handles`），此处不再建连。
     async fn stream(&mut self) -> Result<()> {
-        let kind = self
-            .epoch
-            .as_ref()
-            .map(|e| e.transport)
-            .unwrap_or(TransportKind::WebSocket);
+        let kind = self.epoch.unwrap_or(TransportKind::WebSocket);
         let mut handles = self
             .handles
             .take()
@@ -402,11 +402,14 @@ impl VoiceSupervisor {
         let mut downlink_frames: u64 = 0;
         let mut downlink_diag = Instant::now();
         let mut first_frame_logged = false;
+        // 复用 interval 定时器（每 250ms 巡检），避免每次 select 新建 timer。
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        tick.reset(); // 与 sleep 语义一致：首个 tick 延迟一个周期。
 
         let result = loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break Ok(()),
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                _ = tick.tick() => {
                     // UDP 黑洞检测仅对 MQTT+UDP 生效（TCP 无黑洞概念）。
                     // - 首包等待：TTS start 后 10s 无媒体（TTS 生成延迟属正常）；
                     // - 中途断流：已收到媒体的句子 3s 无媒体。
@@ -511,7 +514,7 @@ impl VoiceSupervisor {
             self.audio = None;
         }
         if matches!(e, VoiceError::Transport(_) | VoiceError::Timeout(_))
-            && self.epoch.as_ref().map(|e| e.transport) == Some(TransportKind::MqttUdp)
+            && self.epoch == Some(TransportKind::MqttUdp)
             && self.mqtt_circuit.record_failure()
         {
             self.prefer_mqtt = false;
@@ -618,7 +621,7 @@ async fn handle_json(
             TtsState::SentenceStop | TtsState::SentenceEnd => {}
         },
         ServerMessage::Stt { text } => info!("用户: {}", text),
-        ServerMessage::Llm { text, .. } => {
+        ServerMessage::Llm { text } => {
             if let Some(t) = text {
                 info!("AI: {}", t);
             }
@@ -636,4 +639,26 @@ async fn handle_json(
         ServerMessage::Unknown => {}
     }
     Ok(None)
+}
+
+/// 实时语音客户端入口：对外唯一接口，只暴露构造与运行。
+///
+/// 网络瞬断、设备热插拔与临时服务故障均在内部由 [`VoiceSupervisor`] 恢复，
+/// 调用方无需感知。构造需 `DeviceIdentity` 与 `OtaConfig`（见 `identity`/`ota`）。
+pub struct RealtimeVoice {
+    identity: DeviceIdentity,
+    ota: OtaConfig,
+}
+
+impl RealtimeVoice {
+    /// 由设备身份与 OTA 配置构造。
+    pub fn from_ota(identity: DeviceIdentity, ota: OtaConfig) -> Result<Self> {
+        Ok(Self { identity, ota })
+    }
+
+    /// 运行至 `shutdown` 取消或不可恢复错误。
+    pub async fn run_until(self, shutdown: CancellationToken) -> Result<()> {
+        let mut supervisor = VoiceSupervisor::new(self.identity, self.ota, shutdown);
+        supervisor.run().await
+    }
 }

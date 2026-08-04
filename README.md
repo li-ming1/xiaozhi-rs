@@ -97,9 +97,7 @@ RUST_LOG=debug xiaozhi-rs start
 src/
 ├── main.rs          CLI 入口 + 多线程 runtime + ring TLS provider + 日志器
 ├── lib.rs           模块声明与公共导出
-├── realtime.rs      RealtimeVoice 公共入口（仅构造 + 运行）
-├── supervisor.rs    VoiceSupervisor 状态机（Bootstrap→SelectTransport→Connect→Streaming→Backoff）
-├── session.rs       SessionEpoch 会话纪元（状态隔离，禁止跨连接复用）
+├── supervisor.rs    VoiceSupervisor 状态机（SelectTransport→Connect→Streaming→Backoff）+ RealtimeVoice 入口
 ├── error.rs         类型化错误（认证/瞬态/协议/音频等分级）
 ├── identity.rs      设备身份（MAC 派生、HMAC、efuse 持久化）
 ├── ota.rs           OTA 配置拉取 + 激活轮询（reqwest）
@@ -111,7 +109,7 @@ src/
 │   └── mqtt_udp.rs  MQTT+UDP 主链路（QoS0、防重放、UDP 黑洞检测）
 └── audio/
     ├── mod.rs       无锁管线：CPAL 回调 + 独立 DSP worker + 漂移补偿
-    ├── opus.rs      Opus 编解码（opusic-sys 静态内置）+ PLC
+    ├── opus.rs      Opus 编解码（opusic-sys 静态内置）+ PLC + 自适应码率
     ├── resample.rs  rubato AsyncSinc（256-tap BlackmanHarris2）
     └── buffer.rs    自适应深度播放缓冲（40–240ms）
 ```

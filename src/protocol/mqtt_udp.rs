@@ -23,12 +23,13 @@ use crate::crypto::{hex_decode_16, AesCtrCipher, UdpAudioHeader, HEADER_SIZE, TY
 use crate::error::{Result, VoiceError};
 use crate::protocol::message::{AudioParams, ClientMessage, ServerMessage};
 
-use super::{now_ms, ConnectParams, IncomingEvent, MqttParams, TransportHandles};
+use super::{
+    now_ms, ConnectParams, IncomingEvent, MqttParams, TransportHandles, CONTROL_CHANNEL_CAP,
+    INCOMING_CHANNEL_CAP,
+};
 
 const MQTT_KEEP_ALIVE: Duration = Duration::from_secs(240);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-const CONTROL_CHANNEL_CAP: usize = 16;
-const INCOMING_CHANNEL_CAP: usize = 64;
 const REQUEST_CAP: usize = 64;
 /// UDP 接收缓冲上限（Opus 最大包 + 包头，留余量）。
 const UDP_MAX_PACKET: usize = 2048;
@@ -190,8 +191,7 @@ async fn wait_hello(eventloop: &mut EventLoop) -> Result<Negotiated> {
                             udp,
                         });
                     }
-                    Ok(_) => continue,
-                    Err(_) => continue,
+                    _ => continue,
                 }
             }
             Event::Incoming(Incoming::ConnAck(_)) => continue,

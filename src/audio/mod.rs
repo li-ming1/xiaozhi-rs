@@ -594,162 +594,149 @@ async fn capture_worker(
     mut grade_rx: mpsc::Receiver<NetworkGrade>,
     device_rate: u32,
 ) {
-    let nominal = 16_000.0 / device_rate as f64;
-    let mut resampler = match AsyncResampler::new(nominal, 160) {
-        Ok(r) => r,
+    let mut worker = match CaptureWorker::new(device_rate) {
+        Ok(w) => w,
         Err(e) => {
-            warn!("捕获重采样器创建失败: {}", e);
+            warn!("捕获管线初始化失败: {}", e);
             return;
         }
     };
-    let mut opus = match OpusCodec::new(16_000) {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("捕获 Opus 编码器创建失败: {}", e);
-            return;
-        }
-    };
-    opus.set_complexity(10);
-
-    let mut pending: Vec<f32> = Vec::with_capacity(ENCODER_FRAME_SIZE * 2);
-    let mut drift = DriftController::new(nominal);
-    let mut window_count: u64 = 0;
-    let mut window_start = Instant::now();
-    let mut stats = CaptureStats::new();
-    let mut agc = Agc::new();
-    let mut vad = Vad::new();
-    // 热路径缓冲：每 2ms 批次读取、重采样输出、编码帧均在 worker 级复用，
-    // 避免每次循环堆分配（这是捕获路径的主要分配热点）。
-    let mut chunk: Vec<f32> = Vec::with_capacity(CAPTURE_BATCH);
-    let mut resample_out: Vec<f32> = Vec::with_capacity(CAPTURE_BATCH + 8);
-    let mut frame: Vec<f32> = Vec::with_capacity(ENCODER_FRAME_SIZE);
-
     loop {
         tokio::select! {
             grade = grade_rx.recv() => {
                 if let Some(g) = grade {
-                    opus.set_network_grade(g);
+                    worker.opus.set_network_grade(g);
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(2)) => {
-                process_capture_batch(
-                    &mut input,
-                    &mut resampler,
-                    &mut opus,
-                    &mut pending,
-                    &mut chunk,
-                    &mut resample_out,
-                    &mut frame,
-                    &mut drift,
-                    &mut window_count,
-                    &mut window_start,
-                    &mut stats,
-                    &mut agc,
-                    &mut vad,
-                    &encoded_tx,
-                ).await;
+                worker.process_batch(&mut input, &encoded_tx).await;
             }
         }
     }
 }
 
-/// 捕获批次处理（非阻塞）：读取输入 → 重采样 → 漂移校正 → 组帧编码。
-#[allow(clippy::too_many_arguments)]
-async fn process_capture_batch(
-    input: &mut Consumer<f32>,
-    resampler: &mut AsyncResampler,
-    opus: &mut OpusCodec,
-    pending: &mut Vec<f32>,
-    chunk: &mut Vec<f32>,
-    resample_out: &mut Vec<f32>,
-    frame: &mut Vec<f32>,
-    drift: &mut DriftController,
-    window_count: &mut u64,
-    window_start: &mut Instant,
-    stats: &mut CaptureStats,
-    agc: &mut Agc,
-    vad: &mut Vad,
-    encoded_tx: &LatestSlot<Vec<u8>>,
-) {
-    chunk.clear();
-    let mut any = false;
-    while let Ok(s) = input.pop() {
-        chunk.push(s);
-        any = true;
-        if chunk.len() >= CAPTURE_BATCH {
-            break;
-        }
-    }
-    if !any {
-        return;
-    }
-    *window_count += chunk.len() as u64;
-    stats.samples += chunk.len() as u64;
-    stats.sum_sq += chunk.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
+/// 捕获管线状态：DSP 组件 + 热路径缓冲（worker 级复用，避免每次循环堆分配）。
+struct CaptureWorker {
+    resampler: AsyncResampler,
+    opus: OpusCodec,
+    pending: Vec<f32>,
+    chunk: Vec<f32>,
+    resample_out: Vec<f32>,
+    frame: Vec<f32>,
+    drift: DriftController,
+    window_count: u64,
+    window_start: Instant,
+    stats: CaptureStats,
+    agc: Agc,
+    vad: Vad,
+}
 
-    resample_out.clear();
-    resampler.process(chunk, drift.ratio, resample_out);
-    pending.extend_from_slice(resample_out);
-
-    // 每 500ms：按窗口样本计数校正比率。
-    if window_start.elapsed() >= DRIFT_PERIOD {
-        let observed = *window_count as f64 / window_start.elapsed().as_secs_f64();
-        if observed > 0.0 {
-            let target_ratio = 16_000.0 / observed;
-            let target_ppm = (target_ratio - drift.nominal_ratio) / drift.nominal_ratio * 1e6;
-            drift.move_toward(target_ppm);
-        }
-        *window_count = 0;
-        *window_start = Instant::now();
+impl CaptureWorker {
+    fn new(device_rate: u32) -> Result<Self> {
+        let nominal = 16_000.0 / device_rate as f64;
+        Ok(Self {
+            resampler: AsyncResampler::new(nominal, 160)?,
+            opus: {
+                let mut o = OpusCodec::new(16_000)?;
+                o.set_complexity(10);
+                o
+            },
+            pending: Vec::with_capacity(ENCODER_FRAME_SIZE * 2),
+            chunk: Vec::with_capacity(CAPTURE_BATCH),
+            resample_out: Vec::with_capacity(CAPTURE_BATCH + 8),
+            frame: Vec::with_capacity(ENCODER_FRAME_SIZE),
+            drift: DriftController::new(nominal),
+            window_count: 0,
+            window_start: Instant::now(),
+            stats: CaptureStats::new(),
+            agc: Agc::new(),
+            vad: Vad::new(),
+        })
     }
 
-    // 组 60ms 帧：VAD 判定语音 → AGC 提升电平；静音 → 清零发送（保持上行
-    // 连续，服务器 VAD 收到干净静音，不受背景噪声干扰）。
-    while pending.len() >= ENCODER_FRAME_SIZE {
-        frame.clear();
-        frame.extend(pending.drain(..ENCODER_FRAME_SIZE));
-        let (rms, _) = frame_stats(frame);
-        if vad.decide(rms) {
-            stats.speech_frames += 1;
-            agc.process_frame(frame);
-            stats.agc_gain = agc.gain;
-        } else {
-            stats.silence_frames += 1;
-            frame.fill(0.0);
-        }
-        match opus.encode(frame) {
-            Ok(pkt) => {
-                stats.frames += 1;
-                encoded_tx.store(pkt).await;
+    /// 处理一批输入（非阻塞）：读取 → 重采样 → 漂移校正 → 组帧编码。
+    async fn process_batch(&mut self, input: &mut Consumer<f32>, encoded_tx: &LatestSlot<Vec<u8>>) {
+        self.chunk.clear();
+        let mut any = false;
+        while let Ok(s) = input.pop() {
+            self.chunk.push(s);
+            any = true;
+            if self.chunk.len() >= CAPTURE_BATCH {
+                break;
             }
-            Err(e) => warn!("Opus 编码失败: {}", e),
         }
-    }
+        if !any {
+            return;
+        }
+        self.window_count += self.chunk.len() as u64;
+        self.stats.samples += self.chunk.len() as u64;
+        self.stats.sum_sq += self.chunk.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
 
-    // 每 2s 输出捕获诊断（RUST_LOG=debug 时可见）。
-    if stats.flush_at.elapsed() >= Duration::from_secs(2) {
-        let rms = if stats.samples > 0 {
-            (stats.sum_sq / stats.samples as f64).sqrt()
-        } else {
-            0.0
-        };
-        let db = if rms > 1e-9 { 20.0 * rms.log10() } else { -120.0 };
-        debug!(
-            "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 编码帧={} (语音{} 静音{}), AGC增益={:.1}x",
-            db,
-            stats.samples,
-            stats.frames,
-            stats.speech_frames,
-            stats.silence_frames,
-            stats.agc_gain
-        );
-        stats.samples = 0;
-        stats.sum_sq = 0.0;
-        stats.frames = 0;
-        stats.speech_frames = 0;
-        stats.silence_frames = 0;
-        stats.agc_gain = 1.0;
-        stats.flush_at = Instant::now();
+        self.resample_out.clear();
+        self.resampler.process(&self.chunk, self.drift.ratio, &mut self.resample_out);
+        self.pending.extend_from_slice(&self.resample_out);
+
+        // 每 500ms：按窗口样本计数校正比率。
+        if self.window_start.elapsed() >= DRIFT_PERIOD {
+            let observed = self.window_count as f64 / self.window_start.elapsed().as_secs_f64();
+            if observed > 0.0 {
+                let target_ratio = 16_000.0 / observed;
+                let target_ppm =
+                    (target_ratio - self.drift.nominal_ratio) / self.drift.nominal_ratio * 1e6;
+                self.drift.move_toward(target_ppm);
+            }
+            self.window_count = 0;
+            self.window_start = Instant::now();
+        }
+
+        // 组 60ms 帧：VAD 判定语音 → AGC 提升电平；静音 → 清零发送（保持上行
+        // 连续，服务器 VAD 收到干净静音，不受背景噪声干扰）。
+        while self.pending.len() >= ENCODER_FRAME_SIZE {
+            self.frame.clear();
+            self.frame.extend(self.pending.drain(..ENCODER_FRAME_SIZE));
+            let (rms, _) = frame_stats(&self.frame);
+            if self.vad.decide(rms) {
+                self.stats.speech_frames += 1;
+                self.agc.process_frame(&mut self.frame);
+                self.stats.agc_gain = self.agc.gain;
+            } else {
+                self.stats.silence_frames += 1;
+                self.frame.fill(0.0);
+            }
+            match self.opus.encode(&self.frame) {
+                Ok(pkt) => {
+                    self.stats.frames += 1;
+                    encoded_tx.store(pkt).await;
+                }
+                Err(e) => warn!("Opus 编码失败: {}", e),
+            }
+        }
+
+        // 每 2s 输出捕获诊断（RUST_LOG=debug 时可见）。
+        if self.stats.flush_at.elapsed() >= Duration::from_secs(2) {
+            let rms = if self.stats.samples > 0 {
+                (self.stats.sum_sq / self.stats.samples as f64).sqrt()
+            } else {
+                0.0
+            };
+            let db = if rms > 1e-9 { 20.0 * rms.log10() } else { -120.0 };
+            debug!(
+                "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 编码帧={} (语音{} 静音{}), AGC增益={:.1}x",
+                db,
+                self.stats.samples,
+                self.stats.frames,
+                self.stats.speech_frames,
+                self.stats.silence_frames,
+                self.stats.agc_gain
+            );
+            self.stats.samples = 0;
+            self.stats.sum_sq = 0.0;
+            self.stats.frames = 0;
+            self.stats.speech_frames = 0;
+            self.stats.silence_frames = 0;
+            self.stats.agc_gain = 1.0;
+            self.stats.flush_at = Instant::now();
+        }
     }
 }
 

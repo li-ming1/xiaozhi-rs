@@ -1,4 +1,4 @@
-//! 类型化错误：供监督状态机按变体分支决策（认证失败 vs 瞬态故障 vs 永久错误）。
+//! 类型化错误：供监督状态机按变体分支决策（认证失败 vs 瞬态故障）。
 
 use thiserror::Error;
 
@@ -39,10 +39,6 @@ pub enum VoiceError {
     /// 超时。
     #[error("超时: {0}")]
     Timeout(String),
-
-    /// 其他未分类错误。
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
 }
 
 pub type Result<T> = std::result::Result<T, VoiceError>;

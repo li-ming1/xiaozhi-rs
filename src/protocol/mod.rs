@@ -18,6 +18,11 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use crate::error::Result;
 use message::{AudioParams, ClientMessage, ServerMessage};
 
+/// 控制消息通道容量（有界，满则背压，不静默丢失）。
+pub(crate) const CONTROL_CHANNEL_CAP: usize = 16;
+/// 入站事件通道容量。
+pub(crate) const INCOMING_CHANNEL_CAP: usize = 64;
+
 /// 连接所需参数（由 OTA 配置 + 设备身份推导）。
 #[derive(Clone, Debug)]
 pub struct ConnectParams {
@@ -124,12 +129,6 @@ impl<T> LatestSlot<T> {
     }
 }
 
-impl<T> Default for LatestSlot<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<T> LatestSlot<T> {
     /// 成对产生发送端与接收端（共享同一底层槽）。
     pub fn pipe(self) -> (LatestSlot<T>, LatestSlot<T>) {
@@ -138,12 +137,11 @@ impl<T> LatestSlot<T> {
     }
 }
 
-/// 当前毫秒时间戳（u32，自 Unix epoch，约 49 天回绕）。服务端 AEC 用。
+/// 当前毫秒时间戳（u32，自 Unix epoch，约 49 天回绕，截断即取低 32 位）。服务端 AEC 用。
 pub(crate) fn now_ms() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    (SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| d.as_millis() as u32)
         .unwrap_or(0)
-        & 0xFFFF_FFFF) as u32
 }

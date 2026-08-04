@@ -12,7 +12,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # 取消令牌
 tokio-util = { version = "0.7", features = ["rt"] }
 
-# WebSocket（rustls 纯 Rust TLS）
+# WebSocket（rustls 纯 Rust TLS；tungstenite 类型经 tokio-tungstenite re-export，无直接依赖）
+# sink 隐式启用 std，StreamExt/SinkExt 均可用
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
@@ -54,9 +55,8 @@ thiserror = "2"
 sha2 = "0.11"
 hmac = "0.13"
 
-# HTTP 类型（WebSocket Headers / 通用 URI）
+# HTTP 类型（WebSocket 请求构造 / 通用 URI）
 http = "1"
-tungstenite = "0.30"
 
 # 音频
 cpal = "0.18"

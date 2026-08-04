@@ -8,12 +8,12 @@ use xiaozhi_rs::identity::DeviceIdentity;
 use xiaozhi_rs::ota::OtaConfig;
 use xiaozhi_rs::RealtimeVoice;
 
-// 多线程 runtime：DSP worker / 控制 / 收发 / 监督状态机独立调度。
 /// 退出原因文件（任何路径都写入，防静默崩溃无法定位）。
 fn write_exit_reason(msg: &str) {
     let _ = std::fs::write("xiaozhi-exit.log", format!("{}\n", msg));
 }
 
+// 多线程 runtime：DSP worker / 控制 / 收发 / 监督状态机独立调度。
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     // 原生崩溃（段错误/访问冲突）捕获：写入 xiaozhi-crash.log。

@@ -13,8 +13,6 @@ pub const INITIAL_TARGET_MS: u64 = 60;
 pub const TARGET_MIN_MS: u64 = 40;
 /// 目标上限。
 pub const TARGET_MAX_MS: u64 = 240;
-/// 物理容量。
-pub const CAPACITY_MS: u64 = 320;
 /// 目标稳定多久后开始下降。
 pub const SHRINK_STABLE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 

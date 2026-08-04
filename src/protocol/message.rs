@@ -89,8 +89,6 @@ pub enum ServerMessage {
     Llm {
         #[serde(default)]
         text: Option<String>,
-        #[serde(default)]
-        emotion: Option<String>,
     },
     Listen {
         state: String,
@@ -146,55 +144,36 @@ pub enum TtsState {
 }
 
 impl ClientMessage {
-    /// WebSocket hello，二进制协议 v1（原始 Opus）。
-    pub fn hello_websocket_v1() -> Self {
+    /// 统一 hello 构造：固定 features（mcp=true）+ 默认音频参数（opus/16k/60ms）。
+    fn hello(version: u8, transport: &str) -> Self {
         Self::Hello {
-            version: 1,
+            version,
             features: Features {
                 mcp: true,
                 glyph_push: false,
             },
-            transport: "websocket".to_string(),
+            transport: transport.to_string(),
             audio_params: AudioParams::default(),
         }
+    }
+
+    /// WebSocket hello，二进制协议 v1（原始 Opus）。
+    pub fn hello_websocket_v1() -> Self {
+        Self::hello(1, "websocket")
     }
 
     /// WebSocket hello，二进制协议 v2（BinaryProtocol2，带时间戳供服务端 AEC）。首选。
     pub fn hello_websocket_v2() -> Self {
-        Self::Hello {
-            version: 2,
-            features: Features {
-                mcp: true,
-                glyph_push: false,
-            },
-            transport: "websocket".to_string(),
-            audio_params: AudioParams::default(),
-        }
+        Self::hello(2, "websocket")
     }
 
     /// WebSocket hello，二进制协议 v3（BinaryProtocol3，4 字节精简头，官方新固件默认）。
     pub fn hello_websocket_v3() -> Self {
-        Self::Hello {
-            version: 3,
-            features: Features {
-                mcp: true,
-                glyph_push: false,
-            },
-            transport: "websocket".to_string(),
-            audio_params: AudioParams::default(),
-        }
+        Self::hello(3, "websocket")
     }
 
     /// MQTT+UDP hello（version=3）。
     pub fn hello_mqtt_udp() -> Self {
-        Self::Hello {
-            version: 3,
-            features: Features {
-                mcp: true,
-                glyph_push: false,
-            },
-            transport: "udp".to_string(),
-            audio_params: AudioParams::default(),
-        }
+        Self::hello(3, "udp")
     }
 }

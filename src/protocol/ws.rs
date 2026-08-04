@@ -36,14 +36,12 @@ use tokio_tungstenite::{connect_async_tls_with_config, MaybeTlsStream, WebSocket
 use crate::error::{Result, VoiceError};
 use crate::protocol::message::{AudioParams, ClientMessage, ServerMessage};
 
-use super::{ConnectParams, IncomingEvent, TransportHandles};
+use super::{ConnectParams, IncomingEvent, TransportHandles, CONTROL_CHANNEL_CAP, INCOMING_CHANNEL_CAP};
 
 const V2_HEADER_SIZE: usize = 16;
 const V3_HEADER_SIZE: usize = 4;
 const V2_TYPE_OPUS: u16 = 0;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
-const CONTROL_CHANNEL_CAP: usize = 16;
-const INCOMING_CHANNEL_CAP: usize = 64;
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -109,25 +107,17 @@ async fn connect_and_handshake(
     let uri: http::Uri = url
         .parse()
         .map_err(|e| VoiceError::Transport(format!("URI 解析失败: {}", e)))?;
-    let host = uri
-        .host()
-        .ok_or_else(|| VoiceError::Transport(format!("URL 缺少 host: {}", url)))?
-        .to_string();
+    uri.host()
+        .ok_or_else(|| VoiceError::Transport(format!("URL 缺少 host: {}", url)))?;
 
+    // 握手必需头（Host/Connection/Upgrade/Sec-WebSocket-*）由 tokio-tungstenite 自动填充，
+    // 这里只附加业务头。
     let request = http::Request::builder()
         .uri(uri)
         .header("Authorization", format!("Bearer {}", params.token))
         .header("Protocol-Version", binary_version.to_string())
         .header("Device-Id", &params.device_id)
         .header("Client-Id", &params.client_id)
-        .header("Host", host.as_str())
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header(
-            "Sec-WebSocket-Key",
-            tungstenite::handshake::client::generate_key(),
-        )
         .body(())
         .map_err(|e| VoiceError::Transport(format!("构建请求失败: {}", e)))?;
 
