@@ -336,7 +336,7 @@ impl VoiceSupervisor {
         }
         let adapter = match kind {
             TransportKind::MqttUdp => TransportAdapter::MqttUdp(MqttUdpTransport),
-            TransportKind::WebSocket => TransportAdapter::WebSocket(WsTransport::default()),
+            TransportKind::WebSocket => TransportAdapter::WebSocket(WsTransport),
         };
         let handles = tokio::time::timeout(CONNECT_TIMEOUT, adapter.connect(&params))
             .await
@@ -462,6 +462,17 @@ impl VoiceSupervisor {
             }
         };
 
+        // 异常结束（Err）时尽力通知服务器中断会话（Abort）。
+        // 否则服务器会停留在旧会话的 Listening/Speaking 状态，新会话的音频会被忽略约 60s。
+        if result.is_err() {
+            let _ = handles
+                .control_tx
+                .send(ClientMessage::Abort {
+                    session_id: handles.session_id.clone(),
+                    reason: "session_terminated".to_string(),
+                })
+                .await;
+        }
         // 停止音频：下次会话重新建流，编解码器随纪元重建。
         if let Some(a) = self.audio.as_mut() {
             a.stop();

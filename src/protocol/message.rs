@@ -22,6 +22,30 @@ pub enum ClientMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
+    /// 中断会话：异常结束/主动打断时通知服务器清理其会话状态
+    /// （否则服务器滞留旧会话，新会话音频会被忽略约 60s）。
+    Abort {
+        session_id: String,
+        reason: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abort_serializes_with_session_and_reason() {
+        let m = ClientMessage::Abort {
+            session_id: "abc".into(),
+            reason: "session_terminated".into(),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"abort","session_id":"abc","reason":"session_terminated"}"#
+        );
+    }
 }
 
 /// serde 过滤：false 字段不序列化（等价于 `std::ops::Not::not`，语义更直白）。
@@ -153,18 +177,9 @@ impl ClientMessage {
         }
     }
 
-    pub fn hello_websocket_v1() -> Self {
-        Self::hello(1, "websocket")
-    }
-
-    /// v2（BinaryProtocol2，带时间戳供服务端 AEC）。首选。
+    /// v2（BinaryProtocol2，带时间戳供服务端 AEC）。
     pub fn hello_websocket_v2() -> Self {
         Self::hello(2, "websocket")
-    }
-
-    /// v3（BinaryProtocol3，4 字节精简头）。
-    pub fn hello_websocket_v3() -> Self {
-        Self::hello(3, "websocket")
     }
 
     pub fn hello_mqtt_udp() -> Self {

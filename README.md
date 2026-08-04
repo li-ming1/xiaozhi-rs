@@ -40,6 +40,18 @@ xiaozhi-rs start
 xiaozhi-rs skip
 ```
 
+## 使用场景
+
+小智是**全双工实时语音**——你说的时候它就在听，随时可以打断，对话像真人一样自然。接好服务端后，它可以陪你做很多事：
+
+- **日常闲聊** — 天气、新闻、八卦、音乐、知识问答……连续对话不冷场，想到什么说什么
+- **情绪陪伴** — 心情不好时倾诉几句，它倾听、安慰、给建议，永远有耐心
+- **英语口语对练** — 跟它英文对话练口语练听力，它语速自然，听不懂还会追问
+- **演讲 / 台词陪练** — 把稿子说给它听，让它当你的专属听众
+- **哄睡与放松** — 让它讲个故事、读首诗，陪你在舒缓的对话里慢慢入眠
+
+> 对话内容由接入的 小智AI 服务端生成；本项目负责把 小智AI 变成"随时可打断、低延迟、自然顺滑"的语音通话体验。
+
 ## 从源码编译
 
 依赖：Rust 工具链（stable）。**无需** OpenSSL / ALSA 以外的系统库（Linux 下 `cpal` 需要 ALSA 头文件）。
@@ -56,7 +68,7 @@ cargo build --release
 推送 `v*` 标签即可触发 GitHub Actions 构建全部 6 个平台并发布 Release：
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.1.3 && git push origin v0.1.3
 ```
 
 ## 使用方法
@@ -106,7 +118,7 @@ src/
 ├── protocol/
 │   ├── mod.rs       TransportAdapter 闭集 + 统一收发句柄 + latest-slot 音频通道
 │   ├── message.rs   线上 JSON 协议类型
-│   ├── ws.rs        WebSocket v1/v2/v3 传输（心跳 15s）
+│   ├── ws.rs        WebSocket v2 传输（BinaryProtocol2，心跳 15s）
 │   └── mqtt_udp.rs  MQTT+UDP 主链路（QoS0、防重放、UDP 黑洞检测）
 └── audio/
     ├── mod.rs       无锁管线：CPAL 回调 + 独立 DSP worker（CaptureWorker/PlaybackWorker）+ 漂移补偿
@@ -114,6 +126,10 @@ src/
     ├── resample.rs  rubato AsyncSinc（256-tap BlackmanHarris2）
     └── buffer.rs    自适应深度播放缓冲（40–240ms）
 ```
+
+## 致谢
+
+本项目深度参考了[小智 AI](https://github.com/78xiaozhi-esp32)（xiaozhi-me）的开源设计——MQTT+UDP 双链路、AES-CTR 加密音频、WebSocket 回退、设备激活与 OTA 等协议细节均与其对齐。感谢小智团队与社区的开放精神，让"低成本硬件上的实时语音助手"成为现实，也才有了这个 Rust 客户端。
 
 ## 许可证
 

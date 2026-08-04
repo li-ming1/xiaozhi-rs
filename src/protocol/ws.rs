@@ -1,6 +1,5 @@
-//! WebSocket 传输：默认 v2 二进制协议（带时间戳供服务端 AEC），可选 v3 精简头。
-//! hello `version` 同时声明二进制协议版本（1=原始 / 2=BinaryProtocol2 / 3=BinaryProtocol3）。
-//! 端序均为大端（与官方 ESP32 一致）。
+//! WebSocket 传输：固定 BinaryProtocol2（16 字节头，时间戳供服务端 AEC）。
+//! hello `version` 声明二进制协议版本（2）。端序大端（与官方 ESP32 一致）。
 
 use std::time::{Duration, Instant};
 
@@ -23,29 +22,12 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// WebSocket 传输。
-pub struct WsTransport {
-    /// 二进制协议版本：2 = BinaryProtocol2（时间戳，AEC），3 = BinaryProtocol3（精简头），1 = 原始 Opus。
-    pub binary_version: u16,
-}
-
-impl Default for WsTransport {
-    fn default() -> Self {
-        // 默认 v2（带 AEC 时间戳，已联调验证）；可用环境变量 XZ_WS_VERSION=1/2/3 切换。
-        let v = std::env::var("XZ_WS_VERSION")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .filter(|v| matches!(v, 1..=3))
-            .unwrap_or(2);
-        Self { binary_version: v }
-    }
-}
+/// WebSocket 传输（固定二进制协议 v2）。
+pub struct WsTransport;
 
 impl WsTransport {
     pub async fn connect(self, params: &ConnectParams) -> Result<TransportHandles> {
-        let binary_version = self.binary_version;
-        let (sender, receiver, session_id, server_audio) =
-            connect_and_handshake(params, binary_version).await?;
+        let (sender, receiver, session_id, server_audio) = connect_and_handshake(params).await?;
 
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
         let (audio_tx_slot, audio_rx_slot) = super::LatestSlot::<Vec<u8>>::new().pipe();
@@ -53,15 +35,8 @@ impl WsTransport {
         // 会话关闭信号：handles drop（Sender 失效）→ 后台任务 `changed()` 返回 Err 退出。
         let (close_tx, close_rx) = watch::channel(());
 
-        let session_start = Instant::now();
-        tokio::spawn(send_loop(
-            sender,
-            control_rx,
-            audio_rx_slot,
-            session_start,
-            close_rx.clone(),
-        ));
-        tokio::spawn(recv_loop(receiver, incoming_tx.clone(), binary_version, close_rx));
+        tokio::spawn(send_loop(sender, control_rx, audio_rx_slot, close_rx.clone()));
+        tokio::spawn(recv_loop(receiver, incoming_tx.clone(), close_rx));
 
         Ok(TransportHandles {
             session_id,
@@ -74,26 +49,63 @@ impl WsTransport {
     }
 }
 
+/// 生成 WebSocket 握手 `Sec-WebSocket-Key`（RFC 6455：16 随机字节 → Base64，24 字符）。
+fn ws_sec_key() -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let uuid = uuid::Uuid::new_v4();
+    let bytes = uuid.as_bytes();
+    let mut out = String::with_capacity(24);
+    let mut i = 0;
+    while i < 16 {
+        let b0 = bytes[i];
+        let b1 = bytes.get(i + 1).copied().unwrap_or(0);
+        let b2 = bytes.get(i + 2).copied().unwrap_or(0);
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < 16 {
+            out.push(ALPHABET[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < 16 {
+            out.push(ALPHABET[(b2 & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
+}
+
 /// 建连并完成 hello 协商，返回 (发送端, 接收端, session_id, 服务器音频参数)。
 async fn connect_and_handshake(
     params: &ConnectParams,
-    binary_version: u16,
 ) -> Result<(WsSender, WsReceiver, String, AudioParams)> {
     let url = &params.ws_url;
-    info!("WebSocket 连接: {} (二进制协议 v{})", url, binary_version);
+    info!("WebSocket 连接: {} (二进制协议 v2)", url);
 
     let uri: http::Uri = url
         .parse()
         .map_err(|e| VoiceError::Transport(format!("URI 解析失败: {}", e)))?;
-    uri.host()
+    // Host 头必须由调用方提供（tungstenite 不会自动填充）。
+    let host = uri
+        .authority()
+        .map(|a| a.as_str().to_string())
         .ok_or_else(|| VoiceError::Transport(format!("URL 缺少 host: {}", url)))?;
 
-    // 握手必需头（Host/Connection/Upgrade/Sec-WebSocket-*）由 tokio-tungstenite 自动填充，
-    // 这里只附加业务头。
+    // 注意：tokio-tungstenite 客户端握手要求请求头完整——
+    // Host/Connection/Upgrade/Sec-WebSocket-Version/Sec-WebSocket-Key 必须由调用方设置，
+    // 缺失会报 "Missing, duplicated or incorrect header sec-websocket-key"。
     let request = http::Request::builder()
         .uri(uri)
+        .header("Host", &host)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", ws_sec_key())
         .header("Authorization", format!("Bearer {}", params.token))
-        .header("Protocol-Version", binary_version.to_string())
+        .header("Protocol-Version", "2")
         .header("Device-Id", &params.device_id)
         .header("Client-Id", &params.client_id)
         .body(())
@@ -105,24 +117,10 @@ async fn connect_and_handshake(
         .map_err(|e| VoiceError::Transport(format!("WebSocket 连接失败: {}", e)))?;
 
     let (sink, stream) = ws_stream.split();
-    let mut sender = WsSender {
-        sink,
-        binary_version,
-    };
+    let mut sender = WsSender { sink };
     let mut receiver = WsReceiver { stream };
 
-    let hello = match binary_version {
-        1 => ClientMessage::hello_websocket_v1(),
-        2 => ClientMessage::hello_websocket_v2(),
-        3 => ClientMessage::hello_websocket_v3(),
-        v => {
-            return Err(VoiceError::Protocol(format!(
-                "不支持的二进制协议版本: {}",
-                v
-            )))
-        }
-    };
-    sender.send_json(&hello).await?;
+    sender.send_json(&ClientMessage::hello_websocket_v2()).await?;
 
     let session_id;
     let server_audio;
@@ -156,23 +154,15 @@ async fn connect_and_handshake(
     Ok((sender, receiver, session_id, server_audio))
 }
 
-/// WebSocket 发送端：独占 SplitSink，封装协议版本对应的音频帧构造与分发。
+/// WebSocket 发送端：独占 SplitSink，按 BinaryProtocol2 构造音频帧。
 struct WsSender {
     sink: futures_util::stream::SplitSink<WsStream, WsMessage>,
-    binary_version: u16,
 }
 
 impl WsSender {
-    /// 按协议版本分发音频帧发送（时间戳仅 v2 需要）。
-    async fn send_audio(&mut self, opus: &[u8], session_start: Instant) -> Result<()> {
-        match self.binary_version {
-            2 => {
-                let ts = session_start.elapsed().as_millis() as u32;
-                self.send_audio_v2(opus, ts).await
-            }
-            3 => self.send_audio_v3(opus).await,
-            _ => self.send_audio_raw(opus).await,
-        }
+    /// 发送音频帧（v2 时间戳为 Unix 毫秒，与 MQTT 一致，供服务器端 AEC 对齐时钟）。
+    async fn send_audio(&mut self, opus: &[u8]) -> Result<()> {
+        self.send_audio_v2(opus, super::now_ms()).await
     }
 
     async fn send_json(&mut self, msg: &ClientMessage) -> Result<()> {
@@ -188,7 +178,7 @@ impl WsSender {
     async fn send_audio_v2(&mut self, opus: &[u8], timestamp_ms: u32) -> Result<()> {
         // BinaryProtocol2 为网络字节序（大端），version/type/payload_size 均 htons/htonl。
         let mut frame = Vec::with_capacity(V2_HEADER_SIZE + opus.len());
-        frame.extend_from_slice(&self.binary_version.to_be_bytes());
+        frame.extend_from_slice(&2u16.to_be_bytes());
         frame.extend_from_slice(&V2_TYPE_OPUS.to_be_bytes());
         frame.extend_from_slice(&0u32.to_be_bytes());
         frame.extend_from_slice(&timestamp_ms.to_be_bytes());
@@ -196,28 +186,6 @@ impl WsSender {
         frame.extend_from_slice(opus);
         self.sink
             .send(WsMessage::Binary(frame.into()))
-            .await
-            .map_err(|e| VoiceError::Transport(format!("音频发送失败: {}", e)))?;
-        Ok(())
-    }
-
-    async fn send_audio_v3(&mut self, opus: &[u8]) -> Result<()> {
-        // BinaryProtocol3：type=0、reserved=0、payload_size=htons(大端)。
-        let mut frame = Vec::with_capacity(V3_HEADER_SIZE + opus.len());
-        frame.push(0u8);
-        frame.push(0u8);
-        frame.extend_from_slice(&(opus.len() as u16).to_be_bytes());
-        frame.extend_from_slice(opus);
-        self.sink
-            .send(WsMessage::Binary(frame.into()))
-            .await
-            .map_err(|e| VoiceError::Transport(format!("音频发送失败: {}", e)))?;
-        Ok(())
-    }
-
-    async fn send_audio_raw(&mut self, opus: &[u8]) -> Result<()> {
-        self.sink
-            .send(WsMessage::Binary(opus.to_vec().into()))
             .await
             .map_err(|e| VoiceError::Transport(format!("音频发送失败: {}", e)))?;
         Ok(())
@@ -270,7 +238,6 @@ async fn send_loop(
     mut sender: WsSender,
     mut control_rx: mpsc::Receiver<ClientMessage>,
     audio_slot: super::LatestSlot<Vec<u8>>,
-    session_start: Instant,
     mut close_rx: watch::Receiver<()>,
 ) {
     let mut ping = interval(PING_INTERVAL);
@@ -291,7 +258,7 @@ async fn send_loop(
                 }
             }
             opus = audio_slot.take() => {
-                if let Err(e) = sender.send_audio(&opus, session_start).await {
+                if let Err(e) = sender.send_audio(&opus).await {
                     warn!("WS 音频发送失败: {}", e);
                     break;
                 }
@@ -305,18 +272,17 @@ async fn send_loop(
             }
         }
         if diag.elapsed() >= Duration::from_secs(2) {
-            info!("WS 上行诊断: 音频帧已发送 {}", sent);
+            debug!("WS 上行诊断: 音频帧已发送 {}", sent);
             sent = 0;
             diag = Instant::now();
         }
     }
 }
 
-/// 接收循环：文本→JSON，二进制→音频（按版本剥头），断开→Closed。
+/// 接收循环：文本→JSON，二进制→音频（剥 v2 头），断开→Closed。
 async fn recv_loop(
     mut receiver: WsReceiver,
     incoming_tx: mpsc::Sender<IncomingEvent>,
-    binary_version: u16,
     mut close_rx: watch::Receiver<()>,
 ) {
     loop {
@@ -329,7 +295,7 @@ async fn recv_loop(
                     }
                 }
                 Ok(ReceivedMessage::Audio(data)) => {
-                    let payload = strip_binary_header(&data, binary_version);
+                    let payload = strip_binary_header(&data);
                     if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
                         break;
                     }
@@ -344,96 +310,83 @@ async fn recv_loop(
     }
 }
 
-/// 剥离二进制帧头：头字段校验匹配则剥头，否则原样返回（裸 Opus）。
-fn strip_binary_header(data: &[u8], binary_version: u16) -> Vec<u8> {
-    match binary_version {
-        2 => {
-            if data.len() >= V2_HEADER_SIZE {
-                let version = u16::from_be_bytes([data[0], data[1]]);
-                let ty = u16::from_be_bytes([data[2], data[3]]);
-                let payload_size =
-                    u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
-                if version == 2 && ty == V2_TYPE_OPUS && V2_HEADER_SIZE + payload_size == data.len()
-                {
-                    return data[V2_HEADER_SIZE..].to_vec();
-                }
-            }
-            data.to_vec()
+/// 剥离 BinaryProtocol2 帧头：头字段校验匹配则剥头，否则原样返回（裸 Opus 兜底）。
+fn strip_binary_header(data: &[u8]) -> Vec<u8> {
+    // 先按 v2（16B 头）识别。实测服务器下行头 version 字段为 0（非 2），
+    // 故仅校验 type=OPUS 与精确长度；裸 Opus 帧前 2 字节为 TOC（非 0），误判概率极低。
+    if data.len() >= V2_HEADER_SIZE {
+        let ty = u16::from_be_bytes([data[2], data[3]]);
+        let payload_size = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
+        if ty == V2_TYPE_OPUS && V2_HEADER_SIZE + payload_size == data.len() {
+            return data[V2_HEADER_SIZE..].to_vec();
         }
-        3 => {
-            if data.len() >= V3_HEADER_SIZE {
-                let ty = data[0];
-                let payload_size = u16::from_be_bytes([data[2], data[3]]) as usize;
-                if ty == 0 && V3_HEADER_SIZE + payload_size == data.len() {
-                    return data[V3_HEADER_SIZE..].to_vec();
-                }
-            }
-            data.to_vec()
-        }
-        _ => data.to_vec(),
     }
+    // 再按 v3（4B 头）识别：type=0, reserved=0, payload_size（大端）。
+    // reserved 必须为 0，避免把裸 Opus 帧（首字节恰为 0 的 SILK 8k 帧）误剥 4 字节。
+    if data.len() >= V3_HEADER_SIZE {
+        let ty = data[0];
+        let payload_size = u16::from_be_bytes([data[2], data[3]]) as usize;
+        if ty as u16 == V2_TYPE_OPUS
+            && data[1] == 0
+            && V3_HEADER_SIZE + payload_size == data.len()
+        {
+            return data[V3_HEADER_SIZE..].to_vec();
+        }
+    }
+    // 均未识别：按裸 Opus 处理，记录前 16 字节便于核对服务器实际格式。
+    if data.len() >= V3_HEADER_SIZE {
+        let hex: String = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+        debug!("WS 下行帧头未识别，按裸 Opus 处理 (len={}): {}", data.len(), hex);
+    }
+    data.to_vec()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn build_v3_frame(payload: &[u8]) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(V3_HEADER_SIZE + payload.len());
-        frame.push(0u8);
-        frame.push(0u8);
-        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        frame.extend_from_slice(payload);
-        frame
-    }
-
-    #[test]
-    fn v3_header_is_4_bytes_with_big_endian_size() {
-        let payload = b"opus-data";
-        let frame = build_v3_frame(payload);
-        assert_eq!(frame.len(), V3_HEADER_SIZE + payload.len());
-        assert_eq!(&frame[0..2], &[0, 0]);
-        assert_eq!(u16::from_be_bytes([frame[2], frame[3]]), payload.len() as u16);
-    }
-
-    #[test]
-    fn strip_v3_recovers_payload() {
-        let payload = b"decoded-opus-frame";
-        let frame = build_v3_frame(payload);
-        let out = strip_binary_header(&frame, 3);
-        assert_eq!(out, payload);
-    }
-
-    #[test]
-    fn strip_v3_falls_back_to_raw_when_header_mismatch() {
-        // 头声明长度与实际不符 → 视为裸 Opus 原样返回。
-        let mut bad = build_v3_frame(b"abc");
-        bad[2] = 0xFF;
-        bad[3] = 0xFF;
-        let out = strip_binary_header(&bad, 3);
-        assert_eq!(out, bad);
-    }
-
     #[test]
     fn strip_v2_is_unchanged() {
-        // v2 头：version=2(大端), type=0, reserved, timestamp, payload_size。
+        // 服务器下行 v2 头：version=0（实测值）, type=0(OPUS), reserved, timestamp, payload_size。
         let payload = b"v2-opus";
         let mut frame = Vec::with_capacity(V2_HEADER_SIZE + payload.len());
-        frame.extend_from_slice(&2u16.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
         frame.extend_from_slice(&0u16.to_be_bytes());
         frame.extend_from_slice(&0u32.to_be_bytes());
         frame.extend_from_slice(&12345u32.to_be_bytes());
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload);
-        let out = strip_binary_header(&frame, 2);
+        let out = strip_binary_header(&frame);
         assert_eq!(out, payload);
     }
 
     #[test]
-    fn strip_v1_returns_raw() {
-        let raw = b"raw-opus";
-        assert_eq!(strip_binary_header(raw, 1), raw);
-        assert_eq!(strip_binary_header(build_v3_frame(b"x").as_slice(), 1), build_v3_frame(b"x"));
+    fn strip_v2_falls_back_to_raw_when_header_mismatch() {
+        // 头声明长度与实际不符 → 视为裸 Opus 原样返回。
+        let payload = b"abc";
+        let mut frame = Vec::with_capacity(V2_HEADER_SIZE + payload.len());
+        frame.extend_from_slice(&2u16.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&u32::MAX.to_be_bytes()); // payload_size 与实际不符
+        frame.extend_from_slice(payload);
+        let out = strip_binary_header(&frame);
+        assert_eq!(out, frame);
+    }
+
+    /// 握手 key 必须为合法 Base64 且长度 24（RFC 6455：16 字节随机值）。
+    #[test]
+    fn ws_sec_key_is_valid_base64() {
+        let key = ws_sec_key();
+        assert_eq!(key.len(), 24, "key 长度异常: {}", key);
+        assert!(key.ends_with("=="), "末组应补 2 个 =: {}", key);
+        assert!(
+            key.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+            "含非法 Base64 字符: {}",
+            key
+        );
     }
 }
 

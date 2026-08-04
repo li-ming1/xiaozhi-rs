@@ -21,7 +21,7 @@ use crate::error::{Result, VoiceError};
 use crate::protocol::LatestSlot;
 
 use buffer::PlaybackBuffer;
-use opus::{NetworkGrade, OpusCodec, ENCODER_FRAME_SIZE, ENCODER_RATE};
+use opus::{NetworkGrade, OpusCodec, ENCODER_FRAME_SIZE, ENCODER_RATE, FRAME_MS};
 use resample::AsyncResampler;
 
 const DRIFT_PERIOD: Duration = Duration::from_millis(500);
@@ -773,6 +773,8 @@ struct PlaybackWorker {
     rx: mpsc::Receiver<PlaybackMsg>,
     grade_rx: mpsc::Receiver<NetworkGrade>,
     out: Producer<f32>,
+    /// 服务器声明采样率（解码帧长基准）。
+    server_rate: u32,
     output_rate: u32,
     cb_count: Arc<AtomicU64>,
     cb_samples: Arc<AtomicU64>,
@@ -782,8 +784,12 @@ struct PlaybackWorker {
     drift: DriftController,
     last_drift: Instant,
     stats: PlaybackStats,
-    /// 当前网络分级（弱网时解码启用 FEC 前向纠错）。
+    /// 当前网络分级（弱网时丢包窗口启用带内 FEC/PLC 恢复）。
     grade: NetworkGrade,
+    /// 距上一帧到达的时间：丢包判定基准（超时由帧定时器补恢复帧）。
+    last_frame_at: Instant,
+    /// 帧长诊断已告警（一次性，避免刷屏）。
+    frame_len_warned: bool,
     /// 重采样输出缓冲常驻复用，避免每帧解码后堆分配。
     out_samples: Vec<f32>,
 }
@@ -803,6 +809,7 @@ impl PlaybackWorker {
             rx,
             grade_rx,
             out,
+            server_rate,
             output_rate,
             cb_count,
             cb_samples,
@@ -813,11 +820,16 @@ impl PlaybackWorker {
             last_drift: Instant::now(),
             stats: PlaybackStats::new(),
             grade: NetworkGrade::Good,
+            last_frame_at: Instant::now(),
+            frame_len_warned: false,
             out_samples: Vec::with_capacity(960 * 3),
         })
     }
 
     async fn run(mut self) {
+        // 帧定时器：无新帧到达时按时产出 FEC/PLC 恢复帧，保持丢包期间音频连续。
+        let mut tick = tokio::time::interval(Duration::from_millis(FRAME_MS as u64));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 g = self.grade_rx.recv() => {
@@ -828,6 +840,12 @@ impl PlaybackWorker {
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else { break };
                     self.handle_msg(msg).await;
+                }
+                _ = tick.tick() => {
+                    // 超过两帧时长无新帧 → 判定丢包，补一帧 FEC/PLC 恢复。
+                    if self.last_frame_at.elapsed() >= Duration::from_millis(FRAME_MS as u64 * 2) {
+                        self.play_plc();
+                    }
                 }
             }
             self.diag_and_drift();
@@ -840,45 +858,62 @@ impl PlaybackWorker {
             PlaybackMsg::Audio(opus) => {
                 self.stats.received += 1;
                 self.buf.observe_arrival(Instant::now());
-                let (pcm, used_plc) =
-                    match self.decoder.decode(&opus, self.grade != NetworkGrade::Good) {
-                        Ok(p) => (p, false),
-                        Err(e) => {
-                            self.stats.decoded_fail += 1;
-                            debug!("Opus 解码失败(len={}): {}", opus.len(), e);
-                            match self.decoder.decode(&[], false) {
-                                Ok(p) => {
-                                    self.stats.plc += 1;
-                                    (p, true)
-                                }
-                                Err(e2) => {
-                                    warn!("Opus 解码与 PLC 均失败: {}", e2);
-                                    return;
-                                }
-                            }
-                        }
-                    };
-                if !used_plc {
-                    self.stats.decoded_ok += 1;
+                // 正常包恒 fec=false：decode_fec=1 会把带 FEC 的包解码为"上一帧恢复"而非当前帧，
+                // 导致所有帧错位；FEC/PLC 恢复仅在丢包（无帧到达）时由帧定时器触发。
+                self.last_frame_at = Instant::now();
+                match self.decoder.decode(&opus, false) {
+                    Ok(p) => self.write_pcm(p, false),
+                    Err(e) => {
+                        self.stats.decoded_fail += 1;
+                        debug!("Opus 解码失败(len={}): {}", opus.len(), e);
+                        self.play_plc();
+                    }
                 }
-                self.stats.last_pcm_len = pcm.len();
-                self.stats.last_needed = self.resampler.input_frames_next();
-                self.out_samples.clear();
-                self.resampler.process(&pcm, self.drift.ratio, &mut self.out_samples);
-                self.stats.last_produced = self.out_samples.len();
-                if self.out_samples.is_empty() {
-                    self.stats.zero_produced += 1;
-                }
-                let before = self.out.slots();
-                write_samples(
-                    &mut self.out,
-                    &self.out_samples,
-                    self.output_rate,
-                    OUTPUT_RING_SAMPLES,
-                );
-                self.stats.written += before.saturating_sub(self.out.slots()) as u64;
             }
             PlaybackMsg::Flush => self.buf.reset(),
+        }
+    }
+
+    /// 将解码 PCM 重采样后写入输出 ring。
+    fn write_pcm(&mut self, pcm: Vec<f32>, used_plc: bool) {
+        if !used_plc {
+            // 帧长应等于 server_rate 的 60ms：不符说明服务器实际采样率与声明不一致（音调/语速错乱）。
+            let expected = self.server_rate as usize * 60 / 1000;
+            if pcm.len() != expected && !self.frame_len_warned {
+                self.frame_len_warned = true;
+                warn!(
+                    "播放帧长异常: 期望 {} 实际 {}（服务器采样率与声明 {}Hz 不符）",
+                    expected, pcm.len(), self.server_rate
+                );
+            }
+            self.stats.decoded_ok += 1;
+        }
+        self.stats.last_pcm_len = pcm.len();
+        self.stats.last_needed = self.resampler.input_frames_next();
+        self.out_samples.clear();
+        self.resampler.process(&pcm, self.drift.ratio, &mut self.out_samples);
+        self.stats.last_produced = self.out_samples.len();
+        if self.out_samples.is_empty() {
+            self.stats.zero_produced += 1;
+        }
+        let before = self.out.slots();
+        write_samples(
+            &mut self.out,
+            &self.out_samples,
+            self.output_rate,
+            OUTPUT_RING_SAMPLES,
+        );
+        self.stats.written += before.saturating_sub(self.out.slots()) as u64;
+    }
+
+    /// 丢包恢复：请求带内 FEC/PLC 解码一帧（60ms），保持音频流连续。
+    fn play_plc(&mut self) {
+        match self.decoder.decode(&[], true) {
+            Ok(p) => {
+                self.stats.plc += 1;
+                self.write_pcm(p, true);
+            }
+            Err(e) => warn!("PLC 失败: {}", e),
         }
     }
 

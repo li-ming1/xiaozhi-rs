@@ -7,7 +7,7 @@ use opusic_sys::{
     opus_encoder_create, opus_encoder_destroy, opus_get_version_string, opus_strerror,
     OpusDecoder, OpusEncoder, OPUS_APPLICATION_VOIP, OPUS_OK, OPUS_SET_BITRATE_REQUEST,
     OPUS_SET_COMPLEXITY_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST,
-    OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST,
+    OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST,
 };
 use std::ffi::{c_int, CStr};
 use std::sync::Once;
@@ -22,8 +22,9 @@ pub const FRAME_MS: u32 = 60;
 /// 编码帧样本数（60ms @ 16k）。
 pub const ENCODER_FRAME_SIZE: usize = (ENCODER_RATE as usize * FRAME_MS as usize) / 1000;
 const MAX_PACKET_SIZE: usize = 1500;
-/// 解码最大输出（60ms @ 48k 单声道）。
-const DECODE_MAX_SAMPLES: usize = 48_000 / 1000 * 60;
+// 解码帧长按解码器采样率计算（16k→960 / 24k→1440 / 48k→2880）。
+// 注意：opus_decode_float 的 frame_size 参数在 PLC（空包）时决定输出样本数，
+// 若按 48k 上限 2880 传，16k 解码器的 PLC 帧会变成 3 倍长，导致播放时序崩坏。
 
 // opus_encoder_ctl 是 C 变参函数（`...`），stable Rust 无法直接调用；
 // 这里按固定 3 参数重新声明同一符号（本项目仅使用 3 参数 ctl 请求）。
@@ -46,6 +47,8 @@ pub enum NetworkGrade {
 pub struct OpusCodec {
     encoder: *mut OpusEncoder,
     decoder: *mut OpusDecoder,
+    /// 解码帧长（decode_rate 的 60ms 样本数）：正常帧与 PLC 帧的统一输出长度。
+    decode_frame_size: c_int,
     encode_buf: Vec<u8>,
     decode_buf: Vec<f32>,
     grade: NetworkGrade,
@@ -99,11 +102,13 @@ impl OpusCodec {
             )));
         }
 
+        let decode_frame_size = (decode_rate as usize * FRAME_MS as usize) / 1000;
         let mut codec = Self {
             encoder,
             decoder,
+            decode_frame_size: decode_frame_size as c_int,
             encode_buf: vec![0u8; MAX_PACKET_SIZE],
-            decode_buf: vec![0f32; DECODE_MAX_SAMPLES],
+            decode_buf: vec![0f32; decode_frame_size],
             grade: NetworkGrade::Good,
         };
         codec.apply_encoder_config(NetworkGrade::Good);
@@ -125,10 +130,11 @@ impl OpusCodec {
     }
 
     fn apply_encoder_config(&mut self, grade: NetworkGrade) {
-        let (bitrate, vbr, constrained, fec, dtx) = match grade {
-            NetworkGrade::Good => (32_000, 1, 0, 0, 0),
-            NetworkGrade::Fair => (28_000, 1, 0, 1, 0),
-            NetworkGrade::Poor => (20_000, 0, 1, 1, 1),
+        // loss_perc（预期丢包率）是带内 FEC 的前提：不设置时编码器不会添加冗余，FEC 形同虚设。
+        let (bitrate, vbr, constrained, fec, dtx, loss_perc) = match grade {
+            NetworkGrade::Good => (32_000, 1, 0, 0, 0, 0),
+            NetworkGrade::Fair => (28_000, 1, 0, 1, 0, 10),
+            NetworkGrade::Poor => (20_000, 0, 1, 1, 1, 15),
         };
         let set = |request: c_int, value: c_int| {
             let ret = unsafe { opus_encoder_ctl_fixed(self.encoder, request, value) };
@@ -140,6 +146,7 @@ impl OpusCodec {
         set(OPUS_SET_VBR_REQUEST, vbr);
         set(OPUS_SET_VBR_CONSTRAINT_REQUEST, constrained);
         set(OPUS_SET_INBAND_FEC_REQUEST, fec);
+        set(OPUS_SET_PACKET_LOSS_PERC_REQUEST, loss_perc);
         set(OPUS_SET_DTX_REQUEST, dtx);
     }
 
@@ -192,7 +199,7 @@ impl OpusCodec {
                 ptr,
                 input.len() as c_int,
                 self.decode_buf.as_mut_ptr(),
-                DECODE_MAX_SAMPLES as c_int,
+                self.decode_frame_size,
                 fec,
             )
         };
@@ -235,5 +242,29 @@ mod tests {
     fn encoder_frame_size_is_960() {
         assert_eq!(ENCODER_FRAME_SIZE, 960);
         assert_eq!(ENCODER_RATE * FRAME_MS / 1000, 960);
+    }
+
+    /// 丢包恢复路径：空包 + fec=true 应产出完整一帧（60ms @16k = 960），而非空/报错。
+    #[test]
+    fn decode_empty_requests_plc_frame() {
+        let mut codec = OpusCodec::new(16_000).unwrap();
+        let plc = codec.decode(&[], true).unwrap();
+        assert_eq!(plc.len(), 960, "PLC 输出帧长异常: {}", plc.len());
+    }
+
+    /// 正常包解码（fec=false）应还原信号能量，验证 FEC 参数不再破坏当前帧。
+    #[test]
+    fn encode_decode_roundtrip_preserves_energy() {
+        let mut codec = OpusCodec::new(16_000).unwrap();
+        // 400Hz 正弦波，幅度 0.5。
+        let frame: Vec<f32> = (0..ENCODER_FRAME_SIZE)
+            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 400.0 * i as f32 / 16_000.0).sin())
+            .collect();
+        let pkt = codec.encode(&frame).unwrap();
+        assert!(!pkt.is_empty());
+        let out = codec.decode(&pkt, false).unwrap();
+        assert_eq!(out.len(), 960, "解码帧长异常: {}", out.len());
+        let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        assert!(rms > 0.1, "解码后能量过低: RMS={:.4}", rms);
     }
 }
