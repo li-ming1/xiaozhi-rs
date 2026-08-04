@@ -1,28 +1,6 @@
-//! WebSocket 传输：默认 v2 二进制协议（带时间戳，供服务端 AEC），可选 v3 精简头；
-//! v1 原始 Opus 回退。
-//!
-//! 协议要点（来自官方 websocket_zh.md）：
-//! - hello `version` 字段同时声明二进制协议版本（1=原始 / 2=BinaryProtocol2 / 3=BinaryProtocol3）。
-//! - 文本帧承载 JSON，二进制帧承载 Opus。
-//! - BinaryProtocol2（16 字节头）：
-//!   ```text
-//!   u16 version        // 2
-//!   u16 type           // 0=OPUS, 1=JSON（WS 下 JSON 走文本帧，故二进制 type 恒为 0）
-//!   u32 reserved       // 0
-//!   u32 timestamp_ms   // 毫秒，服务端 AEC 用
-//!   u32 payload_size
-//!   u8  payload[]      // Opus
-//!   ```
-//! - BinaryProtocol3（4 字节头，官方新固件默认）：
-//!   ```text
-//!   u8  type           // 0=OPUS
-//!   u8  reserved       // 0
-//!   u16 payload_size   // htons（大端）
-//!   u8  payload[]      // Opus
-//!   ```
-//!
-//! 端序：v2 的 version/type/payload_size 用 htons/htonl（大端，实测服务器要求）；
-//! v3 的 payload_size 用 htons（大端）。UDP 包头（见 crypto.rs）同为网络字节序。
+//! WebSocket 传输：默认 v2 二进制协议（带时间戳供服务端 AEC），可选 v3 精简头。
+//! hello `version` 同时声明二进制协议版本（1=原始 / 2=BinaryProtocol2 / 3=BinaryProtocol3）。
+//! 端序均为大端（与官方 ESP32 一致）。
 
 use std::time::{Duration, Instant};
 
@@ -73,7 +51,6 @@ impl WsTransport {
         let (audio_tx_slot, audio_rx_slot) = super::LatestSlot::<Vec<u8>>::new().pipe();
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
 
-        // 发送任务：控制（文本 JSON）、音频（二进制 v2/v1）、心跳 Ping。
         let session_start = Instant::now();
         tokio::spawn(send_loop(
             sender,
@@ -82,8 +59,6 @@ impl WsTransport {
             binary_version,
             session_start,
         ));
-
-        // 接收任务。
         tokio::spawn(recv_loop(receiver, incoming_tx.clone(), binary_version));
 
         Ok(TransportHandles {
@@ -129,7 +104,6 @@ async fn connect_and_handshake(
     let mut sender = WsSender { sink };
     let mut receiver = WsReceiver { stream };
 
-    // hello version = 二进制协议版本。
     let hello = match binary_version {
         1 => ClientMessage::hello_websocket_v1(),
         2 => ClientMessage::hello_websocket_v2(),
@@ -143,7 +117,6 @@ async fn connect_and_handshake(
     };
     sender.send_json(&hello).await?;
 
-    // 等待服务器 hello 响应。
     let session_id;
     let server_audio;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -193,12 +166,11 @@ impl WsSender {
     }
 
     async fn send_audio_v2(&mut self, opus: &[u8], timestamp_ms: u32) -> Result<()> {
-        // 注意：BinaryProtocol2 为网络字节序（大端），官方 ESP32 发送端
-        // 对 version/timestamp/payload_size 调用 htons/htonl，接收端 ntohs/ntohl。
+        // BinaryProtocol2 为网络字节序（大端），version/type/payload_size 均 htons/htonl。
         let mut frame = Vec::with_capacity(V2_HEADER_SIZE + opus.len());
-        frame.extend_from_slice(&2u16.to_be_bytes()); // version
-        frame.extend_from_slice(&V2_TYPE_OPUS.to_be_bytes()); // type
-        frame.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        frame.extend_from_slice(&2u16.to_be_bytes());
+        frame.extend_from_slice(&V2_TYPE_OPUS.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
         frame.extend_from_slice(&timestamp_ms.to_be_bytes());
         frame.extend_from_slice(&(opus.len() as u32).to_be_bytes());
         frame.extend_from_slice(opus);
@@ -212,9 +184,9 @@ impl WsSender {
     async fn send_audio_v3(&mut self, opus: &[u8]) -> Result<()> {
         // BinaryProtocol3：type=0、reserved=0、payload_size=htons(大端)。
         let mut frame = Vec::with_capacity(V3_HEADER_SIZE + opus.len());
-        frame.push(0u8); // type: OPUS
-        frame.push(0u8); // reserved
-        frame.extend_from_slice(&(opus.len() as u16).to_be_bytes()); // payload_size (htons)
+        frame.push(0u8);
+        frame.push(0u8);
+        frame.extend_from_slice(&(opus.len() as u16).to_be_bytes());
         frame.extend_from_slice(opus);
         self.sink
             .send(WsMessage::Binary(frame.into()))
@@ -282,7 +254,7 @@ async fn send_loop(
     session_start: Instant,
 ) {
     let mut ping = interval(PING_INTERVAL);
-    // 首次 tick 立即触发，但心跳应延后；重置为错过首 tick。
+    // 重置为错过首 tick，使首个心跳延后一个周期。
     ping.reset();
 
     let mut sent: u64 = 0;
@@ -290,7 +262,6 @@ async fn send_loop(
     loop {
         tokio::select! {
             biased;
-            // 控制消息优先，不静默丢失。
             ctrl = control_rx.recv() => {
                 let Some(msg) = ctrl else { break };
                 if let Err(e) = sender.send_json(&msg).await {
@@ -298,7 +269,6 @@ async fn send_loop(
                     break;
                 }
             }
-            // 音频 latest-slot：取最新帧，过期帧已丢弃。
             opus = audio_slot.take() => {
                 let res = match binary_version {
                     2 => {
@@ -321,7 +291,6 @@ async fn send_loop(
                 }
             }
         }
-        // 每 2s 输出上行音频发送诊断。
         if diag.elapsed() >= Duration::from_secs(2) {
             info!("WS 上行诊断: 音频帧已发送 {}", sent);
             sent = 0;
@@ -358,10 +327,7 @@ async fn recv_loop(
     }
 }
 
-/// 剥离二进制帧头（按协商版本）：
-/// - v2：16 字节大端头（version==2 且 payload_size 匹配）则剥头；
-/// - v3：4 字节头（type==0 且 payload_size 匹配）则剥头；
-/// - v1 / 无法识别：原样返回（裸 Opus）。
+/// 剥离二进制帧头：头字段校验匹配则剥头，否则原样返回（裸 Opus）。
 fn strip_binary_header(data: &[u8], binary_version: u16) -> Vec<u8> {
     match binary_version {
         2 => {

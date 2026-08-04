@@ -1,10 +1,4 @@
-//! MQTT+UDP 混合传输（主链路）。
-//!
-//! 协议要点（来自官方 mqtt-udp_zh.md）：
-//! - 控制通道 MQTT：QoS 0、clean session、keepalive 240s；hello `version=3`、`transport="udp"`。
-//! - 数据通道 UDP：16 字节包头（= AES-CTR IV），载荷为加密 Opus。
-//! - 服务器 hello 响应携带 `udp.server/port/key/nonce`（key/nonce 为 32 字符 hex）。
-//! - 包头与 IV 同体，见 [`crate::crypto`]。
+//! MQTT+UDP 混合传输（主链路）。控制走 MQTT（QoS0），音频走加密 UDP（包头=IV，见 crypto）。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,10 +45,9 @@ impl MqttUdpTransport {
             .as_ref()
             .ok_or_else(|| VoiceError::InvalidConfig("缺少 MQTT 参数".into()))?;
 
-        // ---------- 1. MQTT 连接 ----------
         let opts = build_mqtt_options(mqtt)?;
         let (client, mut eventloop) = AsyncClient::new(opts, REQUEST_CAP);
-        // 网络层：连接超时 10s、TCP_NODELAY（官方实现一致）。
+        // 网络层：连接超时 10s、TCP_NODELAY（与官方一致）。
         let mut netopts = NetworkOptions::new();
         netopts.set_connection_timeout(10);
         netopts.set_tcp_nodelay(true);
@@ -65,7 +58,6 @@ impl MqttUdpTransport {
             .await
             .map_err(|e| VoiceError::Transport(format!("MQTT 订阅失败: {}", e)))?;
 
-        // 发布 hello（version=3, transport=udp）。
         let hello = ClientMessage::hello_mqtt_udp();
         let hello_json = serde_json::to_string(&hello)?;
         client
@@ -78,7 +70,6 @@ impl MqttUdpTransport {
             .await
             .map_err(|e| VoiceError::Transport(format!("MQTT 发布 hello 失败: {}", e)))?;
 
-        // ---------- 2. 等待 hello 响应，提取 UDP 参数 ----------
         let negotiated = tokio::time::timeout(HELLO_TIMEOUT, wait_hello(&mut eventloop))
             .await
             .map_err(|_| VoiceError::Timeout("MQTT hello 响应超时".into()))??;
@@ -95,7 +86,6 @@ impl MqttUdpTransport {
             negotiated.server_audio.frame_duration
         );
 
-        // ---------- 3. UDP 套接字 ----------
         let udp_socket = Arc::new(
             UdpSocket::bind("0.0.0.0:0")
                 .await
@@ -109,12 +99,10 @@ impl MqttUdpTransport {
             .await
             .map_err(|e| VoiceError::Transport(format!("UDP 连接失败: {}", e)))?;
 
-        // ---------- 4. 通道与任务 ----------
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
         let (audio_tx, audio_rx) = super::LatestSlot::<Vec<u8>>::new().pipe();
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
 
-        // 出站任务：控制走 MQTT，音频走 UDP（加密）。
         let mqtt_send_client = client.clone();
         let mqtt_send_params = mqtt.clone();
         tokio::spawn(send_loop(
@@ -127,10 +115,7 @@ impl MqttUdpTransport {
             base_nonce,
         ));
 
-        // MQTT 事件循环：hello 之后的下行 JSON 路由。
         tokio::spawn(mqtt_event_loop(eventloop, incoming_tx.clone()));
-
-        // UDP 接收：解包头 → 防重放 → 解密 → Audio。
         tokio::spawn(udp_recv_loop(udp_socket, cipher, incoming_tx.clone()));
 
         Ok(TransportHandles {
@@ -212,7 +197,6 @@ async fn send_loop(
     base_nonce: [u8; 16],
 ) {
     let mut local_sequence: u32 = 0;
-    // 加密与组包缓冲常驻复用，避免每帧堆分配。
     let mut packet: Vec<u8> = Vec::with_capacity(UDP_MAX_PACKET);
     loop {
         tokio::select! {
@@ -249,7 +233,7 @@ async fn send_loop(
                 packet.extend_from_slice(&encrypted);
                 if let Err(e) = udp.send(&packet).await {
                     warn!("UDP 发送失败: {}", e);
-                    // UDP 黑洞：连续失败由监督层计数熔断，这里不自行退出。
+                    // 连续失败由监督层计数熔断，这里不自行退出。
                 }
             }
         }
@@ -303,12 +287,10 @@ async fn udp_recv_loop(
                 }
                 let iv: [u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().unwrap();
                 let hdr = UdpAudioHeader::parse(&iv);
-                // 类型校验。
                 if hdr.type_ != TYPE_AUDIO {
                     stats.type_dropped += 1;
                     continue;
                 }
-                // 长度校验。
                 if HEADER_SIZE + hdr.payload_len as usize != n {
                     stats.len_dropped += 1;
                     debug!("UDP 长度不匹配: 实际 {} 声明 {}", n, hdr.payload_len);

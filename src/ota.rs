@@ -1,7 +1,4 @@
-//! OTA 配置与激活：reqwest（共享 rustls/ring，纯 Rust 跨平台）。
-//!
-//! 本地 IP 探测（原 8.8.8.8 UDP connect）已移除 —— 地址只从实际官方服务路由推导，
-//! MQTT endpoint 由 OTA 下发或从 WebSocket URL 的 host 推导。
+//! OTA 配置拉取与激活轮询（reqwest，共享 rustls/ring）。
 
 use anyhow::{anyhow, Context, Result};
 use log::{info, warn};
@@ -18,7 +15,6 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct OtaConfig {
     #[serde(default)]
     pub websocket: WebSocketConfig,
-    /// 可选 MQTT 配置（主链路）；缺省时回退 WebSocket-only。
     #[serde(default)]
     pub mqtt: Option<OtaMqttConfig>,
     #[serde(default)]
@@ -34,9 +30,7 @@ pub struct WebSocketConfig {
 /// MQTT 配置（与官方 OTA 响应结构对应）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OtaMqttConfig {
-    /// endpoint，可含端口（"host:port"）；缺省端口见 `derive_mqtt`。
     pub endpoint: Option<String>,
-    /// 服务器下发的 MQTT client_id（必须使用，勿自造）。
     #[serde(default)]
     pub client_id: Option<String>,
     #[serde(default)]
@@ -62,13 +56,12 @@ pub struct ActivationData {
     pub authorization_url: Option<String>,
 }
 
-/// 全局复用 HTTP 客户端（含连接池，激活重试时避免重复 TLS 握手）。
+/// 全局复用 HTTP 客户端（含连接池，避免重复 TLS 握手）。
 fn client() -> Result<&'static reqwest::Client> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     if let Some(c) = CLIENT.get() {
         return Ok(c);
     }
-    // 并发时可能重复构建，但仅首个成功者被保留，其余丢弃，无副作用。
     let built = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
@@ -112,7 +105,7 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
     }
 
     let text = response.text().await.context("读取 OTA 响应失败")?;
-    // 打印脱敏原始响应，便于核对服务器实际返回的连接字段（如 mqtt 对象结构）。
+    // 打印脱敏原始响应，便于核对服务器实际返回的连接字段。
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
         let mut masked = v.clone();
         if let Some(ws) = masked
@@ -132,8 +125,8 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
         info!("OTA 响应(脱敏): {}", masked);
     }
 
+    // 完整 config 含 mqtt.password / websocket.token，任何日志级别都不应泄密。
     let config: OtaConfig = serde_json::from_str(&text).context("OTA 响应解析失败")?;
-    // 不打印完整 config：其中含 mqtt.password / websocket.token，debug 级别也不应泄密。
 
     if config.activation.is_some() {
         warn!("设备需要激活");

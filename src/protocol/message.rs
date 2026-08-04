@@ -1,14 +1,7 @@
-//! 线上 JSON 消息协议（WebSocket 与 MQTT 共用文本载荷）。
-//!
-//! 关键约定（来自官方协议文档）：
-//! - WebSocket hello `version = 1`，MQTT hello `version = 3`。
-//! - 上行 `audio_params.frame_duration = 60`（ms），`sample_rate = 16000`。
-//! - 服务器 hello 响应 `audio_params.sample_rate` 可为 16000/24000/48000；
-//!   MQTT 响应额外含 `udp` 字段（server/port/key/nonce）。
+//! 线上 JSON 消息协议（WebSocket 与 MQTT 共用）。
+//! 关键约定：WS hello `version=1`、MQTT `version=3`；上行 `frame_duration=60`ms、`sample_rate=16000`。
 
 use serde::{Deserialize, Serialize};
-
-// ===================== 出站（设备 → 服务器） =====================
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
@@ -70,8 +63,6 @@ pub enum ListenState {
     Start,
     Stop,
 }
-
-// ===================== 入站（服务器 → 设备） =====================
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
@@ -144,7 +135,7 @@ pub enum TtsState {
 }
 
 impl ClientMessage {
-    /// 统一 hello 构造：固定 features（mcp=true）+ 默认音频参数（opus/16k/60ms）。
+    /// 统一 hello 构造：固定 features（mcp=true）+ 默认音频参数。
     fn hello(version: u8, transport: &str) -> Self {
         Self::Hello {
             version,
@@ -157,22 +148,20 @@ impl ClientMessage {
         }
     }
 
-    /// WebSocket hello，二进制协议 v1（原始 Opus）。
     pub fn hello_websocket_v1() -> Self {
         Self::hello(1, "websocket")
     }
 
-    /// WebSocket hello，二进制协议 v2（BinaryProtocol2，带时间戳供服务端 AEC）。首选。
+    /// v2（BinaryProtocol2，带时间戳供服务端 AEC）。首选。
     pub fn hello_websocket_v2() -> Self {
         Self::hello(2, "websocket")
     }
 
-    /// WebSocket hello，二进制协议 v3（BinaryProtocol3，4 字节精简头，官方新固件默认）。
+    /// v3（BinaryProtocol3，4 字节精简头）。
     pub fn hello_websocket_v3() -> Self {
         Self::hello(3, "websocket")
     }
 
-    /// MQTT+UDP hello（version=3）。
     pub fn hello_mqtt_udp() -> Self {
         Self::hello(3, "udp")
     }

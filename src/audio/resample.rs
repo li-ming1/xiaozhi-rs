@@ -1,8 +1,5 @@
-//! 高质量重采样：rubato 4.0 `Async`（sinc，256-tap BlackmanHarris2）。
-//!
-//! 采用异步（Async）重采样器以便实时调整比率补偿时钟漂移（±1000ppm）。
-//! 输入侧固定（`FixedAsync::Input`）：每次调用消费 `input_frames_next()` 输入帧。
-//! 内部用 `VecDeque` 累积输入，凑足一帧即处理。
+//! 高质量重采样：rubato `Async`（sinc 256-tap BlackmanHarris2），
+//! 支持实时调整比率补偿时钟漂移（±1000ppm）。
 
 use std::collections::VecDeque;
 
@@ -13,9 +10,8 @@ use rubato::{
 
 use crate::error::{Result, VoiceError};
 
-/// 相对比率最大偏差（1.01 → ±1%）。
+/// 相对比率最大偏差（±1%）。
 const MAX_RELATIVE_RATIO: f64 = 1.01;
-/// sinc 滤波器长度（256-tap，自动截止频率）。
 const SINC_LEN: usize = 256;
 
 /// 异步重采样器（单声道）。
@@ -50,7 +46,6 @@ impl AsyncResampler {
     }
 
     /// 喂入输入样本并尝试产出，结果追加到 `out`。
-    /// `ratio` 为当前目标比率（输出/输入），随漂移控制调整。
     pub fn process(&mut self, input: &[f32], ratio: f64, out: &mut Vec<f32>) {
         self.in_queue.extend(input.iter().copied());
         if (ratio - self.ratio).abs() > 1e-9 {
@@ -97,7 +92,6 @@ mod tests {
 
     #[test]
     fn resample_48k_to_16k_produces_expected_ratio() {
-        // 48k → 16k，输入 480 帧（10ms），应产出约 160 帧。
         let mut r = AsyncResampler::new(16_000.0 / 48_000.0, 480).unwrap();
         let input = vec![0.5f32; 480];
         let mut out = Vec::new();
@@ -108,8 +102,7 @@ mod tests {
             "out.len={}",
             out.len()
         );
-        // 滤波器瞬态在前 ~1.5 个滤波器长度（sinc 256-tap 对应 ~50 输出样本），
-        // 后一半应为稳态直流 0.5。
+        // 滤波器瞬态在前 ~1.5 个滤波器长度，后一半应为稳态直流 0.5。
         let steady = &out[out.len() / 2..];
         assert!(
             steady.iter().all(|s| (*s - 0.5).abs() < 0.01),
@@ -123,7 +116,6 @@ mod tests {
         let mut r = AsyncResampler::new(2.0, 960).unwrap();
         let input = vec![0.1f32; 960];
         let mut out = Vec::new();
-        // 千分之一漂移内调整不应失败。
         r.process(&input, 2.0 * 1.001, &mut out);
         assert!(!out.is_empty());
     }

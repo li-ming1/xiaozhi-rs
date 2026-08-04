@@ -13,21 +13,16 @@ fn write_exit_reason(msg: &str) {
     let _ = std::fs::write("xiaozhi-exit.log", format!("{}\n", msg));
 }
 
-// 多线程 runtime：DSP worker / 控制 / 收发 / 监督状态机独立调度。
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
-    // 原生崩溃（段错误/访问冲突）捕获：写入 xiaozhi-crash.log。
     #[cfg(windows)]
     xiaozhi_rs::crash::install();
-
-    // 全局 panic 钩子：打印并写入退出原因文件。
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("[panic] {:?}", info);
         eprintln!("{}", msg);
         write_exit_reason(&msg);
     }));
-
-    // rustls 自带 ring provider 须在使用任意 HTTPS 调用前注册一次（reqwest/rumqttc 复用）。
+    // ring provider 须在任意 HTTPS 调用前注册一次（reqwest/rumqttc 复用）。
     rustls::crypto::ring::default_provider().install_default().ok();
 
     init_logger();
@@ -133,13 +128,11 @@ async fn run_with_signal(skip_activation: bool) -> Result<()> {
                 info!("收到 Ctrl+C 信号，正在退出...");
                 shutdown_clone.cancel();
             }
-            // 信号监听失败（如非交互环境）不应触发退出。
             Err(e) => warn!("信号监听失败: {}（忽略，不退出）", e),
         }
     });
 
     let res = run_client(skip_activation, shutdown).await;
-    // 退出原因日志：任何返回都记录到控制台与文件，便于定位"自动退出"。
     let reason = match &res {
         Ok(()) => "normal-return（supervisor 已返回）".to_string(),
         Err(e) => format!("error: {:?}", e),

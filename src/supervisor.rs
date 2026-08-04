@@ -1,13 +1,6 @@
 //! `VoiceSupervisor`：连接生命周期状态机。
-//!
-//! 状态流转固定为 `Bootstrap -> SelectTransport -> Connect -> Streaming -> Backoff`。
-//! 网络瞬断、设备热插拔与临时服务故障均在内部恢复；认证失败立即失效并刷新。
-//!
-//! 关键策略（重构方案）：
-//! - 无限 decorrelated-jitter 退避，base=250ms、cap=30s。
-//! - MQTT 熔断：120s 内失败 2 次 → 5min，后续 10/20/30min 递增；稳定 120s 清零。
-//! - UDP 黑洞：活跃句子 3s 无媒体 → 废弃纪元并回退 WebSocket。
-//! - 网络分级：10s 窗口丢包率映射 Good/Fair/Poor，驱动 Opus 编码策略。
+//! `SelectTransport -> Connect -> Streaming -> Backoff`，网络瞬断/热插拔/服务故障均在内部恢复。
+//! 策略：decorrelated-jitter 退避（250ms~30s）；MQTT 熔断；UDP 黑洞检测；10s 窗口网络分级。
 
 use std::time::{Duration, Instant};
 
@@ -62,7 +55,6 @@ impl Backoff {
     }
 
     fn next(&mut self) -> Duration {
-        // 简单 LCG。
         self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         // shift 恒 ≤ 8，`1 << shift` 不会溢出。
         let exp = self.base.saturating_mul(1u32 << self.attempt.min(8));
@@ -127,7 +119,6 @@ impl CircuitBreaker {
         }
     }
 
-    /// 稳定运行后清零。
     fn on_stable(&mut self) {
         self.failures.retain(|t| t.elapsed() < Self::STABLE_RESET);
         if self.failures.is_empty() {
@@ -253,7 +244,6 @@ impl VoiceSupervisor {
                     }
                 },
                 State::Streaming => match self.stream().await {
-                    // 会话正常结束（goodbye）也保持运行：回到传输选择，不退出进程。
                     Ok(()) => {
                         info!("会话正常结束，重新连接");
                         self.cleanup_session();
@@ -366,16 +356,11 @@ impl VoiceSupervisor {
     /// 流式会话。句柄来自 Connect 状态（`self.handles`），此处不再建连。
     async fn stream(&mut self) -> Result<()> {
         let kind = self.epoch.unwrap_or(TransportKind::WebSocket);
-        let mut handles = self
-            .handles
-            .take()
-            .ok_or_else(|| VoiceError::SessionClosed)?;
+        let mut handles = self.handles.take().ok_or(VoiceError::SessionClosed)?;
 
-        // 启动音频（设备缺失/错误时返回瞬态错误进入退避）。
         self.ensure_audio(handles.server_audio.sample_rate, handles.audio_tx.clone())
             .await?;
 
-        // 发送 listen start。
         handles
             .control_tx
             .send(ClientMessage::Listen {
@@ -392,33 +377,27 @@ impl VoiceSupervisor {
             _ => "WebSocket",
         });
 
-        let mut tts_active = false;
+        let mut ctx = SessionCtx::new();
         let mut last_audio = Instant::now();
-        // 当前句子是否已收到过音频（区分"首包等待"与"中途断流"）。
-        let mut sentence_has_media = false;
-        let mut tts_started_at: Option<Instant> = None;
         let mut loss = LossEstimator::new();
         let mut last_grade_check = Instant::now();
         let mut downlink_frames: u64 = 0;
         let mut downlink_diag = Instant::now();
         let mut first_frame_logged = false;
-        // 复用 interval 定时器（每 250ms 巡检），避免每次 select 新建 timer。
         let mut tick = tokio::time::interval(Duration::from_millis(250));
-        tick.reset(); // 与 sleep 语义一致：首个 tick 延迟一个周期。
+        tick.reset(); // 首个 tick 延迟一个周期。
 
         let result = loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break Ok(()),
                 _ = tick.tick() => {
-                    // UDP 黑洞检测仅对 MQTT+UDP 生效（TCP 无黑洞概念）。
-                    // - 首包等待：TTS start 后 10s 无媒体（TTS 生成延迟属正常）；
-                    // - 中途断流：已收到媒体的句子 3s 无媒体。
-                    if kind == TransportKind::MqttUdp && tts_active {
+                    // UDP 黑洞检测（仅 MQTT+UDP）：首包 10s 无媒体，或中途断流 3s。
+                    if kind == TransportKind::MqttUdp && ctx.tts_active {
                         let now = Instant::now();
-                        let blackhole = if sentence_has_media {
+                        let blackhole = if ctx.sentence_has_media {
                             last_audio.elapsed() >= Duration::from_secs(3)
                         } else {
-                            tts_started_at
+                            ctx.tts_started_at
                                 .map(|t| now.duration_since(t) >= Duration::from_secs(10))
                                 .unwrap_or(false)
                         };
@@ -427,13 +406,12 @@ impl VoiceSupervisor {
                             break Err(VoiceError::Transport("UDP 黑洞".into()));
                         }
                     }
-                    // 下行诊断：每 2s 输出收到的服务器音频帧数（RUST_LOG=debug 时可见）。
                     if downlink_diag.elapsed() >= Duration::from_secs(2) {
                         debug!("下行诊断: 收到服务器音频帧 {}", downlink_frames);
                         downlink_frames = 0;
                         downlink_diag = Instant::now();
                     }
-                    // 网络分级（10s 窗口）：同时下发捕获侧（编码策略）与播放侧（FEC 解码）。
+                    // 网络分级（10s 窗口）：下发捕获侧（编码策略）与播放侧（FEC 解码）。
                     if last_grade_check.elapsed() >= Duration::from_secs(10) {
                         let grade = loss.grade;
                         if let Some(a) = self.audio.as_ref() {
@@ -450,7 +428,7 @@ impl VoiceSupervisor {
                 incoming = handles.incoming_rx.recv() => {
                     match incoming {
                         Some(IncomingEvent::Json(msg)) => {
-                            match handle_json(msg, &mut tts_active, &mut sentence_has_media, &mut tts_started_at, self.audio.as_ref()).await {
+                            match handle_json(msg, &mut ctx, self.audio.as_ref()).await {
                                 Ok(Some(())) => break Ok(()),   // goodbye
                                 Ok(None) => {}
                                 Err(e) => break Err(e),
@@ -458,7 +436,7 @@ impl VoiceSupervisor {
                         }
                         Some(IncomingEvent::Audio(data)) => {
                             last_audio = Instant::now();
-                            sentence_has_media = true;
+                            ctx.sentence_has_media = true;
                             if !first_frame_logged {
                                 first_frame_logged = true;
                                 let hex: Vec<String> =
@@ -482,7 +460,7 @@ impl VoiceSupervisor {
             }
         };
 
-        // 停止音频（下次会话重新建流，编解码器随纪元重建）。
+        // 停止音频：下次会话重新建流，编解码器随纪元重建。
         if let Some(a) = self.audio.as_mut() {
             a.stop();
         }
@@ -532,13 +510,8 @@ impl VoiceSupervisor {
     }
 }
 
-/// 由 OTA 配置推导 MQTT 参数。
-///
-/// 关键规则（与官方 ESP32 一致）：
-/// - client_id 必须使用服务器下发的值（勿自造）。
-/// - 端点未带端口时默认 1883（明文）；带端口按端口判断 TLS。
-/// - 服务器 `subscribe_topic` 为 "null"/空 时回退为与发布同主题
-///   （官方客户端回调不区分 topic，响应即达）。
+/// 由 OTA 配置推导 MQTT 参数。关键规则（与官方一致）：
+/// client_id 用服务器下发值；端点无端口时默认 8883(TLS)；subscribe_topic 为 "null"/空 时回退为发布同主题。
 fn derive_mqtt(m: &OtaMqttConfig, ws_url: &str, client_id: &str) -> MqttParams {
     let (host, port, tls) = if let Some(ep) = &m.endpoint {
         let ep = ep.trim();
@@ -547,7 +520,6 @@ fn derive_mqtt(m: &OtaMqttConfig, ws_url: &str, client_id: &str) -> MqttParams {
                 let p = p.parse().unwrap_or(8883);
                 (h.to_string(), p, m.tls || p == 8883)
             }
-            // 官方 MQTT 默认 TLS 8883（协议文档 §8.1）。
             _ => (ep.to_string(), 8883, true),
         }
     } else {
@@ -584,21 +556,37 @@ fn derive_mqtt(m: &OtaMqttConfig, ws_url: &str, client_id: &str) -> MqttParams {
     }
 }
 
+/// 会话上下文：TTS 状态与媒体跟踪（每次流式会话重建）。
+struct SessionCtx {
+    tts_active: bool,
+    sentence_has_media: bool,
+    /// TTS 开始时间（UDP 黑洞首包超时判定基准）。
+    tts_started_at: Option<Instant>,
+}
+
+impl SessionCtx {
+    fn new() -> Self {
+        Self {
+            tts_active: false,
+            sentence_has_media: false,
+            tts_started_at: None,
+        }
+    }
+}
+
 /// 处理服务器 JSON 消息。返回 Some(()) 表示会话应结束（goodbye）。
 async fn handle_json(
     msg: ServerMessage,
-    tts_active: &mut bool,
-    sentence_has_media: &mut bool,
-    tts_started_at: &mut Option<Instant>,
+    ctx: &mut SessionCtx,
     audio: Option<&AudioManager>,
 ) -> Result<Option<()>> {
     match msg {
         ServerMessage::Tts { state, text } => match state {
             TtsState::Start => {
                 debug!("TTS 开始");
-                *tts_active = true;
-                *sentence_has_media = false;
-                *tts_started_at = Some(Instant::now());
+                ctx.tts_active = true;
+                ctx.sentence_has_media = false;
+                ctx.tts_started_at = Some(Instant::now());
                 if let Some(a) = audio
                     && let Some(tx) = a.playback_sender()
                 {
@@ -609,9 +597,9 @@ async fn handle_json(
             }
             TtsState::Stop => {
                 debug!("TTS 结束");
-                *tts_active = false;
-                *sentence_has_media = false;
-                *tts_started_at = None;
+                ctx.tts_active = false;
+                ctx.sentence_has_media = false;
+                ctx.tts_started_at = None;
             }
             TtsState::SentenceStart => {
                 if let Some(t) = text {
@@ -641,10 +629,7 @@ async fn handle_json(
     Ok(None)
 }
 
-/// 实时语音客户端入口：对外唯一接口，只暴露构造与运行。
-///
-/// 网络瞬断、设备热插拔与临时服务故障均在内部由 [`VoiceSupervisor`] 恢复，
-/// 调用方无需感知。构造需 `DeviceIdentity` 与 `OtaConfig`（见 `identity`/`ota`）。
+/// 实时语音客户端入口：对外唯一接口，内部由 [`VoiceSupervisor`] 恢复各类故障。
 pub struct RealtimeVoice {
     identity: DeviceIdentity,
     ota: OtaConfig,

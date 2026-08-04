@@ -1,13 +1,6 @@
 //! 音频子系统：无锁实时管线。
-//!
-//! 架构（重构方案）：
-//! - CPAL 回调只做固定成本的格式转换、声道合并/展开、rtrb 读写与状态变量，
-//!   禁止锁、堆分配、重采样、Opus 与日志。
-//! - 捕获与播放各有一个独立 DSP worker（Tokio 任务），持有 rtrb 的另一端：
-//!   * 捕获 worker：设备率 → 16kHz（rubato Async）→ 60ms 帧 → Opus 编码 → latest-slot。
-//!   * 播放 worker：接收 Opus → 解码（服务器采样率）→ 设备率重采样 → rtrb。
-//! - 时钟漂移：捕获按"窗口内样本计数"、播放按"缓冲占用"调整重采样比率，
-//!   每 500ms 一次，限幅 ±1000ppm、变化率 ≤50ppm/s。
+//! CPAL 回调仅做固定成本的格式转换与 rtrb 读写（禁止锁/堆分配/重采样/Opus/日志）；
+//! 捕获与播放各由独立 DSP worker 处理，时钟漂移每 500ms 调整重采样比率（±1000ppm）。
 
 pub mod buffer;
 pub mod opus;
@@ -28,30 +21,24 @@ use crate::error::{Result, VoiceError};
 use crate::protocol::LatestSlot;
 
 use buffer::PlaybackBuffer;
-use opus::{NetworkGrade, OpusCodec, ENCODER_FRAME_SIZE};
+use opus::{NetworkGrade, OpusCodec, ENCODER_FRAME_SIZE, ENCODER_RATE};
 use resample::AsyncResampler;
 
-/// 漂移调整周期。
 const DRIFT_PERIOD: Duration = Duration::from_millis(500);
-/// 最大比率偏差（ppm）。
 const MAX_DRIFT_PPM: f64 = 1000.0;
-/// 比率变化率上限（ppm/s）。
 const RATE_LIMIT_PPM_S: f64 = 50.0;
-/// 输出环形缓冲容量（样本，单声道）：320ms @ 96kHz 余量。
+/// 输出环形缓冲容量（320ms @ 96kHz 余量）。
 const OUTPUT_RING_SAMPLES: usize = 32 * 1024;
-/// 输入环形缓冲容量（样本，单声道）：约 1s @ 48kHz，
-/// 吸收 WASAPI 采集回调的突发（burst）写入，避免 rtrb 满导致丢样本。
-const INPUT_RING_SAMPLES: usize = 48 * 1024;
-/// 捕获批次上限（样本）：一次循环尽量读空 rtrb，防 burst 丢样本。
+/// 输入环形缓冲容量（250ms @ 48kHz，吸收 WASAPI 采集突发写入）。
+const INPUT_RING_SAMPLES: usize = 12 * 1024;
+/// 捕获批次上限（一次循环尽量读空 rtrb）。
 const CAPTURE_BATCH: usize = 4096;
 
 /// 下行到播放 worker 的消息。
 pub enum PlaybackMsg {
-    /// Opus 音频帧。
     Audio(Vec<u8>),
     /// 清空播放缓冲（TTS 切换）。
     Flush,
-    /// 关闭。
     Shutdown,
 }
 
@@ -234,7 +221,7 @@ impl AudioManager {
     }
 }
 
-/// 输入回调：格式转换 + 下混单声道 + rtrb 入队（满则丢）。
+/// 输入回调：格式转换 + 下混单声道 + rtrb 入队。
 fn build_input_stream<S>(
     device: &Device,
     config: StreamConfig,
@@ -267,7 +254,7 @@ where
 }
 
 /// 输出回调：rtrb 读单声道 → 声道展开 + 格式转换；欠载 5ms 斜坡静音。
-/// 点击抑制状态为回调闭包内的局部可变量（FnMut），无需锁/原子。
+/// 点击抑制状态为闭包局部变量，无需锁/原子。
 #[allow(clippy::too_many_arguments)]
 fn build_output_stream<T>(
     device: &Device,
@@ -355,18 +342,17 @@ fn fill_output<T>(
     }
 }
 
-/// 捕获统计（诊断用）：RMS 电平与编码帧数，每 2s 打日志，
-/// 用于确认麦克风数据是否真实流入（排除 Windows 麦克风隐私/静音问题）。
+/// 捕获统计（每 2s 诊断日志，确认麦克风数据真实流入）。
 struct CaptureStats {
     flush_at: Instant,
     samples: u64,
     sum_sq: f64,
     frames: u64,
-    /// 语音帧数（VAD 判定后发送）。
+    /// VAD 判定后发送的语音帧数。
     speech_frames: u64,
-    /// 静音帧数（VAD 判定后跳过）。
+    /// VAD 判定后跳过的静音帧数。
     silence_frames: u64,
-    /// 最近一次 AGC 增益（线性）。
+    /// 最近一次 AGC 增益。
     agc_gain: f32,
 }
 
@@ -384,7 +370,7 @@ impl CaptureStats {
     }
 }
 
-/// 播放统计（诊断用）：确认下行音频是否被正确解码并写入环形缓冲。
+/// 播放统计（每 2s 诊断日志，确认下行解码与写入正常）。
 struct PlaybackStats {
     flush_at: Instant,
     received: u64,
@@ -392,13 +378,9 @@ struct PlaybackStats {
     decoded_fail: u64,
     plc: u64,
     written: u64,
-    /// 最近一帧解码输出样本数。
     last_pcm_len: usize,
-    /// 最近一次重采样 input_frames_next()。
     last_needed: usize,
-    /// 最近一次重采样产出样本数。
     last_produced: usize,
-    /// 重采样无产出的帧数（累计）。
     zero_produced: u64,
 }
 
@@ -419,7 +401,7 @@ impl PlaybackStats {
     }
 }
 
-/// 漂移控制器：目标比率随观测漂移调整，限幅 ±1000ppm、变化率 ≤50ppm/s。
+/// 漂移控制器：比率随观测漂移调整（限幅 ±1000ppm、变化率 ≤50ppm/s）。
 struct DriftController {
     nominal_ratio: f64,
     ratio: f64,
@@ -452,34 +434,29 @@ impl DriftController {
     }
 }
 
-/// 帧统计（RMS 与峰值）。
+/// 帧统计（RMS 与峰值）。单帧 ≤960 样本，f32 精度足够。
 fn frame_stats(frame: &[f32]) -> (f32, f32) {
     if frame.is_empty() {
         return (0.0, 0.0);
     }
-    let mut sum_sq = 0.0f64;
+    let mut sum_sq = 0.0f32;
     let mut peak = 0.0f32;
-    for &s in frame.iter() {
-        sum_sq += (s as f64) * (s as f64);
+    for &s in frame {
+        sum_sq += s * s;
         peak = peak.max(s.abs());
     }
-    let rms = (sum_sq / frame.len() as f64).sqrt() as f32;
+    let rms = (sum_sq / frame.len() as f32).sqrt();
     (rms, peak)
 }
 
-/// 上行自动增益控制（AGC）。
-///
-/// 目的：用户语音电平偏低导致服务器 ASR/VAD 难以触发。本 AGC 把语音帧
-/// RMS 提升到目标电平（约 -21dBFS，上限 36dB），静音帧不放大，增益平滑
-/// 更新，并按帧峰值限幅防止过载削波。
+/// 上行自动增益控制：把语音帧 RMS 提升到目标电平（-21dBFS，上限 36dB），静音不放大。
 struct Agc {
-    /// 当前增益（线性）。
     gain: f32,
     /// 视为语音的最小 RMS（≈ -66dBFS）。
     voice_threshold: f32,
     /// 语音帧目标 RMS（≈ -21dBFS）。
     target_rms: f32,
-    /// 最大增益（线性，36dB）。
+    /// 最大增益（36dB）。
     max_gain: f32,
 }
 
@@ -501,11 +478,10 @@ impl Agc {
         let (rms, peak) = frame_stats(frame);
         if rms >= self.voice_threshold {
             let mut target = (self.target_rms / rms).clamp(1.0, self.max_gain);
-            // 峰值防削波：增益上限不超过 0.85/peak，避免过载失真。
+            // 峰值防削波：增益上限不超过 0.85/peak。
             if peak > 0.0 {
                 target = target.min(0.85 / peak);
             }
-            // 升增益快、降增益慢，避免抽泣声/爆音。
             let alpha = if target > self.gain { 0.5 } else { 0.2 };
             self.gain += (target - self.gain) * alpha;
             let g = self.gain;
@@ -513,33 +489,26 @@ impl Agc {
                 *s = (*s * g).clamp(-0.98, 0.98);
             }
         } else {
-            // 静音帧：不放大（底噪不被抬高），内部增益缓慢回落待命。
+            // 静音帧不放大，内部增益缓慢回落待命。
             self.gain += (1.0 - self.gain) * 0.1;
         }
     }
 }
 
-/// 语音活动检测（静音抑制）。
-///
-/// 静音帧不编码、不上行，只发送语音帧，降低背景噪声对服务器 VAD/ASR 的
-/// 干扰（服务器端 VAD 阈值不会因持续噪声被抬升）。自适应噪声底 + 滞回 +
-/// 尾随缓冲（hangover 1.2s），参数取保守方向（宁多勿漏，避免吞字）。
+/// 语音活动检测：静音帧不编码不上行，降低背景噪声对服务器 VAD/ASR 干扰。
+/// 自适应噪声底 + 滞回 + hangover 1.2s（宁多勿漏，避免吞字）。
 struct Vad {
-    /// 当前是否处于语音段。
     speech: bool,
-    /// 已连续低于释放阈值的帧数。
     hangover: u32,
     /// 噪声底估计（EMA，仅静音段更新）。
     noise_floor: f32,
-    /// 相对噪声底的触发阈值（dB）。
-    on_db: f32,
-    /// 相对噪声底的释放阈值（dB）。
-    off_db: f32,
+    /// 触发阈值缩放系数（= 10^(8dB/20)，预计算避免每帧 powf）。
+    on_scale: f32,
+    /// 释放阈值缩放系数（= 10^(4dB/20)）。
+    off_scale: f32,
     /// 语音结束后的尾随帧数（1.2s @ 60ms）。
     hangover_frames: u32,
-    /// 触发绝对下限（≈ -68dBFS）。
     min_on: f32,
-    /// 释放绝对下限（≈ -74dBFS）。
     min_off: f32,
 }
 
@@ -551,8 +520,8 @@ impl Vad {
             // 初始噪声底取很低值（-80dBFS），使触发阈值从一开始就是
             // 绝对下限 min_on，启动后即使立刻说话也不会被吞。
             noise_floor: 0.0001,
-            on_db: 8.0,
-            off_db: 4.0,
+            on_scale: 10f32.powf(8.0 / 20.0),
+            off_scale: 10f32.powf(4.0 / 20.0),
             hangover_frames: 20,
             min_on: 0.0004,
             min_off: 0.0002,
@@ -561,8 +530,8 @@ impl Vad {
 
     /// 输入一帧 RMS，返回是否应发送该帧（true=语音，false=静音跳过）。
     fn decide(&mut self, rms: f32) -> bool {
-        let on = (self.noise_floor * 10f32.powf(self.on_db / 20.0)).max(self.min_on);
-        let off = (self.noise_floor * 10f32.powf(self.off_db / 20.0)).max(self.min_off);
+        let on = (self.noise_floor * self.on_scale).max(self.min_on);
+        let off = (self.noise_floor * self.off_scale).max(self.min_off);
         if self.speech {
             if rms < off {
                 self.hangover += 1;
@@ -574,7 +543,7 @@ impl Vad {
                 self.hangover = 0;
             }
         } else {
-            // 静音段：慢跟噪声底（仅低电平观测进入，避免语音污染）。
+            // 静音段慢跟噪声底（仅低电平观测进入，避免语音污染）。
             if rms < on {
                 self.noise_floor = self.noise_floor * 0.98 + rms * 0.02;
             }
@@ -601,6 +570,8 @@ async fn capture_worker(
             return;
         }
     };
+    let mut tick = tokio::time::interval(Duration::from_millis(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             grade = grade_rx.recv() => {
@@ -608,7 +579,7 @@ async fn capture_worker(
                     worker.opus.set_network_grade(g);
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(2)) => {
+            _ = tick.tick() => {
                 worker.process_batch(&mut input, &encoded_tx).await;
             }
         }
@@ -676,11 +647,11 @@ impl CaptureWorker {
         self.resampler.process(&self.chunk, self.drift.ratio, &mut self.resample_out);
         self.pending.extend_from_slice(&self.resample_out);
 
-        // 每 500ms：按窗口样本计数校正比率。
+        // 每 500ms 按窗口样本计数校正比率。
         if self.window_start.elapsed() >= DRIFT_PERIOD {
             let observed = self.window_count as f64 / self.window_start.elapsed().as_secs_f64();
             if observed > 0.0 {
-                let target_ratio = 16_000.0 / observed;
+                let target_ratio = ENCODER_RATE as f64 / observed;
                 let target_ppm =
                     (target_ratio - self.drift.nominal_ratio) / self.drift.nominal_ratio * 1e6;
                 self.drift.move_toward(target_ppm);
@@ -689,8 +660,7 @@ impl CaptureWorker {
             self.window_start = Instant::now();
         }
 
-        // 组 60ms 帧：VAD 判定语音 → AGC 提升电平；静音 → 清零发送（保持上行
-        // 连续，服务器 VAD 收到干净静音，不受背景噪声干扰）。
+        // 组 60ms 帧：VAD 判定语音才编码上行，空闲时零编码开销。
         while self.pending.len() >= ENCODER_FRAME_SIZE {
             self.frame.clear();
             self.frame.extend(self.pending.drain(..ENCODER_FRAME_SIZE));
@@ -699,20 +669,18 @@ impl CaptureWorker {
                 self.stats.speech_frames += 1;
                 self.agc.process_frame(&mut self.frame);
                 self.stats.agc_gain = self.agc.gain;
+                match self.opus.encode(&self.frame) {
+                    Ok(pkt) => {
+                        self.stats.frames += 1;
+                        encoded_tx.store(pkt).await;
+                    }
+                    Err(e) => warn!("Opus 编码失败: {}", e),
+                }
             } else {
                 self.stats.silence_frames += 1;
-                self.frame.fill(0.0);
-            }
-            match self.opus.encode(&self.frame) {
-                Ok(pkt) => {
-                    self.stats.frames += 1;
-                    encoded_tx.store(pkt).await;
-                }
-                Err(e) => warn!("Opus 编码失败: {}", e),
             }
         }
 
-        // 每 2s 输出捕获诊断（RUST_LOG=debug 时可见）。
         if self.stats.flush_at.elapsed() >= Duration::from_secs(2) {
             let rms = if self.stats.samples > 0 {
                 (self.stats.sum_sq / self.stats.samples as f64).sqrt()
@@ -742,121 +710,172 @@ impl CaptureWorker {
 
 /// 播放 DSP worker：Opus → 解码（服务器率）→ 设备率 → rtrb。
 async fn playback_worker(
-    mut rx: mpsc::Receiver<PlaybackMsg>,
-    mut grade_rx: mpsc::Receiver<NetworkGrade>,
-    mut out: Producer<f32>,
+    rx: mpsc::Receiver<PlaybackMsg>,
+    grade_rx: mpsc::Receiver<NetworkGrade>,
+    out: Producer<f32>,
     server_rate: u32,
     output_rate: u32,
     cb_count: Arc<AtomicU64>,
     cb_samples: Arc<AtomicU64>,
 ) {
-    let nominal = output_rate as f64 / server_rate as f64;
-    let mut resampler = match AsyncResampler::new(nominal, 960) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("播放重采样器创建失败: {}", e);
-            return;
-        }
-    };
-    let mut decoder = match OpusCodec::new(server_rate) {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("播放 Opus 解码器创建失败: {}", e);
-            return;
-        }
-    };
-    let mut buf = PlaybackBuffer::new(60);
-    let mut drift = DriftController::new(nominal);
-    let mut last_drift = Instant::now();
-    let mut stats = PlaybackStats::new();
-    // 当前网络分级（弱网时解码启用 FEC 前向纠错）。
-    let mut grade = NetworkGrade::Good;
-    // 重采样输出缓冲常驻复用，避免每帧解码后堆分配。
-    let mut out_samples: Vec<f32> = Vec::with_capacity(960 * 3);
+    match PlaybackWorker::new(rx, grade_rx, out, server_rate, output_rate, cb_count, cb_samples) {
+        Ok(worker) => worker.run().await,
+        Err(e) => warn!("播放管线初始化失败: {}", e),
+    }
+}
 
-    loop {
-        tokio::select! {
-            g = grade_rx.recv() => {
-                if let Some(g) = g {
-                    grade = g;
+/// 播放管线状态：DSP 组件 + 播放缓冲 + 诊断统计（与 `CaptureWorker` 对称）。
+struct PlaybackWorker {
+    rx: mpsc::Receiver<PlaybackMsg>,
+    grade_rx: mpsc::Receiver<NetworkGrade>,
+    out: Producer<f32>,
+    output_rate: u32,
+    cb_count: Arc<AtomicU64>,
+    cb_samples: Arc<AtomicU64>,
+    resampler: AsyncResampler,
+    decoder: OpusCodec,
+    buf: PlaybackBuffer,
+    drift: DriftController,
+    last_drift: Instant,
+    stats: PlaybackStats,
+    /// 当前网络分级（弱网时解码启用 FEC 前向纠错）。
+    grade: NetworkGrade,
+    /// 重采样输出缓冲常驻复用，避免每帧解码后堆分配。
+    out_samples: Vec<f32>,
+}
+
+impl PlaybackWorker {
+    fn new(
+        rx: mpsc::Receiver<PlaybackMsg>,
+        grade_rx: mpsc::Receiver<NetworkGrade>,
+        out: Producer<f32>,
+        server_rate: u32,
+        output_rate: u32,
+        cb_count: Arc<AtomicU64>,
+        cb_samples: Arc<AtomicU64>,
+    ) -> Result<Self> {
+        let nominal = output_rate as f64 / server_rate as f64;
+        Ok(Self {
+            rx,
+            grade_rx,
+            out,
+            output_rate,
+            cb_count,
+            cb_samples,
+            resampler: AsyncResampler::new(nominal, 960)?,
+            decoder: OpusCodec::new(server_rate)?,
+            buf: PlaybackBuffer::new(60),
+            drift: DriftController::new(nominal),
+            last_drift: Instant::now(),
+            stats: PlaybackStats::new(),
+            grade: NetworkGrade::Good,
+            out_samples: Vec::with_capacity(960 * 3),
+        })
+    }
+
+    async fn run(mut self) {
+        loop {
+            tokio::select! {
+                g = self.grade_rx.recv() => {
+                    if let Some(g) = g {
+                        self.grade = g;
+                    }
+                }
+                msg = self.rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    match msg {
+                        PlaybackMsg::Shutdown => break,
+                        msg => self.handle_msg(msg).await,
+                    }
                 }
             }
-            msg = rx.recv() => {
-                let Some(msg) = msg else { break };
-                match msg {
-                    PlaybackMsg::Audio(opus) => {
-                        stats.received += 1;
-                        buf.observe_arrival(Instant::now());
-                        let (pcm, used_plc) = match decoder.decode(&opus, grade != NetworkGrade::Good) {
-                            Ok(p) => (p, false),
-                            Err(e) => {
-                                stats.decoded_fail += 1;
-                                debug!("Opus 解码失败(len={}): {}", opus.len(), e);
-                                match decoder.decode(&[], false) {
-                                    Ok(p) => {
-                                        stats.plc += 1;
-                                        (p, true)
-                                    }
-                                    Err(e2) => {
-                                        warn!("Opus 解码与 PLC 均失败: {}", e2);
-                                        continue;
-                                    }
+            self.diag_and_drift();
+        }
+    }
+
+    /// 处理一条下行消息（Audio/Flush）。
+    async fn handle_msg(&mut self, msg: PlaybackMsg) {
+        match msg {
+            PlaybackMsg::Audio(opus) => {
+                self.stats.received += 1;
+                self.buf.observe_arrival(Instant::now());
+                let (pcm, used_plc) =
+                    match self.decoder.decode(&opus, self.grade != NetworkGrade::Good) {
+                        Ok(p) => (p, false),
+                        Err(e) => {
+                            self.stats.decoded_fail += 1;
+                            debug!("Opus 解码失败(len={}): {}", opus.len(), e);
+                            match self.decoder.decode(&[], false) {
+                                Ok(p) => {
+                                    self.stats.plc += 1;
+                                    (p, true)
+                                }
+                                Err(e2) => {
+                                    warn!("Opus 解码与 PLC 均失败: {}", e2);
+                                    return;
                                 }
                             }
-                        };
-                        if !used_plc {
-                            stats.decoded_ok += 1;
                         }
-                        stats.last_pcm_len = pcm.len();
-                        stats.last_needed = resampler.input_frames_next();
-                        out_samples.clear();
-                        resampler.process(&pcm, drift.ratio, &mut out_samples);
-                        stats.last_produced = out_samples.len();
-                        if out_samples.is_empty() {
-                            stats.zero_produced += 1;
-                        }
-                        let before = out.slots();
-                        write_samples(&mut out, &out_samples, output_rate, OUTPUT_RING_SAMPLES);
-                        stats.written += before.saturating_sub(out.slots()) as u64;
-                    }
-                    PlaybackMsg::Flush => buf.reset(),
-                    PlaybackMsg::Shutdown => break,
+                    };
+                if !used_plc {
+                    self.stats.decoded_ok += 1;
                 }
+                self.stats.last_pcm_len = pcm.len();
+                self.stats.last_needed = self.resampler.input_frames_next();
+                self.out_samples.clear();
+                self.resampler.process(&pcm, self.drift.ratio, &mut self.out_samples);
+                self.stats.last_produced = self.out_samples.len();
+                if self.out_samples.is_empty() {
+                    self.stats.zero_produced += 1;
+                }
+                let before = self.out.slots();
+                write_samples(
+                    &mut self.out,
+                    &self.out_samples,
+                    self.output_rate,
+                    OUTPUT_RING_SAMPLES,
+                );
+                self.stats.written += before.saturating_sub(self.out.slots()) as u64;
             }
+            PlaybackMsg::Flush => self.buf.reset(),
+            PlaybackMsg::Shutdown => {}
         }
+    }
 
-        if stats.flush_at.elapsed() >= Duration::from_secs(2) {
-            let cb = cb_count.swap(0, Ordering::Relaxed);
-            let cbs = cb_samples.swap(0, Ordering::Relaxed);
+    /// 每迭代执行：2s 诊断输出 + 500ms 漂移校正。
+    fn diag_and_drift(&mut self) {
+        if self.stats.flush_at.elapsed() >= Duration::from_secs(2) {
+            let cb = self.cb_count.swap(0, Ordering::Relaxed);
+            let cbs = self.cb_samples.swap(0, Ordering::Relaxed);
             debug!(
                 "播放诊断: 收帧={}, 解码成功={}, 失败={}, PLC={}, 写入={}, pcm={}, needed={}, 产出={}, 零产出={} | 回调={}次, 消费样本={}",
-                stats.received,
-                stats.decoded_ok,
-                stats.decoded_fail,
-                stats.plc,
-                stats.written,
-                stats.last_pcm_len,
-                stats.last_needed,
-                stats.last_produced,
-                stats.zero_produced,
+                self.stats.received,
+                self.stats.decoded_ok,
+                self.stats.decoded_fail,
+                self.stats.plc,
+                self.stats.written,
+                self.stats.last_pcm_len,
+                self.stats.last_needed,
+                self.stats.last_produced,
+                self.stats.zero_produced,
                 cb,
                 cbs
             );
-            stats = PlaybackStats::new();
+            self.stats = PlaybackStats::new();
         }
 
-        if last_drift.elapsed() >= DRIFT_PERIOD {
-            buf.update_target(Instant::now());
-            // 缓冲占用校正：占用高于目标 → 降低比率（放慢产出），反之升高。
-            let free = out.slots() as f64;
+        if self.last_drift.elapsed() >= DRIFT_PERIOD {
+            self.buf.update_target(Instant::now());
+            // 缓冲占用校正：占用高 → 降低比率（放慢产出），反之升高。
+            let free = self.out.slots() as f64;
             let cap = OUTPUT_RING_SAMPLES as f64;
-            let occupancy_ms = ((cap - free) / output_rate as f64) * 1000.0;
-            let target_ms = buf.target_ms() as f64;
+            let occupancy_ms = ((cap - free) / self.output_rate as f64) * 1000.0;
+            let target_ms = self.buf.target_ms() as f64;
             if target_ms > 0.0 {
                 let err_ppm = ((occupancy_ms - target_ms) / target_ms) * 1e6 * 0.5;
-                drift.move_toward(err_ppm.clamp(-MAX_DRIFT_PPM, MAX_DRIFT_PPM));
+                self.drift.move_toward(err_ppm.clamp(-MAX_DRIFT_PPM, MAX_DRIFT_PPM));
             }
-            last_drift = Instant::now();
+            self.last_drift = Instant::now();
         }
     }
 }
@@ -870,7 +889,7 @@ fn write_samples(
 ) {
     let free = out.slots();
     let occupancy_ms = ((capacity - free) as f64 / output_rate as f64) * 1000.0;
-    // 硬同步：占用超 280ms 时本轮整体丢弃，让缓冲自然回落。
+    // 占用超 280ms 时整体丢弃本轮，让缓冲自然回落。
     if occupancy_ms > 280.0 {
         return;
     }

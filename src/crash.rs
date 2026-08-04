@@ -1,8 +1,5 @@
 //! Windows 未处理异常过滤器：捕获原生崩溃（访问冲突等），
 //! 将异常码、出错地址与所在模块写入 `xiaozhi-crash.log`。
-//!
-//! Rust panic 不经过此路径（由全局 panic 钩子处理）；只有 C/原生层
-//! 段错误/访问冲突会触发这里。用于定位 cpal/WASAPI、opus FFI 等原生崩溃。
 
 #![cfg(windows)]
 
@@ -31,7 +28,6 @@ unsafe extern "system" fn crash_handler(ep: *const EXCEPTION_POINTERS) -> i32 {
                     "CRASH ExceptionCode=0x{:08x} at 0x{:x}",
                     er.ExceptionCode, addr
                 ));
-                // 出错地址所在模块（HMODULE 即模块基址，可算偏移）。
                 let mut hmod: windows_sys::Win32::Foundation::HMODULE = std::ptr::null_mut();
                 GetModuleHandleExA(
                     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,

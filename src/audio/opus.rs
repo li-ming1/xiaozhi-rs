@@ -1,9 +1,5 @@
-//! Opus 编解码：opusic-sys 内置绑定（bundled，构建期用 cmake 编译 libopus 静态链接）。
-//!
-//! 编码器固定 16kHz/单声道/60ms（官方上行标准）；解码器采样率可配置
-//! （下行服从服务器 hello.audio_params，支持 16/24/48kHz）。
-//! 不再动态加载外部 opus 库：libopus 由 opusic-sys 的 bundled 特性在构建期
-//! 通过 cmake 源码编译并直接静态链接进可执行文件，运行时无需部署 opus dll。
+//! Opus 编解码：opusic-sys 内置绑定（bundled，构建期 cmake 静态链接）。
+//! 编码固定 16kHz/单声道/60ms；解码采样率服从服务器 hello.audio_params（16/24/48kHz）。
 
 use log::{debug, info, warn};
 use opusic_sys::{
@@ -24,16 +20,13 @@ pub(crate) const OPUS_CALL_ENCODE: u8 = 1;
 pub(crate) const OPUS_CALL_DECODE: u8 = 2;
 pub(crate) const OPUS_CALL_CTL: u8 = 3;
 pub(crate) const OPUS_CALL_DESTROY: u8 = 4;
-/// 崩溃诊断：最近一次 opus_encoder_ctl 的请求号。
 pub(crate) static LAST_OPUS_CTL_REQUEST: AtomicU32 = AtomicU32::new(0);
-/// 进程级：内置库版本信息只打印一次（编码器/解码器各实例化一次，避免刷屏）。
+/// 进程级：内置库版本信息只打印一次。
 static OPUS_LIB_INFO_ONCE: Once = Once::new();
 
 use crate::error::{Result, VoiceError};
 
-/// 上行采样率（官方固定）。
 pub const ENCODER_RATE: u32 = 16000;
-/// 上行帧长 60ms（官方标准）。
 pub const FRAME_MS: u32 = 60;
 /// 编码帧样本数（60ms @ 16k）。
 pub const ENCODER_FRAME_SIZE: usize = (ENCODER_RATE as usize * FRAME_MS as usize) / 1000;
@@ -41,9 +34,8 @@ const MAX_PACKET_SIZE: usize = 1500;
 /// 解码最大输出（60ms @ 48k 单声道）。
 const DECODE_MAX_SAMPLES: usize = 48_000 / 1000 * 60;
 
-// opus_encoder_ctl 在 opusic-sys 中是 C 变参函数（`...`），stable Rust 无法直接调用；
-// 这里按固定 3 参数重新声明同一符号（x86-64/ARM64 调用约定下与变参调用 ABI 兼容，
-// 是本项目仅使用的一类请求：3 参数 ctl）。
+// opus_encoder_ctl 是 C 变参函数（`...`），stable Rust 无法直接调用；
+// 这里按固定 3 参数重新声明同一符号（本项目仅使用 3 参数 ctl 请求）。
 unsafe extern "C" {
     #[link_name = "opus_encoder_ctl"]
     fn opus_encoder_ctl_fixed(st: *mut OpusEncoder, request: c_int, arg: c_int) -> c_int;
@@ -52,11 +44,11 @@ unsafe extern "C" {
 /// 网络质量分级，驱动编码策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkGrade {
-    /// 良好：32kbps VBR / FEC off / DTX off。
+    /// 32kbps VBR / FEC off / DTX off。
     Good,
-    /// 中等弱网：28kbps + FEC。
+    /// 28kbps + FEC。
     Fair,
-    /// 严重弱网：20kbps constrained-VBR / FEC / DTX。
+    /// 20kbps constrained-VBR / FEC / DTX。
     Poor,
 }
 
@@ -65,14 +57,12 @@ pub struct OpusCodec {
     decoder: *mut OpusDecoder,
     encode_buf: Vec<u8>,
     decode_buf: Vec<f32>,
-    /// 当前网络分级。
     grade: NetworkGrade,
 }
 
 unsafe impl Send for OpusCodec {}
 unsafe impl Sync for OpusCodec {}
 
-/// 打印内置 libopus 版本（进程级一次）。
 fn log_opus_version() {
     OPUS_LIB_INFO_ONCE.call_once(|| {
         let v = unsafe { opus_get_version_string() };
@@ -131,9 +121,6 @@ impl OpusCodec {
     }
 
     /// 按网络分级调整编码参数（32/28/20kbps + FEC/DTX）。
-    ///
-    /// libopus 已由 opusic-sys 静态内置（bundled），`opus_encoder_ctl` 采用
-    /// libopus 官方请求号，运行时调整安全，无历史 opus.dll 崩溃问题。
     pub fn set_network_grade(&mut self, grade: NetworkGrade) {
         if self.grade == grade {
             return;
@@ -206,8 +193,7 @@ impl OpusCodec {
         Ok(self.encode_buf[..len as usize].to_vec())
     }
 
-    /// 解码 Opus 包为 f32 PCM（长度随帧时长与采样率变化）。
-    /// `input` 为空时执行 PLC；`fec` 为 true 时尝试带内 FEC 前向错误恢复。
+    /// 解码 Opus 包为 f32 PCM。`input` 为空时执行 PLC；`fec` 为 true 时尝试带内 FEC 恢复。
     pub fn decode(&mut self, input: &[u8], fec: bool) -> Result<Vec<f32>> {
         LAST_OPUS_CALL.store(OPUS_CALL_DECODE, Ordering::Relaxed);
         let samples = if input.is_empty() {
@@ -257,7 +243,6 @@ impl Drop for OpusCodec {
     }
 }
 
-/// 将 opus 返回码转换为可读错误描述。
 fn opus_error_desc(code: c_int) -> String {
     let s = unsafe { opus_strerror(code) };
     if s.is_null() {

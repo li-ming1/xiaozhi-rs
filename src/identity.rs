@@ -35,16 +35,17 @@ struct EfuseData {
     activation_status: bool,
 }
 
-/// 字节数组转十六进制（替代 hex crate）。
 fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        let _ = write!(s, "{:02x}", b);
-        s
-    })
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
 }
 
-/// 应用配置目录（跨平台，替代 directories crate）：
+/// 应用配置目录（跨平台）：
 /// Windows `%APPDATA%\xiaozhi-rs`；macOS `~/Library/Application Support/xiaozhi-rs`；
 /// Linux `$XDG_CONFIG_HOME/xiaozhi-rs` 或 `~/.config/xiaozhi-rs`。
 fn app_config_dir() -> PathBuf {
@@ -79,7 +80,6 @@ fn app_config_dir() -> PathBuf {
     }
 }
 
-/// 主机名（跨平台，替代 hostname crate；仅用于首次生成 HMAC 密钥并固化）。
 fn hostname_str() -> String {
     #[cfg(windows)]
     {
@@ -104,7 +104,7 @@ fn hostname_str() -> String {
 }
 
 impl DeviceIdentity {
-    /// 定位配置目录（`%APPDATA%\xiaozhi-rs\efuse.json`），存在则加载，否则生成并落盘。
+    /// 定位配置目录，存在则加载，否则生成并落盘。
     pub fn load_or_create() -> Result<Self> {
         let config_dir = app_config_dir();
 
@@ -118,7 +118,6 @@ impl DeviceIdentity {
         }
     }
 
-    /// 从文件加载；文件空/损坏则重建。
     fn load_from_file(efuse_path: &Path) -> Result<Self> {
         let content = fs::read_to_string(efuse_path)?;
 
@@ -131,14 +130,12 @@ impl DeviceIdentity {
             Err(_) => return Self::create_new(efuse_path),
         };
 
-        // 持久化 client_id 优先；缺失时补一个 UUID（旧文件迁移场景）。
         let client_id_missing = data.client_id.is_empty();
         let client_id = if client_id_missing {
             Uuid::new_v4().to_string()
         } else {
             data.client_id
         };
-        // mac_address 缺失则派生本地 MAC，否则复用持久值。
         let device_id = if data.mac_address.is_empty() {
             Self::generate_mac_address()
         } else {
@@ -156,8 +153,7 @@ impl DeviceIdentity {
             efuse_path: efuse_path.to_path_buf(),
         };
 
-        // 补出的 client_id 必须落盘：否则每次启动都会生成不同 UUID，
-        // 且文件里始终看不到该字段。
+        // 补出的 client_id 必须落盘，否则每次启动都会生成不同 UUID。
         if client_id_missing {
             identity.save()?;
             info!("已为设备身份补齐 client_id: {}", identity.client_id);
@@ -174,12 +170,11 @@ impl DeviceIdentity {
         let device_id = Self::generate_mac_address();
         let client_id = Uuid::new_v4().to_string();
 
-        // 序列号 = SN-{hash[:8]}-{mac_clean}
+        // 序列号 = SN-{hash[:8]}-{mac_clean}；HMAC 密钥绑定主机名，防止凭证跨机复用。
         let mac_clean = device_id.replace(":", "").to_lowercase();
         let hash = to_hex(&Sha256::digest(mac_clean.as_bytes()));
         let serial_number = format!("SN-{}-{}", hash[..8].to_uppercase(), mac_clean);
 
-        // HMAC 密钥绑定主机名+设备+客户端，防止凭证跨机复用。
         let hostname = hostname_str();
         let hmac_input = format!("{}||{}||{}", hostname, device_id, client_id);
         let hmac_key = to_hex(&Sha256::digest(hmac_input.as_bytes()));
@@ -216,7 +211,7 @@ impl DeviceIdentity {
         self.activation_status
     }
 
-    /// 以 HMAC-SHA256 对挑战码签名（SimpleHmac 适配实现 Digest 的哈希）。
+    /// 以 HMAC-SHA256 对挑战码签名。
     pub fn generate_hmac_signature(&self, challenge: &str) -> String {
         use hmac::{KeyInit, Mac, SimpleHmac};
         type HmacSha256 = SimpleHmac<Sha256>;

@@ -1,17 +1,9 @@
-//! 播放缓冲目标深度控制。
-//!
-//! 自适应目标深度（重构方案）：
-//! - 初始 60ms；目标 = clamp(40ms + 4 × jitter_EWMA, 40, 240)；
-//! - 增长立即生效；稳定 30s 后每次下降一帧；
-//! - 物理容量 320ms，超限丢最旧帧。
+//! 播放缓冲目标深度控制：目标 = clamp(40ms + 4×jitter_EWMA, 40, 240)，增长即时、稳定后下降。
 
 use std::time::Instant;
 
-/// 初始目标深度。
 pub const INITIAL_TARGET_MS: u64 = 60;
-/// 目标下限。
 pub const TARGET_MIN_MS: u64 = 40;
-/// 目标上限。
 pub const TARGET_MAX_MS: u64 = 240;
 /// 目标稳定多久后开始下降。
 pub const SHRINK_STABLE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
@@ -36,13 +28,12 @@ impl PlaybackBuffer {
         }
     }
 
-    /// 记录一次帧到达（用于 jitter EWMA）。
+    /// 记录一次帧到达（用于 jitter EWMA，α=0.1）。
     pub fn observe_arrival(&mut self, now: Instant) {
         if let Some(prev) = self.last_arrival {
             let dt = now.duration_since(prev).as_secs_f64() * 1000.0;
             let expected = self.frame_ms as f64;
             let dev = (dt - expected).abs();
-            // 指数加权，α=0.1。
             self.jitter_ewma_ms = if self.jitter_ewma_ms == 0.0 {
                 dev
             } else {
@@ -57,12 +48,11 @@ impl PlaybackBuffer {
         let desired = (TARGET_MIN_MS as f64 + 4.0 * self.jitter_ewma_ms) as u64;
         let desired = desired.clamp(TARGET_MIN_MS, TARGET_MAX_MS);
         if desired > self.target_ms {
-            // 增长立即生效。
             self.target_ms = desired;
             self.stable_since = None;
-        } else if self.stable_since.is_none() {
-            self.stable_since = Some(now);
-        } else if now.duration_since(self.stable_since.unwrap()) >= SHRINK_STABLE_DURATION {
+        } else if let Some(since) = self.stable_since
+            && now.duration_since(since) >= SHRINK_STABLE_DURATION
+        {
             // 稳定足够久，每次下降一帧。
             let frame = self.frame_ms.max(1);
             if self.target_ms > TARGET_MIN_MS && self.target_ms >= desired + frame {
@@ -99,7 +89,6 @@ mod tests {
     fn target_clamps_and_grows_immediately() {
         let mut b = PlaybackBuffer::new(60);
         let now = Instant::now();
-        // 注入大 jitter：每次到达偏离 100ms。
         for _ in 0..20 {
             let t = now + std::time::Duration::from_millis(60 + 100);
             b.observe_arrival(t);
