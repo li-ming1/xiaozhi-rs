@@ -1,5 +1,5 @@
 //! 线上 JSON 消息协议（WebSocket 与 MQTT 共用）。
-//! 关键约定：WS hello `version=1`、MQTT `version=3`；上行 `frame_duration=60`ms、`sample_rate=16000`。
+//! 关键约定：WS hello `version=2`（BinaryProtocol2）、MQTT `version=3`；上行 `frame_duration=60`ms、`sample_rate=16000`。
 
 use serde::{Deserialize, Serialize};
 

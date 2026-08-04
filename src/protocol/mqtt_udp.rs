@@ -223,6 +223,8 @@ async fn send_loop(
             }
             audio = audio_rx.take() => {
                 local_sequence = local_sequence.wrapping_add(1);
+                // build_iv 仅覆写 payload_len/timestamp/sequence；
+                // type_/flags/ssrc 区保留服务器 base_nonce（官方协议约定，发送时忽略本构造值）。
                 let hdr = UdpAudioHeader {
                     type_: TYPE_AUDIO,
                     flags: 0,

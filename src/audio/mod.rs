@@ -288,7 +288,8 @@ where
     T: FromSample<f32> + SizedSample + Copy + Send + 'static,
 {
     let mut underrun = Underrun::new(ramp_len);
-    // cb_samples 由回调本地累积，批量提交原子（每 ~10ms 一次 fetch_add，避免每样本原子操作）。
+    // cb_samples 由回调本地累积，批量提交原子（每累计 960 样本一次 fetch_add，
+    // 约 10-20ms @96/48kHz，避免每样本原子操作）。
     let mut local_cb: u64 = 0;
     let stream = device
         .build_output_stream(
@@ -529,19 +530,36 @@ impl Agc {
 }
 
 /// 语音活动检测：静音帧不编码不上行，降低背景噪声对服务器 VAD/ASR 干扰。
-/// 自适应噪声底 + 滞回 + hangover 1.2s（宁多勿漏，避免吞字）。
+/// 防误触设计：
+/// 1. 触发防抖——连续 2 帧超阈值才进入语音（过滤点击/碰撞等 <120ms 瞬态噪声）。
+/// 2. 自适应噪声底——非语音段持续学习，持续底噪会把触发阈值推高到噪声之上。
+/// 3. 能量钳制——语音态若连续 2s 无强音（≥ -52dBFS）则判为噪声误触发，立即释放并重估噪声底，
+///    避免环境声把客户端卡在"说话态"。
+/// 4. 滞回 + hangover 0.72s——尾随防切词（宁多勿漏，避免吞字）。
 struct Vad {
     speech: bool,
+    /// 连续超阈值帧数（触发防抖计数）。
+    on_count: u32,
     hangover: u32,
-    /// 噪声底估计（EMA，仅静音段更新）。
+    /// 语音态内连续无强音的帧数（能量钳制计数）。
+    low_speech_run: u32,
+    /// 噪声底估计（EMA，非语音段更新）。
     noise_floor: f32,
     /// 触发阈值缩放系数（= 10^(8dB/20)，预计算避免每帧 powf）。
     on_scale: f32,
     /// 释放阈值缩放系数（= 10^(4dB/20)）。
     off_scale: f32,
-    /// 语音结束后的尾随帧数（1.2s @ 60ms）。
+    /// 语音结束后的尾随帧数（0.72s @ 60ms）。
     hangover_frames: u32,
+    /// 进入语音态所需连续超阈帧数（120ms @ 60ms）。
+    on_confirm_frames: u32,
+    /// 能量钳制：语音态连续超过该帧数仍无强音则释放（2s @ 60ms）。
+    force_release_frames: u32,
+    /// 视为"强音"的最小 RMS（≈ -52dBFS，正常语音的音素能量必然周期性超过）。
+    speech_min_rms: f32,
+    /// 触发阈值绝对下限（≈ -68dBFS，噪声底收敛前保证不因阈值过低误触发）。
     min_on: f32,
+    /// 释放阈值绝对下限（≈ -74dBFS，语音尾音不被提前切掉）。
     min_off: f32,
 }
 
@@ -549,13 +567,18 @@ impl Vad {
     fn new() -> Self {
         Self {
             speech: false,
+            on_count: 0,
             hangover: 0,
+            low_speech_run: 0,
             // 初始噪声底取很低值（-80dBFS），使触发阈值从一开始就是
             // 绝对下限 min_on，启动后即使立刻说话也不会被吞。
             noise_floor: 0.0001,
             on_scale: 10f32.powf(8.0 / 20.0),
             off_scale: 10f32.powf(4.0 / 20.0),
-            hangover_frames: 20,
+            hangover_frames: 12,
+            on_confirm_frames: 2,
+            force_release_frames: 34,
+            speech_min_rms: 0.0025,
             min_on: 0.0004,
             min_off: 0.0002,
         }
@@ -566,22 +589,47 @@ impl Vad {
         let on = (self.noise_floor * self.on_scale).max(self.min_on);
         let off = (self.noise_floor * self.off_scale).max(self.min_off);
         if self.speech {
+            // 能量钳制：长时无强音判为噪声误触发，释放并重估底噪。
+            if rms >= self.speech_min_rms {
+                self.low_speech_run = 0;
+            } else {
+                self.low_speech_run += 1;
+                if self.low_speech_run >= self.force_release_frames {
+                    self.speech = false;
+                    self.hangover = 0;
+                    self.low_speech_run = 0;
+                    self.noise_floor = self.noise_floor * 0.5 + rms * 0.5;
+                    return false;
+                }
+            }
             if rms < off {
                 self.hangover += 1;
                 if self.hangover >= self.hangover_frames {
                     self.speech = false;
                     self.hangover = 0;
+                    self.low_speech_run = 0;
                 }
             } else {
                 self.hangover = 0;
             }
-        } else if rms >= on {
-            self.speech = true;
-            self.hangover = 0;
-        } else {
-            // 静音段慢跟噪声底（仅低电平观测进入，避免语音污染）。
-            self.noise_floor = self.noise_floor * 0.98 + rms * 0.02;
+            return self.speech;
         }
+        // 非语音段：触发需要连续 on_confirm_frames 帧超阈值（滤瞬态噪声）。
+        if rms >= on {
+            self.on_count += 1;
+            if self.on_count >= self.on_confirm_frames {
+                self.speech = true;
+                self.on_count = 0;
+                self.hangover = 0;
+                self.low_speech_run = 0;
+            }
+        } else {
+            self.on_count = 0;
+        }
+        // 非语音段总是更新噪声底：持续高电平环境噪声会把阈值推高，
+        // 自适应解除误触发；待确认帧用慢速，避免语音开头污染底噪。
+        let rate = if rms >= on { 0.02 } else { 0.05 };
+        self.noise_floor = self.noise_floor * (1.0 - rate) + rms * rate;
         self.speech
     }
 }
@@ -738,14 +786,22 @@ impl CaptureWorker {
                 0.0
             };
             let db = if rms > 1e-9 { 20.0 * rms.log10() } else { -120.0 };
+            let nf_db = 20.0 * self.vad.noise_floor.max(1e-9).log10();
+            let on_db = (self.vad.noise_floor * self.vad.on_scale)
+                .max(self.vad.min_on)
+                .max(1e-9)
+                .log10()
+                * 20.0;
             debug!(
-                "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 编码帧={} (语音{} 静音{}), AGC增益={:.1}x",
+                "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 编码帧={} (语音{} 静音{}), AGC增益={:.1}x, 噪声底={:.1}dBFS, 触发阈值={:.1}dBFS",
                 db,
                 self.stats.samples,
                 self.stats.frames,
                 self.stats.speech_frames,
                 self.stats.silence_frames,
-                self.stats.agc_gain
+                self.stats.agc_gain,
+                nf_db,
+                on_db
             );
             self.stats.reset();
         }
@@ -1031,8 +1087,9 @@ mod tests {
         let mut vad = Vad::new();
         // 静音（-80dBFS）不触发。
         assert!(!vad.decide(0.0001));
-        // 语音（-45dBFS）立即触发。
-        assert!(vad.decide(0.0056));
+        // 语音（-45dBFS）连续 2 帧触发（防抖）。
+        assert!(!vad.decide(0.0056), "防抖第一帧不应立即触发");
+        assert!(vad.decide(0.0056), "防抖第二帧应触发");
         // 词间停顿（-50dBFS，仍高于释放阈值）不释放。
         assert!(vad.decide(0.003));
         // 尾随：刚进入静音时仍发送（hangover 防切词）。
@@ -1046,7 +1103,8 @@ mod tests {
             }
         }
         assert!(released, "持续静音未释放");
-        // 释放后新语音再次触发。
+        // 释放后新语音再次触发（仍需防抖 2 帧）。
+        assert!(!vad.decide(0.0056));
         assert!(vad.decide(0.0056));
     }
 
@@ -1054,7 +1112,34 @@ mod tests {
     fn vad_does_not_swallow_soft_speech_at_startup() {
         // 启动即说话（-55dBFS），阈值应从 min_on 起步，不应吞帧。
         let mut vad = Vad::new();
+        assert!(!vad.decide(0.0018), "防抖第一帧等待确认");
         assert!(vad.decide(0.0018), "启动即说话被 VAD 吞掉");
+    }
+
+    #[test]
+    fn vad_ignores_single_frame_transients() {
+        // 单帧高电平（键盘敲击/鼠标点击类瞬态）不应触发语音。
+        let mut vad = Vad::new();
+        for _ in 0..20 {
+            assert!(!vad.decide(0.0003)); // -70dBFS 环境静音，建立底噪
+        }
+        assert!(!vad.decide(0.01), "单帧瞬态噪声误触发");
+        assert!(!vad.decide(0.0003), "瞬态后未回到静音");
+    }
+
+    #[test]
+    fn vad_releases_when_stuck_on_low_level_noise() {
+        // 持续 -60dBFS 环境噪声：可能短暂触发，但无强音应在钳制窗口内自动释放，
+        // 且释放后噪声底抬高，底噪不再误触发。
+        let mut vad = Vad::new();
+        let mut any_speech = false;
+        for _ in 0..(vad.force_release_frames + 10) {
+            any_speech |= vad.decide(0.001);
+        }
+        assert!(any_speech, "低电平噪声应短暂触发过（用于验证钳制）");
+        for _ in 0..10 {
+            assert!(!vad.decide(0.001), "钳制释放后底噪仍误触发");
+        }
     }
 
     /// 单次调整受速率限制（≤50ppm/s × 最小采样间隔 1ms = 0.05ppm）。
