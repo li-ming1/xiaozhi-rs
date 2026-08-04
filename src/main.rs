@@ -150,7 +150,7 @@ async fn run_client(skip_activation: bool, shutdown: CancellationToken) -> Resul
 
     let mut identity = DeviceIdentity::load_or_create()?;
     if skip_activation {
-        identity.device_id = DeviceIdentity::get_test_mac_address();
+        identity.device_id = DeviceIdentity::TEST_MAC.to_string();
         info!("使用测试 MAC 地址: {}", identity.device_id);
     }
 
@@ -174,31 +174,24 @@ async fn ensure_activated(
     }
 
     const MAX_RETRIES: u32 = 5;
-    let mut retry_count = 0;
-
-    while retry_count < MAX_RETRIES {
-        if let Some(activation_data) = &ota_config.activation {
-            retry_count += 1;
-            info!("设备需要激活（尝试 {}/{}）", retry_count, MAX_RETRIES);
-            info!("请访问 https://xiaozhi.me/ 输入激活码：{}", activation_data.code);
-
-            match xiaozhi_rs::ota::wait_for_activation(identity, &activation_data.challenge).await {
-                Ok(_) => {
-                    info!("激活成功！");
-                    identity.set_activated()?;
-                    return Ok(ota_config);
-                }
-                Err(e) => {
-                    if retry_count < MAX_RETRIES {
-                        info!("激活码已过期，正在重新获取...");
-                        ota_config = xiaozhi_rs::ota::fetch_config(identity).await?;
-                    } else {
-                        return Err(anyhow::anyhow!("激活失败，已达到最大重试次数: {}", e));
-                    }
-                }
-            }
-        } else {
+    for attempt in 1..=MAX_RETRIES {
+        let Some(activation_data) = &ota_config.activation else {
             return Ok(ota_config);
+        };
+        info!("设备需要激活（尝试 {}/{}）", attempt, MAX_RETRIES);
+        info!("请访问 https://xiaozhi.me/ 输入激活码：{}", activation_data.code);
+
+        match xiaozhi_rs::ota::wait_for_activation(identity, &activation_data.challenge).await {
+            Ok(_) => {
+                info!("激活成功！");
+                identity.set_activated()?;
+                return Ok(ota_config);
+            }
+            Err(_) if attempt < MAX_RETRIES => {
+                info!("激活码已过期，正在重新获取...");
+                ota_config = xiaozhi_rs::ota::fetch_config(identity).await?;
+            }
+            Err(e) => return Err(anyhow::anyhow!("激活失败，已达到最大重试次数: {}", e)),
         }
     }
     Ok(ota_config)

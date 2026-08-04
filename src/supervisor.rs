@@ -239,10 +239,7 @@ impl VoiceSupervisor {
                 heartbeat = Instant::now();
             }
             self.state = match self.state {
-                State::SelectTransport => {
-                    self.select_transport();
-                    State::Connect
-                }
+                State::SelectTransport => State::Connect,
                 State::Connect => match self.connect().await {
                     Ok(()) => State::Streaming,
                     Err(e) => {
@@ -284,15 +281,6 @@ impl VoiceSupervisor {
         self.ota.mqtt.is_some() && !self.mqtt_circuit.is_open()
     }
 
-    /// 选择传输：MQTT+UDP 优先（未熔断），否则 WebSocket。
-    fn select_transport(&mut self) {
-        if self.mqtt_available() {
-            info!("选择传输: MQTT+UDP（主链路）");
-        } else {
-            info!("选择传输: WebSocket（回退）");
-        }
-    }
-
     fn current_transport_kind(&self) -> TransportKind {
         if self.mqtt_available() {
             TransportKind::MqttUdp
@@ -322,8 +310,15 @@ impl VoiceSupervisor {
 
     /// 建连 + 协商。句柄存入 `self.handles`，由 Streaming 状态取用。
     async fn connect(&mut self) -> Result<()> {
-        let params = self.build_params();
         let kind = self.current_transport_kind();
+        info!(
+            "选择传输: {}",
+            match kind {
+                TransportKind::MqttUdp => "MQTT+UDP（主链路）",
+                TransportKind::WebSocket => "WebSocket（回退）",
+            }
+        );
+        let params = self.build_params();
         if kind == TransportKind::MqttUdp
             && let Some(m) = &params.mqtt
         {
@@ -382,27 +377,19 @@ impl VoiceSupervisor {
             _ => "WebSocket",
         });
 
-        let mut ctx = SessionCtx::new();
-        let mut last_audio = Instant::now();
-        let mut loss = LossEstimator::new();
-        let mut last_grade_check = Instant::now();
-        let mut downlink_frames: u64 = 0;
-        let mut downlink_diag = Instant::now();
-        let mut first_frame_logged = false;
-        let mut tick = tokio::time::interval(Duration::from_millis(250));
-        tick.reset(); // 首个 tick 延迟一个周期。
-
+        let mut s = StreamSession::new();
         let result = loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break Ok(()),
-                _ = tick.tick() => {
+                _ = s.tick.tick() => {
                     // UDP 黑洞检测（仅 MQTT+UDP）：首包 10s 无媒体，或中途断流 3s。
-                    if kind == TransportKind::MqttUdp && ctx.tts_active {
+                    if kind == TransportKind::MqttUdp && s.ctx.tts_active {
                         let now = Instant::now();
-                        let blackhole = if ctx.sentence_has_media {
-                            last_audio.elapsed() >= Duration::from_secs(3)
+                        let blackhole = if s.ctx.sentence_has_media {
+                            s.last_audio.elapsed() >= Duration::from_secs(3)
                         } else {
-                            ctx.tts_started_at
+                            s.ctx
+                                .tts_started_at
                                 .map(|t| now.duration_since(t) >= Duration::from_secs(10))
                                 .unwrap_or(false)
                         };
@@ -411,14 +398,14 @@ impl VoiceSupervisor {
                             break Err(VoiceError::Transport("UDP 黑洞".into()));
                         }
                     }
-                    if downlink_diag.elapsed() >= Duration::from_secs(2) {
-                        debug!("下行诊断: 收到服务器音频帧 {}", downlink_frames);
-                        downlink_frames = 0;
-                        downlink_diag = Instant::now();
+                    if s.downlink_diag.elapsed() >= Duration::from_secs(2) {
+                        debug!("下行诊断: 收到服务器音频帧 {}", s.downlink_frames);
+                        s.downlink_frames = 0;
+                        s.downlink_diag = Instant::now();
                     }
                     // 网络分级（10s 窗口）：下发捕获侧（编码策略）与播放侧（FEC 解码）。
-                    if last_grade_check.elapsed() >= Duration::from_secs(10) {
-                        let grade = loss.grade;
+                    if s.last_grade_check.elapsed() >= Duration::from_secs(10) {
+                        let grade = s.loss.grade;
                         if let Some(a) = self.audio.as_ref() {
                             if let Some(tx) = a.grade_sender() {
                                 let _ = tx.send(grade).await;
@@ -427,31 +414,31 @@ impl VoiceSupervisor {
                                 let _ = tx.send(grade).await;
                             }
                         }
-                        last_grade_check = Instant::now();
+                        s.last_grade_check = Instant::now();
                     }
                 }
                 incoming = handles.incoming_rx.recv() => {
                     match incoming {
                         Some(IncomingEvent::Json(msg)) => {
-                            match handle_json(msg, &mut ctx, self.audio.as_ref()).await {
+                            match handle_json(msg, &mut s.ctx, self.audio.as_ref()).await {
                                 Ok(Some(())) => break Ok(()),   // goodbye
                                 Ok(None) => {}
                                 Err(e) => break Err(e),
                             }
                         }
                         Some(IncomingEvent::Audio(data)) => {
-                            last_audio = Instant::now();
-                            ctx.sentence_has_media = true;
-                            if !first_frame_logged {
-                                first_frame_logged = true;
+                            s.last_audio = Instant::now();
+                            s.ctx.sentence_has_media = true;
+                            if !s.first_frame_logged {
+                                s.first_frame_logged = true;
                                 let hex: Vec<String> =
                                     data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
                                 debug!("下行首帧 hex (len={}): {}", data.len(), hex.join(" "));
                             }
-                            downlink_frames += 1;
+                            s.downlink_frames += 1;
                             // 丢包估计仅对 UDP 有意义（TCP 可靠传输，间隙是服务器停顿而非丢包）。
                             if kind == TransportKind::MqttUdp {
-                                loss.observe_frame(Instant::now());
+                                s.loss.observe_frame(Instant::now());
                             }
                             if let Some(tx) = self.audio.as_ref().and_then(|a| a.playback_sender())
                                 && let Err(e) = tx.send(PlaybackMsg::Audio(data)).await
@@ -517,6 +504,14 @@ impl VoiceSupervisor {
     }
 }
 
+/// topic 归一化：服务器可能下发 "null"/空 字符串，统一回退到缺省值。
+fn effective_topic(t: &Option<String>, default: &str) -> String {
+    t.as_deref()
+        .filter(|s| !s.is_empty() && *s != "null")
+        .map(str::to_string)
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// 由 OTA 配置推导 MQTT 参数。关键规则（与官方一致）：
 /// client_id 用服务器下发值；端点无端口时默认 8883(TLS)；subscribe_topic 为 "null"/空 时回退为发布同主题。
 fn derive_mqtt(m: &OtaMqttConfig, ws_url: &str, client_id: &str) -> MqttParams {
@@ -541,16 +536,8 @@ fn derive_mqtt(m: &OtaMqttConfig, ws_url: &str, client_id: &str) -> MqttParams {
     };
 
     // 服务器可能下发 "null"/空 字符串：按缺省处理。
-    let publish_topic = m
-        .publish_topic
-        .clone()
-        .filter(|s| !s.is_empty() && s != "null")
-        .unwrap_or_else(|| "device-server".to_string());
-    let subscribe_topic = m
-        .subscribe_topic
-        .clone()
-        .filter(|s| s != "null" && !s.is_empty())
-        .unwrap_or_else(|| publish_topic.clone());
+    let publish_topic = effective_topic(&m.publish_topic, "device-server");
+    let subscribe_topic = effective_topic(&m.subscribe_topic, &publish_topic);
 
     MqttParams {
         host,
@@ -578,6 +565,35 @@ impl SessionCtx {
             tts_active: false,
             sentence_has_media: false,
             tts_started_at: None,
+        }
+    }
+}
+
+/// 流式会话状态（每次建流重建）：TTS/媒体跟踪、丢包估计、诊断计时。
+struct StreamSession {
+    ctx: SessionCtx,
+    loss: LossEstimator,
+    last_audio: Instant,
+    last_grade_check: Instant,
+    downlink_frames: u64,
+    downlink_diag: Instant,
+    first_frame_logged: bool,
+    tick: tokio::time::Interval,
+}
+
+impl StreamSession {
+    fn new() -> Self {
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        tick.reset(); // 首个 tick 延迟一个周期。
+        Self {
+            ctx: SessionCtx::new(),
+            loss: LossEstimator::new(),
+            last_audio: Instant::now(),
+            last_grade_check: Instant::now(),
+            downlink_frames: 0,
+            downlink_diag: Instant::now(),
+            first_frame_logged: false,
+            tick,
         }
     }
 }

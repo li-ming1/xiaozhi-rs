@@ -110,19 +110,17 @@ impl<T> LatestSlot<T> {
             self.notify.notified().await;
         }
     }
+
+    /// 成对产生发送端与接收端（共享同一底层槽）。
+    pub fn pipe(self) -> (LatestSlot<T>, LatestSlot<T>) {
+        let tx = self.clone();
+        (tx, self)
+    }
 }
 
 impl<T> Default for LatestSlot<T> {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl<T> LatestSlot<T> {
-    /// 成对产生发送端与接收端（共享同一底层槽）。
-    pub fn pipe(self) -> (LatestSlot<T>, LatestSlot<T>) {
-        let tx = self.clone();
-        (tx, self)
     }
 }
 

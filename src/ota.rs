@@ -56,6 +56,25 @@ pub struct ActivationData {
     pub authorization_url: Option<String>,
 }
 
+/// 脱敏 OTA 响应：websocket.token 与 mqtt 密码字段以 `***` 替代，供日志打印。
+fn mask_sensitive(mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(ws) = v
+        .get_mut("websocket")
+        .and_then(|w| w.as_object_mut())
+        && let Some(t) = ws.get_mut("token")
+    {
+        *t = serde_json::Value::String("***".into());
+    }
+    if let Some(mq) = v.get_mut("mqtt").and_then(|m| m.as_object_mut()) {
+        for key in ["password", "pwd", "secret"] {
+            if let Some(v) = mq.get_mut(key) {
+                *v = serde_json::Value::String("***".into());
+            }
+        }
+    }
+    v
+}
+
 /// 全局复用 HTTP 客户端（含连接池，避免重复 TLS 握手）。
 fn client() -> Result<&'static reqwest::Client> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -107,22 +126,7 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
     let text = response.text().await.context("读取 OTA 响应失败")?;
     // 打印脱敏原始响应，便于核对服务器实际返回的连接字段。
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-        let mut masked = v.clone();
-        if let Some(ws) = masked
-            .get_mut("websocket")
-            .and_then(|w| w.as_object_mut())
-            && let Some(t) = ws.get_mut("token")
-        {
-            *t = serde_json::Value::String("***".into());
-        }
-        if let Some(mq) = masked.get_mut("mqtt").and_then(|m| m.as_object_mut()) {
-            for key in ["password", "pwd", "secret"] {
-                if let Some(v) = mq.get_mut(key) {
-                    *v = serde_json::Value::String("***".into());
-                }
-            }
-        }
-        info!("OTA 响应(脱敏): {}", masked);
+        info!("OTA 响应(脱敏): {}", mask_sensitive(v));
     }
 
     // 完整 config 含 mqtt.password / websocket.token，任何日志级别都不应泄密。
@@ -160,6 +164,7 @@ pub async fn wait_for_activation(identity: &DeviceIdentity, challenge: &str) -> 
         if attempt > 1 {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
+        let remaining = (MAX_POLLS - attempt) * POLL_INTERVAL.as_secs() as u32;
 
         let response = client
             .post(&activate_url)
@@ -176,13 +181,11 @@ pub async fn wait_for_activation(identity: &DeviceIdentity, challenge: &str) -> 
                     return Ok(());
                 }
                 202 => {
-                    let remaining = (MAX_POLLS - attempt) * POLL_INTERVAL.as_secs() as u32;
                     info!("等待用户输入验证码...（剩余{}秒）", remaining);
                 }
                 status => warn!("服务器返回状态码: {}", status),
             },
             Err(_) => {
-                let remaining = (MAX_POLLS - attempt) * POLL_INTERVAL.as_secs() as u32;
                 info!(
                     "网络请求失败，{}秒后重试...（剩余{}秒）",
                     POLL_INTERVAL.as_secs(),

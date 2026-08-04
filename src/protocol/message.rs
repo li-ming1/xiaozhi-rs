@@ -24,11 +24,16 @@ pub enum ClientMessage {
     },
 }
 
+/// serde 过滤：false 字段不序列化（等价于 `std::ops::Not::not`，语义更直白）。
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Features {
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub mcp: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub glyph_push: bool,
 }
 

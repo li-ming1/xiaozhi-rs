@@ -105,18 +105,14 @@ impl MqttUdpTransport {
         // 会话关闭信号：handles drop（Sender 失效）→ 后台任务 `changed()` 返回 Err 退出。
         let (close_tx, close_rx) = watch::channel(());
 
-        let mqtt_send_client = client.clone();
-        let mqtt_send_params = mqtt.clone();
-        tokio::spawn(send_loop(
-            mqtt_send_client,
-            mqtt_send_params,
-            control_rx,
-            audio_rx,
-            udp_socket.clone(),
-            cipher.clone(),
+        let outbound = Outbound {
+            client: client.clone(),
+            mqtt: mqtt.clone(),
+            udp: udp_socket.clone(),
+            cipher: cipher.clone(),
             base_nonce,
-            close_rx.clone(),
-        ));
+        };
+        tokio::spawn(send_loop(outbound, control_rx, audio_rx, close_rx.clone()));
 
         tokio::spawn(mqtt_event_loop(eventloop, incoming_tx.clone(), close_rx.clone()));
         tokio::spawn(udp_recv_loop(udp_socket, cipher, incoming_tx.clone(), close_rx));
@@ -189,16 +185,19 @@ async fn wait_hello(eventloop: &mut EventLoop) -> Result<Negotiated> {
     }
 }
 
-/// 出站：控制（MQTT publish JSON）+ 音频（UDP 加密发送）。
-#[allow(clippy::too_many_arguments)]
-async fn send_loop(
+/// 出站上下文：控制（MQTT publish JSON）+ 音频（UDP 加密发送）。
+struct Outbound {
     client: AsyncClient,
     mqtt: MqttParams,
-    mut control_rx: mpsc::Receiver<ClientMessage>,
-    audio_rx: super::LatestSlot<Vec<u8>>,
     udp: Arc<UdpSocket>,
     cipher: AesCtrCipher,
     base_nonce: [u8; 16],
+}
+
+async fn send_loop(
+    out: Outbound,
+    mut control_rx: mpsc::Receiver<ClientMessage>,
+    audio_rx: super::LatestSlot<Vec<u8>>,
     mut close_rx: watch::Receiver<()>,
 ) {
     let mut local_sequence: u32 = 0;
@@ -213,8 +212,9 @@ async fn send_loop(
                     Ok(p) => p,
                     Err(e) => { warn!("控制消息序列化失败: {}", e); continue; }
                 };
-                if let Err(e) = client
-                    .publish(&mqtt.publish_topic, QoS::AtMostOnce, false, payload)
+                if let Err(e) = out
+                    .client
+                    .publish(&out.mqtt.publish_topic, QoS::AtMostOnce, false, payload)
                     .await
                 {
                     warn!("MQTT 控制发布失败: {}", e);
@@ -231,13 +231,13 @@ async fn send_loop(
                     timestamp: now_ms(),
                     sequence: local_sequence,
                 };
-                let iv = hdr.build_iv(&base_nonce);
+                let iv = hdr.build_iv(&out.base_nonce);
                 let mut encrypted = audio;
-                cipher.apply_keystream(&iv, &mut encrypted);
+                out.cipher.apply_keystream(&iv, &mut encrypted);
                 packet.clear();
                 packet.extend_from_slice(&iv);
                 packet.extend_from_slice(&encrypted);
-                if let Err(e) = udp.send(&packet).await {
+                if let Err(e) = out.udp.send(&packet).await {
                     warn!("UDP 发送失败: {}", e);
                     // 连续失败由监督层计数熔断，这里不自行退出。
                 }

@@ -180,28 +180,21 @@ impl OpusCodec {
 
     /// 解码 Opus 包为 f32 PCM。`input` 为空时执行 PLC；`fec` 为 true 时尝试带内 FEC 恢复。
     pub fn decode(&mut self, input: &[u8], fec: bool) -> Result<Vec<f32>> {
-        let samples = if input.is_empty() {
-            unsafe {
-                opus_decode_float(
-                    self.decoder,
-                    std::ptr::null(),
-                    0,
-                    self.decode_buf.as_mut_ptr(),
-                    DECODE_MAX_SAMPLES as c_int,
-                    0,
-                )
-            }
+        // 空包走 PLC（调用方恒传 fec=false，此处分支显式置 0 更稳健）。
+        let (ptr, fec) = if input.is_empty() {
+            (std::ptr::null(), 0)
         } else {
-            unsafe {
-                opus_decode_float(
-                    self.decoder,
-                    input.as_ptr(),
-                    input.len() as c_int,
-                    self.decode_buf.as_mut_ptr(),
-                    DECODE_MAX_SAMPLES as c_int,
-                    fec as c_int,
-                )
-            }
+            (input.as_ptr(), fec as c_int)
+        };
+        let samples = unsafe {
+            opus_decode_float(
+                self.decoder,
+                ptr,
+                input.len() as c_int,
+                self.decode_buf.as_mut_ptr(),
+                DECODE_MAX_SAMPLES as c_int,
+                fec,
+            )
         };
         if samples < 0 {
             return Err(VoiceError::Opus(format!(

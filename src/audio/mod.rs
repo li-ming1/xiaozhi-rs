@@ -253,9 +253,26 @@ where
     Ok(stream)
 }
 
+/// 输出欠载状态：点击抑制所需状态为闭包局部变量，无需锁/原子。
+struct Underrun {
+    last_out: f32,
+    ramp_left: usize,
+    ramp_pending: bool,
+    ramp_len: usize,
+}
+
+impl Underrun {
+    fn new(ramp_len: usize) -> Self {
+        Self {
+            last_out: 0.0,
+            ramp_left: 0,
+            ramp_pending: true,
+            ramp_len,
+        }
+    }
+}
+
 /// 输出回调：rtrb 读单声道 → 声道展开 + 格式转换；欠载 5ms 斜坡静音。
-/// 点击抑制状态为闭包局部变量，无需锁/原子。
-#[allow(clippy::too_many_arguments)]
 fn build_output_stream<T>(
     device: &Device,
     config: StreamConfig,
@@ -268,25 +285,14 @@ fn build_output_stream<T>(
 where
     T: FromSample<f32> + SizedSample + Copy + Send + 'static,
 {
-    let mut last_out: f32 = 0.0;
-    let mut ramp_left: usize = 0;
-    let mut ramp_pending: bool = true;
+    let mut underrun = Underrun::new(ramp_len);
     // cb_samples 由回调本地累积，批量提交原子（每 ~10ms 一次 fetch_add，避免每样本原子操作）。
     let mut local_cb: u64 = 0;
     let stream = device
         .build_output_stream(
             config,
             move |data: &mut [T], _: &_| {
-                let consumed = fill_output(
-                    data,
-                    channels,
-                    &mut consumer,
-                    &mut last_out,
-                    &mut ramp_left,
-                    &mut ramp_pending,
-                    ramp_len,
-                    &cb_count,
-                );
+                let consumed = fill_output(data, channels, &mut consumer, &mut underrun, &cb_count);
                 local_cb += consumed as u64;
                 if local_cb >= 960 {
                     cb_samples.fetch_add(local_cb, Ordering::Relaxed);
@@ -301,15 +307,11 @@ where
 }
 
 /// 输出回调体（无锁、零分配、零日志）。
-#[allow(clippy::too_many_arguments)]
 fn fill_output<T>(
     data: &mut [T],
     channels: usize,
     consumer: &mut Consumer<f32>,
-    last_out: &mut f32,
-    ramp_left: &mut usize,
-    ramp_pending: &mut bool,
-    ramp_len: usize,
+    u: &mut Underrun,
     cb_count: &AtomicU64,
 ) -> usize
 where
@@ -317,26 +319,26 @@ where
 {
     cb_count.fetch_add(1, Ordering::Relaxed);
     let frames = data.len() / channels;
-    let ramp_len = ramp_len.max(1);
+    let ramp_len = u.ramp_len.max(1);
     let mut consumed = 0;
     for i in 0..frames {
         let sample = match consumer.pop().ok() {
             Some(v) => {
                 consumed += 1;
-                *last_out = v;
-                *ramp_pending = true;
+                u.last_out = v;
+                u.ramp_pending = true;
                 v
             }
             None => {
-                if *ramp_pending {
-                    *ramp_pending = false;
-                    if last_out.abs() > 1e-4 {
-                        *ramp_left = ramp_len - 1;
+                if u.ramp_pending {
+                    u.ramp_pending = false;
+                    if u.last_out.abs() > 1e-4 {
+                        u.ramp_left = ramp_len - 1;
                     }
                 }
-                if *ramp_left > 0 {
-                    *ramp_left -= 1;
-                    *last_out * (*ramp_left as f32 / ramp_len as f32)
+                if u.ramp_left > 0 {
+                    u.ramp_left -= 1;
+                    u.last_out * (u.ramp_left as f32 / ramp_len as f32)
                 } else {
                     0.0
                 }
@@ -375,6 +377,17 @@ impl CaptureStats {
             silence_frames: 0,
             agc_gain: 1.0,
         }
+    }
+
+    /// 每 2s 诊断输出后清零。
+    fn reset(&mut self) {
+        self.samples = 0;
+        self.sum_sq = 0.0;
+        self.frames = 0;
+        self.speech_frames = 0;
+        self.silence_frames = 0;
+        self.agc_gain = 1.0;
+        self.flush_at = Instant::now();
     }
 }
 
@@ -443,9 +456,17 @@ impl DriftController {
 }
 
 /// 帧统计（RMS 与峰值）。单帧 ≤960 样本，f32 精度足够。
-fn frame_stats(frame: &[f32]) -> (f32, f32) {
+struct FrameStats {
+    rms: f32,
+    peak: f32,
+}
+
+fn frame_stats(frame: &[f32]) -> FrameStats {
     if frame.is_empty() {
-        return (0.0, 0.0);
+        return FrameStats {
+            rms: 0.0,
+            peak: 0.0,
+        };
     }
     let mut sum_sq = 0.0f32;
     let mut peak = 0.0f32;
@@ -453,8 +474,10 @@ fn frame_stats(frame: &[f32]) -> (f32, f32) {
         sum_sq += s * s;
         peak = peak.max(s.abs());
     }
-    let rms = (sum_sq / frame.len() as f32).sqrt();
-    (rms, peak)
+    FrameStats {
+        rms: (sum_sq / frame.len() as f32).sqrt(),
+        peak,
+    }
 }
 
 /// 上行自动增益控制：把语音帧 RMS 提升到目标电平（-21dBFS，上限 36dB），静音不放大。
@@ -546,15 +569,12 @@ impl Vad {
             } else {
                 self.hangover = 0;
             }
+        } else if rms >= on {
+            self.speech = true;
+            self.hangover = 0;
         } else {
             // 静音段慢跟噪声底（仅低电平观测进入，避免语音污染）。
-            if rms < on {
-                self.noise_floor = self.noise_floor * 0.98 + rms * 0.02;
-            }
-            if rms >= on {
-                self.speech = true;
-                self.hangover = 0;
-            }
+            self.noise_floor = self.noise_floor * 0.98 + rms * 0.02;
         }
         self.speech
     }
@@ -631,6 +651,16 @@ impl CaptureWorker {
 
     /// 处理一批输入（非阻塞）：读取 → 重采样 → 漂移校正 → 组帧编码。
     async fn process_batch(&mut self, input: &mut Consumer<f32>, encoded_tx: &LatestSlot<Vec<u8>>) {
+        if !self.drain_input(input) {
+            return;
+        }
+        self.update_drift();
+        self.encode_pending(encoded_tx).await;
+        self.flush_stats();
+    }
+
+    /// 读空 rtrb 并重采样到 16kHz，产出追加到 pending；无输入返回 false。
+    fn drain_input(&mut self, input: &mut Consumer<f32>) -> bool {
         self.chunk.clear();
         let mut any = false;
         while let Ok(s) = input.pop() {
@@ -641,7 +671,7 @@ impl CaptureWorker {
             }
         }
         if !any {
-            return;
+            return false;
         }
         self.window_count += self.chunk.len() as u64;
         self.stats.samples += self.chunk.len() as u64;
@@ -650,8 +680,11 @@ impl CaptureWorker {
         self.resample_out.clear();
         self.resampler.process(&self.chunk, self.drift.ratio, &mut self.resample_out);
         self.pending.extend_from_slice(&self.resample_out);
+        true
+    }
 
-        // 每 500ms 按窗口样本计数校正比率。
+    /// 每 500ms 按窗口样本计数校正重采样比率（补偿时钟漂移）。
+    fn update_drift(&mut self) {
         if self.window_start.elapsed() >= DRIFT_PERIOD {
             let observed = self.window_count as f64 / self.window_start.elapsed().as_secs_f64();
             if observed > 0.0 {
@@ -663,15 +696,17 @@ impl CaptureWorker {
             self.window_count = 0;
             self.window_start = Instant::now();
         }
+    }
 
-        // 组 60ms 帧：VAD 判定语音才编码上行，空闲时零编码开销。
+    /// 组 60ms 帧：VAD 判定语音才编码上行，空闲时零编码开销。
+    async fn encode_pending(&mut self, encoded_tx: &LatestSlot<Vec<u8>>) {
         while self.pending.len() >= ENCODER_FRAME_SIZE {
             self.frame.clear();
             self.frame.extend(self.pending.drain(..ENCODER_FRAME_SIZE));
-            let (rms, peak) = frame_stats(&self.frame);
-            if self.vad.decide(rms) {
+            let s = frame_stats(&self.frame);
+            if self.vad.decide(s.rms) {
                 self.stats.speech_frames += 1;
-                self.agc.process_frame(&mut self.frame, rms, peak);
+                self.agc.process_frame(&mut self.frame, s.rms, s.peak);
                 self.stats.agc_gain = self.agc.gain;
                 match self.opus.encode(&self.frame) {
                     Ok(pkt) => {
@@ -684,7 +719,10 @@ impl CaptureWorker {
                 self.stats.silence_frames += 1;
             }
         }
+    }
 
+    /// 每 2s 输出一次捕获诊断并清零统计。
+    fn flush_stats(&mut self) {
         if self.stats.flush_at.elapsed() >= Duration::from_secs(2) {
             let rms = if self.stats.samples > 0 {
                 (self.stats.sum_sq / self.stats.samples as f64).sqrt()
@@ -701,13 +739,7 @@ impl CaptureWorker {
                 self.stats.silence_frames,
                 self.stats.agc_gain
             );
-            self.stats.samples = 0;
-            self.stats.sum_sq = 0.0;
-            self.stats.frames = 0;
-            self.stats.speech_frames = 0;
-            self.stats.silence_frames = 0;
-            self.stats.agc_gain = 1.0;
-            self.stats.flush_at = Instant::now();
+            self.stats.reset();
         }
     }
 }
@@ -934,11 +966,11 @@ mod tests {
         let mut last_db = -120.0f64;
         for _ in 0..12 {
             let mut frame = make_frame(0.0018, ENCODER_FRAME_SIZE);
-            let (rms, peak) = frame_stats(&frame);
-            agc.process_frame(&mut frame, rms, peak);
-            let (rms, peak) = frame_stats(&frame);
-            last_db = 20.0 * (rms as f64).log10();
-            assert!(peak <= 0.99, "AGC 后峰值 {} 异常（削波）", peak);
+            let s = frame_stats(&frame);
+            agc.process_frame(&mut frame, s.rms, s.peak);
+            let s = frame_stats(&frame);
+            last_db = 20.0 * (s.rms as f64).log10();
+            assert!(s.peak <= 0.99, "AGC 后峰值 {} 异常（削波）", s.peak);
         }
         // 收敛后应提升到目标附近（> -30dBFS）。
         assert!(last_db > -30.0, "AGC 后 RMS {}dBFS 仍过低", last_db);
@@ -949,11 +981,11 @@ mod tests {
         let mut frame = make_frame(0.00003, ENCODER_FRAME_SIZE); // -90dBFS
         let mut agc = Agc::new();
         agc.gain = 20.0; // 模拟此前语音拉高增益
-        let (rms, _) = frame_stats(&frame);
-        agc.process_frame(&mut frame, rms, 0.0);
-        let (rms, _) = frame_stats(&frame);
+        let s = frame_stats(&frame);
+        agc.process_frame(&mut frame, s.rms, 0.0);
+        let s = frame_stats(&frame);
         // 静音帧不放大：RMS 保持极低。
-        assert!(rms < 0.0001, "静音帧被放大: RMS={}", rms);
+        assert!(s.rms < 0.0001, "静音帧被放大: RMS={}", s.rms);
     }
 
     #[test]

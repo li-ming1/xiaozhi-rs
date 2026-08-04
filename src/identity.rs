@@ -82,25 +82,17 @@ fn app_config_dir() -> PathBuf {
 
 fn hostname_str() -> String {
     #[cfg(windows)]
-    {
-        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string())
-    }
+    let host = std::env::var("COMPUTERNAME").ok();
     #[cfg(target_os = "macos")]
-    {
-        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
-    }
+    let host = std::env::var("HOSTNAME").ok();
     #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::fs::read_to_string("/proc/sys/kernel/hostname")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unknown".to_string())
-    }
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     #[cfg(not(any(windows, target_os = "macos", unix)))]
-    {
-        "unknown".to_string()
-    }
+    let host = None;
+    host.unwrap_or_else(|| "unknown".to_string())
 }
 
 impl DeviceIdentity {
@@ -203,9 +195,7 @@ impl DeviceIdentity {
     }
 
     /// 测试用 MAC（服务器自动授权）。
-    pub fn get_test_mac_address() -> String {
-        "00:00:00:00:00:00".to_string()
-    }
+    pub const TEST_MAC: &str = "00:00:00:00:00:00";
 
     pub fn is_activated(&self) -> bool {
         self.activation_status
