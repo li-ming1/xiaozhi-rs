@@ -6,7 +6,7 @@ pub mod ws;
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use crate::error::Result;
 use message::{AudioParams, ClientMessage, ServerMessage};
@@ -54,6 +54,8 @@ pub struct TransportHandles {
     pub control_tx: mpsc::Sender<ClientMessage>,
     pub audio_tx: LatestSlot<Vec<u8>>,
     pub incoming_rx: mpsc::Receiver<IncomingEvent>,
+    /// drop 时 watch Sender 失效，后台任务经 `changed()` 返回 Err 退出，防悬挂泄漏。
+    _close: watch::Sender<()>,
 }
 
 /// 传输适配器闭集：枚举即静态分派，无 dyn / 无 async_trait。

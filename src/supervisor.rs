@@ -27,6 +27,9 @@ enum TransportKind {
     WebSocket,
 }
 
+/// 建连整体超时（TCP/TLS 握手无响应时兜底，避免状态机卡死）。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 状态机。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -140,6 +143,8 @@ struct LossEstimator {
 impl LossEstimator {
     const FRAME_MS: u64 = 60;
     const WINDOW: Duration = Duration::from_secs(10);
+    /// gap 超过此值视为服务器静默期（TTS 间隔/无下行），重置窗口而非计丢失。
+    const RESET_GAP_MS: u64 = 1000;
 
     fn new() -> Self {
         Self {
@@ -154,7 +159,13 @@ impl LossEstimator {
     fn observe_frame(&mut self, now: Instant) {
         if let Some(prev) = self.last {
             let gap_ms = now.duration_since(prev).as_millis() as u64;
-            if gap_ms > Self::FRAME_MS * 3 {
+            // 服务器静默期无法区分"丢包"与"未发送"：>1s 重置窗口；
+            // 否则按帧间隔折算丢失。
+            if gap_ms > Self::RESET_GAP_MS {
+                self.received = 0;
+                self.lost = 0;
+                self.window_start = now;
+            } else if gap_ms > Self::FRAME_MS * 3 {
                 self.lost += gap_ms / Self::FRAME_MS - 1;
             }
         }
@@ -190,8 +201,6 @@ pub struct VoiceSupervisor {
     audio: Option<AudioManager>,
     backoff: Backoff,
     mqtt_circuit: CircuitBreaker,
-    /// 主链路偏好（MQTT+UDP）。熔断或黑洞时暂时切换 WebSocket。
-    prefer_mqtt: bool,
     /// 当前会话的传输类型（每次建连重建，标记"纪元"）。
     epoch: Option<TransportKind>,
     /// 当前会话建连后的统一句柄（由 Connect 状态交给 Streaming 状态，禁止重复建连）。
@@ -209,7 +218,6 @@ impl VoiceSupervisor {
             audio,
             backoff: Backoff::new(),
             mqtt_circuit: CircuitBreaker::new(),
-            prefer_mqtt: true,
             epoch: None,
             handles: None,
         }
@@ -271,9 +279,9 @@ impl VoiceSupervisor {
         }
     }
 
-    /// MQTT+UDP 链路可用（OTA 已下发且熔断器未打开）。
+    /// MQTT+UDP 链路可用（OTA 已下发且熔断器未打开；冷却期结束后自动恢复尝试）。
     fn mqtt_available(&self) -> bool {
-        self.prefer_mqtt && self.ota.mqtt.is_some() && !self.mqtt_circuit.is_open()
+        self.ota.mqtt.is_some() && !self.mqtt_circuit.is_open()
     }
 
     /// 选择传输：MQTT+UDP 优先（未熔断），否则 WebSocket。
@@ -293,32 +301,28 @@ impl VoiceSupervisor {
         }
     }
 
-    /// 构造连接参数。
-    fn build_params(&self) -> Result<ConnectParams> {
-        let ws_url = self
-            .ota
-            .websocket
-            .url
-            .clone()
-            .ok_or_else(|| VoiceError::InvalidConfig("OTA 未提供 WebSocket URL".into()))?;
+    /// 构造连接参数。WebSocket URL 缺失时用空串（MQTT 主链路不受影响；
+    /// 选择 WS 时 URI 解析自然失败）。
+    fn build_params(&self) -> ConnectParams {
+        let ws_url = self.ota.websocket.url.clone().unwrap_or_default();
         let token = self.ota.websocket.token.clone().unwrap_or_default();
         let mqtt = self
             .ota
             .mqtt
             .as_ref()
             .map(|m| derive_mqtt(m, &ws_url, &self.identity.client_id));
-        Ok(ConnectParams {
+        ConnectParams {
             device_id: self.identity.device_id.clone(),
             client_id: self.identity.client_id.clone(),
             token,
             ws_url,
             mqtt,
-        })
+        }
     }
 
     /// 建连 + 协商。句柄存入 `self.handles`，由 Streaming 状态取用。
     async fn connect(&mut self) -> Result<()> {
-        let params = self.build_params()?;
+        let params = self.build_params();
         let kind = self.current_transport_kind();
         if kind == TransportKind::MqttUdp
             && let Some(m) = &params.mqtt
@@ -332,7 +336,9 @@ impl VoiceSupervisor {
             TransportKind::MqttUdp => TransportAdapter::MqttUdp(MqttUdpTransport),
             TransportKind::WebSocket => TransportAdapter::WebSocket(WsTransport::default()),
         };
-        let handles = adapter.connect(&params).await?;
+        let handles = tokio::time::timeout(CONNECT_TIMEOUT, adapter.connect(&params))
+            .await
+            .map_err(|_| VoiceError::Timeout(format!("连接超时（{}s）", CONNECT_TIMEOUT.as_secs())))??;
         self.epoch = Some(kind);
         self.handles = Some(handles);
         self.backoff.on_success();
@@ -344,9 +350,8 @@ impl VoiceSupervisor {
     fn on_connect_error(&mut self, e: &VoiceError) {
         if matches!(e, VoiceError::Transport(_) | VoiceError::Timeout(_))
             && self.current_transport_kind() == TransportKind::MqttUdp
-            && self.mqtt_circuit.record_failure()
         {
-            self.prefer_mqtt = false;
+            self.mqtt_circuit.record_failure();
         }
         if matches!(e, VoiceError::AuthenticationFailed(_)) {
             warn!("认证失败：请重新激活");
@@ -444,7 +449,10 @@ impl VoiceSupervisor {
                                 debug!("下行首帧 hex (len={}): {}", data.len(), hex.join(" "));
                             }
                             downlink_frames += 1;
-                            loss.observe_frame(Instant::now());
+                            // 丢包估计仅对 UDP 有意义（TCP 可靠传输，间隙是服务器停顿而非丢包）。
+                            if kind == TransportKind::MqttUdp {
+                                loss.observe_frame(Instant::now());
+                            }
                             if let Some(tx) = self.audio.as_ref().and_then(|a| a.playback_sender())
                                 && let Err(e) = tx.send(PlaybackMsg::Audio(data)).await
                             {
@@ -493,9 +501,8 @@ impl VoiceSupervisor {
         }
         if matches!(e, VoiceError::Transport(_) | VoiceError::Timeout(_))
             && self.epoch == Some(TransportKind::MqttUdp)
-            && self.mqtt_circuit.record_failure()
         {
-            self.prefer_mqtt = false;
+            self.mqtt_circuit.record_failure();
         }
         self.epoch = None;
     }
@@ -533,11 +540,12 @@ fn derive_mqtt(m: &OtaMqttConfig, ws_url: &str, client_id: &str) -> MqttParams {
         (host, 1883, m.tls)
     };
 
+    // 服务器可能下发 "null"/空 字符串：按缺省处理。
     let publish_topic = m
         .publish_topic
         .clone()
+        .filter(|s| !s.is_empty() && s != "null")
         .unwrap_or_else(|| "device-server".to_string());
-    // "null" 字符串按缺省处理。
     let subscribe_topic = m
         .subscribe_topic
         .clone()
@@ -645,5 +653,56 @@ impl RealtimeVoice {
     pub async fn run_until(self, shutdown: CancellationToken) -> Result<()> {
         let mut supervisor = VoiceSupervisor::new(self.identity, self.ota, shutdown);
         supervisor.run().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 服务器静默期（gap >1s）应重置窗口，不计入丢失。
+    #[test]
+    fn loss_estimator_ignores_server_silence() {
+        let mut e = LossEstimator::new();
+        let t0 = Instant::now();
+        for i in 0..10 {
+            e.observe_frame(t0 + Duration::from_millis(i * 60));
+        }
+        e.observe_frame(t0 + Duration::from_millis(3000 + 600));
+        assert_eq!(e.lost, 0);
+    }
+
+    /// 180ms–1s 内的间隙按帧间隔折算丢失。
+    #[test]
+    fn loss_estimator_counts_gaps_within_threshold() {
+        let mut e = LossEstimator::new();
+        let t0 = Instant::now();
+        e.observe_frame(t0);
+        e.observe_frame(t0 + Duration::from_millis(300));
+        assert_eq!(e.lost, 4); // 5 帧间隔 → 丢 4 帧
+    }
+
+    #[test]
+    fn circuit_breaker_opens_after_two_failures() {
+        let mut cb = CircuitBreaker::new();
+        assert!(!cb.record_failure());
+        assert!(!cb.is_open());
+        assert!(cb.record_failure());
+        assert!(cb.is_open());
+    }
+
+    /// 服务器下发 "null"/空 topic 时应回退缺省值。
+    #[test]
+    fn derive_mqtt_null_topic_falls_back() {
+        let m = OtaMqttConfig {
+            endpoint: Some("mqtt.example.com:1883".into()),
+            subscribe_topic: Some("null".into()),
+            publish_topic: Some("device-server".into()),
+            ..Default::default()
+        };
+        let p = derive_mqtt(&m, "wss://x", "client-1");
+        assert_eq!(p.subscribe_topic, "device-server");
+        assert_eq!(p.publish_topic, "device-server");
+        assert!(!p.tls);
     }
 }

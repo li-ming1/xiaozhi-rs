@@ -1,9 +1,0 @@
-# 二进制库文件标记为 vendored，不参与语言统计
-libs/**/*.dll linguist-vendored
-libs/**/*.so linguist-vendored
-libs/**/*.dylib linguist-vendored
-
-# 二进制文件不做换行符转换
-*.dll binary
-*.so binary
-*.dylib binary

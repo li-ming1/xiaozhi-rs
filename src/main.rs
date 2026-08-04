@@ -73,7 +73,7 @@ impl log::Log for SimpleLogger {
     fn log(&self, record: &log::Record) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::ZERO)
             .as_secs();
         let local = now + 8 * 3600; // UTC+8
         let days = (local / 86400) as i64;
@@ -120,7 +120,8 @@ fn civil_from_days(z: i64) -> (i32, u8, u8) {
 async fn run_with_signal(skip_activation: bool) -> Result<()> {
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
-    let sig_task = tokio::spawn(async move {
+    // 独立任务监听 Ctrl+C 并取消 shutdown；不等待其完成（进程退出时自然终止）。
+    let _sig_task = tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {
                 info!("收到 Ctrl+C 信号，正在退出...");
@@ -138,7 +139,8 @@ async fn run_with_signal(skip_activation: bool) -> Result<()> {
     eprintln!("[退出] {}", reason);
     info!("客户端退出原因: {}", reason);
     write_exit_reason(&format!("[退出] {}", reason));
-    let _ = sig_task.await;
+    // 不等待 sig_task：supervisor 只在 shutdown 取消时返回，而激活失败/配置错误等
+    // 路径 shutdown 从未取消，await 会使进程挂起。Ctrl+C 已触发时任务自会完成。
     res
 }
 

@@ -71,6 +71,3 @@ codegen-units = 1
 # abort：移除 unwind 表，显著减小体积。panic hook 仍会先执行（写退出原因日志）。
 panic = "abort"
 strip = true
-
-[profile.release.package."*"]
-opt-level = 3

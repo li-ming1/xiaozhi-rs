@@ -11,7 +11,7 @@ use rumqttc::{
 };
 use rustls::ClientConfig;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::crypto::{hex_decode_16, AesCtrCipher, UdpAudioHeader, HEADER_SIZE, TYPE_AUDIO};
 use crate::error::{Result, VoiceError};
@@ -102,6 +102,8 @@ impl MqttUdpTransport {
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
         let (audio_tx, audio_rx) = super::LatestSlot::<Vec<u8>>::new().pipe();
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
+        // 会话关闭信号：handles drop（Sender 失效）→ 后台任务 `changed()` 返回 Err 退出。
+        let (close_tx, close_rx) = watch::channel(());
 
         let mqtt_send_client = client.clone();
         let mqtt_send_params = mqtt.clone();
@@ -113,10 +115,11 @@ impl MqttUdpTransport {
             udp_socket.clone(),
             cipher.clone(),
             base_nonce,
+            close_rx.clone(),
         ));
 
-        tokio::spawn(mqtt_event_loop(eventloop, incoming_tx.clone()));
-        tokio::spawn(udp_recv_loop(udp_socket, cipher, incoming_tx.clone()));
+        tokio::spawn(mqtt_event_loop(eventloop, incoming_tx.clone(), close_rx.clone()));
+        tokio::spawn(udp_recv_loop(udp_socket, cipher, incoming_tx.clone(), close_rx));
 
         Ok(TransportHandles {
             session_id: negotiated.session_id,
@@ -124,6 +127,7 @@ impl MqttUdpTransport {
             control_tx,
             audio_tx,
             incoming_rx,
+            _close: close_tx,
         })
     }
 }
@@ -195,12 +199,14 @@ async fn send_loop(
     udp: Arc<UdpSocket>,
     cipher: AesCtrCipher,
     base_nonce: [u8; 16],
+    mut close_rx: watch::Receiver<()>,
 ) {
     let mut local_sequence: u32 = 0;
     let mut packet: Vec<u8> = Vec::with_capacity(UDP_MAX_PACKET);
     loop {
         tokio::select! {
             biased;
+            _ = close_rx.changed() => break,
             ctrl = control_rx.recv() => {
                 let Some(msg) = ctrl else { break };
                 let payload = match serde_json::to_string(&msg) {
@@ -241,29 +247,34 @@ async fn send_loop(
 }
 
 /// MQTT 事件循环：hello 之后的下行 JSON 路由到 incoming。
-async fn mqtt_event_loop(mut eventloop: EventLoop, incoming_tx: mpsc::Sender<IncomingEvent>) {
+async fn mqtt_event_loop(
+    mut eventloop: EventLoop,
+    incoming_tx: mpsc::Sender<IncomingEvent>,
+    mut close_rx: watch::Receiver<()>,
+) {
     loop {
-        match eventloop.poll().await {
-            Ok(Event::Incoming(Incoming::Publish(publish))) => {
-                let text = String::from_utf8_lossy(&publish.payload);
-                match serde_json::from_str::<ServerMessage>(&text) {
-                    Ok(msg) => {
-                        if incoming_tx.send(IncomingEvent::Json(msg)).await.is_err() {
-                            break;
+        tokio::select! {
+            _ = close_rx.changed() => break,
+            ev = eventloop.poll() => match ev {
+                Ok(Event::Incoming(Incoming::Publish(publish))) => {
+                    let text = String::from_utf8_lossy(&publish.payload);
+                    match serde_json::from_str::<ServerMessage>(&text) {
+                        Ok(msg) => {
+                            if incoming_tx.send(IncomingEvent::Json(msg)).await.is_err() {
+                                break;
+                            }
                         }
+                        Err(e) => warn!("MQTT JSON 解析失败: {} (payload={})", e, text),
                     }
-                    Err(e) => warn!("MQTT JSON 解析失败: {} (payload={})", e, text),
                 }
-            }
-            Ok(Event::Incoming(Incoming::ConnAck(_))) => {
-                debug!("MQTT ConnAck");
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!("MQTT 连接中断: {}", e);
-                let _ = incoming_tx.send(IncomingEvent::Closed).await;
-                break;
-            }
+                Ok(Event::Incoming(Incoming::ConnAck(_))) => debug!("MQTT ConnAck"),
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("MQTT 连接中断: {}", e);
+                    let _ = incoming_tx.send(IncomingEvent::Closed).await;
+                    break;
+                }
+            },
         }
     }
 }
@@ -273,51 +284,59 @@ async fn udp_recv_loop(
     udp: Arc<UdpSocket>,
     cipher: AesCtrCipher,
     incoming_tx: mpsc::Sender<IncomingEvent>,
+    mut close_rx: watch::Receiver<()>,
 ) {
     let mut buf = vec![0u8; UDP_MAX_PACKET];
     let mut remote_sequence: u32 = 0;
     let mut stats = UdpRecvStats::new();
     loop {
-        match udp.recv(&mut buf).await {
-            Ok(n) => {
-                stats.received += 1;
-                if n < HEADER_SIZE {
-                    stats.short += 1;
-                    continue;
-                }
-                let iv: [u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().unwrap();
-                let hdr = UdpAudioHeader::parse(&iv);
-                if hdr.type_ != TYPE_AUDIO {
-                    stats.type_dropped += 1;
-                    continue;
-                }
-                if HEADER_SIZE + hdr.payload_len as usize != n {
-                    stats.len_dropped += 1;
-                    debug!("UDP 长度不匹配: 实际 {} 声明 {}", n, hdr.payload_len);
-                    continue;
-                }
-                // 防重放：序列号必须单调递增（允许跳跃，丢弃过期包）。
-                if hdr.sequence <= remote_sequence {
-                    stats.seq_dropped += 1;
-                    debug!("UDP 序列号过期/重放: {} <= {}", hdr.sequence, remote_sequence);
-                    continue;
-                }
-                if hdr.sequence != remote_sequence.wrapping_add(1) {
-                    warn!("UDP 序列号跳跃: 期望 {} 得 {}", remote_sequence + 1, hdr.sequence);
-                }
-                remote_sequence = hdr.sequence;
+        tokio::select! {
+            _ = close_rx.changed() => break,
+            recv = udp.recv(&mut buf) => match recv {
+                Ok(n) => {
+                    stats.received += 1;
+                    if n < HEADER_SIZE {
+                        stats.short += 1;
+                        continue;
+                    }
+                    let iv: [u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().unwrap();
+                    let hdr = UdpAudioHeader::parse(&iv);
+                    if hdr.type_ != TYPE_AUDIO {
+                        stats.type_dropped += 1;
+                        continue;
+                    }
+                    if HEADER_SIZE + hdr.payload_len as usize != n {
+                        stats.len_dropped += 1;
+                        debug!("UDP 长度不匹配: 实际 {} 声明 {}", n, hdr.payload_len);
+                        continue;
+                    }
+                    // 防重放：序列号必须单调递增（允许跳跃，丢弃过期包）。
+                    if hdr.sequence <= remote_sequence {
+                        stats.seq_dropped += 1;
+                        debug!("UDP 序列号过期/重放: {} <= {}", hdr.sequence, remote_sequence);
+                        continue;
+                    }
+                    if hdr.sequence != remote_sequence.wrapping_add(1) {
+                        debug!(
+                            "UDP 序列号跳跃: 期望 {} 得 {}",
+                            remote_sequence.wrapping_add(1),
+                            hdr.sequence
+                        );
+                    }
+                    remote_sequence = hdr.sequence;
 
-                let mut payload = buf[HEADER_SIZE..n].to_vec();
-                cipher.apply_keystream(&iv, &mut payload);
-                stats.ok += 1;
-                if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
+                    let mut payload = buf[HEADER_SIZE..n].to_vec();
+                    cipher.apply_keystream(&iv, &mut payload);
+                    stats.ok += 1;
+                    if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("UDP 接收错误: {}", e);
+                    let _ = incoming_tx.send(IncomingEvent::Closed).await;
                     break;
                 }
-            }
-            Err(e) => {
-                warn!("UDP 接收错误: {}", e);
-                let _ = incoming_tx.send(IncomingEvent::Closed).await;
-                break;
             }
         }
 

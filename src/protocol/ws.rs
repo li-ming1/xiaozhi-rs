@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::interval;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{connect_async_tls_with_config, MaybeTlsStream, WebSocketStream};
@@ -50,6 +50,8 @@ impl WsTransport {
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
         let (audio_tx_slot, audio_rx_slot) = super::LatestSlot::<Vec<u8>>::new().pipe();
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
+        // 会话关闭信号：handles drop（Sender 失效）→ 后台任务 `changed()` 返回 Err 退出。
+        let (close_tx, close_rx) = watch::channel(());
 
         let session_start = Instant::now();
         tokio::spawn(send_loop(
@@ -58,8 +60,9 @@ impl WsTransport {
             audio_rx_slot,
             binary_version,
             session_start,
+            close_rx.clone(),
         ));
-        tokio::spawn(recv_loop(receiver, incoming_tx.clone(), binary_version));
+        tokio::spawn(recv_loop(receiver, incoming_tx.clone(), binary_version, close_rx));
 
         Ok(TransportHandles {
             session_id,
@@ -67,6 +70,7 @@ impl WsTransport {
             control_tx,
             audio_tx: audio_tx_slot,
             incoming_rx,
+            _close: close_tx,
         })
     }
 }
@@ -96,7 +100,8 @@ async fn connect_and_handshake(
         .body(())
         .map_err(|e| VoiceError::Transport(format!("构建请求失败: {}", e)))?;
 
-    let (ws_stream, _) = connect_async_tls_with_config(request, None, false, None)
+    // disable_nagle=true：禁用 TCP Nagle 算法，降低小音频包的发送延迟（与 MQTT 侧一致）。
+    let (ws_stream, _) = connect_async_tls_with_config(request, None, true, None)
         .await
         .map_err(|e| VoiceError::Transport(format!("WebSocket 连接失败: {}", e)))?;
 
@@ -252,6 +257,7 @@ async fn send_loop(
     audio_slot: super::LatestSlot<Vec<u8>>,
     binary_version: u16,
     session_start: Instant,
+    mut close_rx: watch::Receiver<()>,
 ) {
     let mut ping = interval(PING_INTERVAL);
     // 重置为错过首 tick，使首个心跳延后一个周期。
@@ -262,6 +268,7 @@ async fn send_loop(
     loop {
         tokio::select! {
             biased;
+            _ = close_rx.changed() => break,
             ctrl = control_rx.recv() => {
                 let Some(msg) = ctrl else { break };
                 if let Err(e) = sender.send_json(&msg).await {
@@ -304,25 +311,29 @@ async fn recv_loop(
     mut receiver: WsReceiver,
     incoming_tx: mpsc::Sender<IncomingEvent>,
     binary_version: u16,
+    mut close_rx: watch::Receiver<()>,
 ) {
     loop {
-        match receiver.receive().await {
-            Ok(ReceivedMessage::Json(srv)) => {
-                if incoming_tx.send(IncomingEvent::Json(srv)).await.is_err() {
+        tokio::select! {
+            _ = close_rx.changed() => break,
+            msg = receiver.receive() => match msg {
+                Ok(ReceivedMessage::Json(srv)) => {
+                    if incoming_tx.send(IncomingEvent::Json(srv)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(ReceivedMessage::Audio(data)) => {
+                    let payload = strip_binary_header(&data, binary_version);
+                    if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("WS 接收错误: {}", e);
+                    let _ = incoming_tx.send(IncomingEvent::Closed).await;
                     break;
                 }
-            }
-            Ok(ReceivedMessage::Audio(data)) => {
-                let payload = strip_binary_header(&data, binary_version);
-                if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
-                    break;
-                }
-            }
-            Err(e) => {
-                warn!("WS 接收错误: {}", e);
-                let _ = incoming_tx.send(IncomingEvent::Closed).await;
-                break;
-            }
+            },
         }
     }
 }
@@ -333,9 +344,11 @@ fn strip_binary_header(data: &[u8], binary_version: u16) -> Vec<u8> {
         2 => {
             if data.len() >= V2_HEADER_SIZE {
                 let version = u16::from_be_bytes([data[0], data[1]]);
+                let ty = u16::from_be_bytes([data[2], data[3]]);
                 let payload_size =
                     u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
-                if version == 2 && V2_HEADER_SIZE + payload_size == data.len() {
+                if version == 2 && ty == V2_TYPE_OPUS && V2_HEADER_SIZE + payload_size == data.len()
+                {
                     return data[V2_HEADER_SIZE..].to_vec();
                 }
             }
@@ -359,7 +372,6 @@ fn strip_binary_header(data: &[u8], binary_version: u16) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// 按 v3 规范构造一帧：type=0, reserved=0, payload_size=htons(len)。
     fn build_v3_frame(payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::with_capacity(V3_HEADER_SIZE + payload.len());
         frame.push(0u8);
@@ -374,7 +386,6 @@ mod tests {
         let payload = b"opus-data";
         let frame = build_v3_frame(payload);
         assert_eq!(frame.len(), V3_HEADER_SIZE + payload.len());
-        // type=0, reserved=0, payload_size 大端。
         assert_eq!(frame[0], 0);
         assert_eq!(frame[1], 0);
         assert_eq!(
@@ -420,7 +431,6 @@ mod tests {
     fn strip_v1_returns_raw() {
         let raw = b"raw-opus";
         assert_eq!(strip_binary_header(raw, 1), raw);
-        // v3 头对 v1 无意义，原样。
         assert_eq!(strip_binary_header(build_v3_frame(b"x").as_slice(), 1), build_v3_frame(b"x"));
     }
 }

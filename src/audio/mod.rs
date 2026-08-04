@@ -271,11 +271,13 @@ where
     let mut last_out: f32 = 0.0;
     let mut ramp_left: usize = 0;
     let mut ramp_pending: bool = true;
+    // cb_samples 由回调本地累积，批量提交原子（每 ~10ms 一次 fetch_add，避免每样本原子操作）。
+    let mut local_cb: u64 = 0;
     let stream = device
         .build_output_stream(
             config,
             move |data: &mut [T], _: &_| {
-                fill_output(
+                let consumed = fill_output(
                     data,
                     channels,
                     &mut consumer,
@@ -284,8 +286,12 @@ where
                     &mut ramp_pending,
                     ramp_len,
                     &cb_count,
-                    &cb_samples,
                 );
+                local_cb += consumed as u64;
+                if local_cb >= 960 {
+                    cb_samples.fetch_add(local_cb, Ordering::Relaxed);
+                    local_cb = 0;
+                }
             },
             |err| warn!("输出流错误: {}", err),
             None,
@@ -305,17 +311,18 @@ fn fill_output<T>(
     ramp_pending: &mut bool,
     ramp_len: usize,
     cb_count: &AtomicU64,
-    cb_samples: &AtomicU64,
-) where
+) -> usize
+where
     T: FromSample<f32> + Copy,
 {
     cb_count.fetch_add(1, Ordering::Relaxed);
     let frames = data.len() / channels;
     let ramp_len = ramp_len.max(1);
+    let mut consumed = 0;
     for i in 0..frames {
         let sample = match consumer.pop().ok() {
             Some(v) => {
-                cb_samples.fetch_add(1, Ordering::Relaxed);
+                consumed += 1;
                 *last_out = v;
                 *ramp_pending = true;
                 v
@@ -340,6 +347,7 @@ fn fill_output<T>(
             data[i * channels + c] = converted;
         }
     }
+    consumed
 }
 
 /// 捕获统计（每 2s 诊断日志，确认麦克风数据真实流入）。
@@ -470,12 +478,8 @@ impl Agc {
         }
     }
 
-    /// 对一帧（60ms，960 样本）做 AGC。
-    fn process_frame(&mut self, frame: &mut [f32]) {
-        if frame.is_empty() {
-            return;
-        }
-        let (rms, peak) = frame_stats(frame);
+    /// 对一帧做 AGC。`rms`/`peak` 由调用方传入（复用 VAD 已算的帧统计，避免重复遍历）。
+    fn process_frame(&mut self, frame: &mut [f32], rms: f32, peak: f32) {
         if rms >= self.voice_threshold {
             let mut target = (self.target_rms / rms).clamp(1.0, self.max_gain);
             // 峰值防削波：增益上限不超过 0.85/peak。
@@ -664,10 +668,10 @@ impl CaptureWorker {
         while self.pending.len() >= ENCODER_FRAME_SIZE {
             self.frame.clear();
             self.frame.extend(self.pending.drain(..ENCODER_FRAME_SIZE));
-            let (rms, _) = frame_stats(&self.frame);
+            let (rms, peak) = frame_stats(&self.frame);
             if self.vad.decide(rms) {
                 self.stats.speech_frames += 1;
-                self.agc.process_frame(&mut self.frame);
+                self.agc.process_frame(&mut self.frame, rms, peak);
                 self.stats.agc_gain = self.agc.gain;
                 match self.opus.encode(&self.frame) {
                     Ok(pkt) => {
@@ -838,7 +842,8 @@ impl PlaybackWorker {
                 self.stats.written += before.saturating_sub(self.out.slots()) as u64;
             }
             PlaybackMsg::Flush => self.buf.reset(),
-            PlaybackMsg::Shutdown => {}
+            // run() 已过滤 Shutdown，此处不可达。
+            PlaybackMsg::Shutdown => unreachable!(),
         }
     }
 
@@ -927,10 +932,10 @@ mod tests {
         // 弱语音约 -58dBFS（amp=0.0018，正弦 RMS=amp/√2）。
         let mut agc = Agc::new();
         let mut last_db = -120.0f64;
-        // 模拟生产：每帧独立输入，多帧让增益收敛。
         for _ in 0..12 {
             let mut frame = make_frame(0.0018, ENCODER_FRAME_SIZE);
-            agc.process_frame(&mut frame);
+            let (rms, peak) = frame_stats(&frame);
+            agc.process_frame(&mut frame, rms, peak);
             let (rms, peak) = frame_stats(&frame);
             last_db = 20.0 * (rms as f64).log10();
             assert!(peak <= 0.99, "AGC 后峰值 {} 异常（削波）", peak);
@@ -944,7 +949,8 @@ mod tests {
         let mut frame = make_frame(0.00003, ENCODER_FRAME_SIZE); // -90dBFS
         let mut agc = Agc::new();
         agc.gain = 20.0; // 模拟此前语音拉高增益
-        agc.process_frame(&mut frame);
+        let (rms, _) = frame_stats(&frame);
+        agc.process_frame(&mut frame, rms, 0.0);
         let (rms, _) = frame_stats(&frame);
         // 静音帧不放大：RMS 保持极低。
         assert!(rms < 0.0001, "静音帧被放大: RMS={}", rms);

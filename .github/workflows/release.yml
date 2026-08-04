@@ -37,13 +37,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # opusic-sys（bundled）构建期用 cmake 编译 libopus。
+      # 显式安装统一最新版，避免依赖 runner 预装版本（各平台不一致且可能过旧）。
+      - name: Install cmake
+        uses: lukka/get-cmake@latest
+
       # ── Linux: 安装 ALSA 开发库（cpal 依赖）──
       - name: Install ALSA dev
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y libasound2-dev
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       # ── 打包：可执行文件（Opus 已由 opusic-sys 静态内置，无需再分发 opus 库）──
       - name: Package
