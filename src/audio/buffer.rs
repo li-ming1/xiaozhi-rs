@@ -81,6 +81,7 @@ impl PlaybackBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn initial_target_is_60ms() {
@@ -93,37 +94,33 @@ mod tests {
         let mut b = PlaybackBuffer::new(60);
         let now = Instant::now();
         for _ in 0..20 {
-            let t = now + std::time::Duration::from_millis(60 + 100);
-            b.observe_arrival(t);
+            b.observe_arrival(now + Duration::from_millis(60 + 100));
         }
-        b.update_target(now + std::time::Duration::from_secs(2));
+        b.update_target(now + Duration::from_secs(2));
         assert!(b.target_ms() >= 60, "target={}", b.target_ms());
         assert!(b.target_ms() <= TARGET_MAX_MS);
     }
 
-    /// 回归：稳定期计时启动后，抖动回落且稳定满 30s，目标深度应开始下降。
-    /// 注意：所有 Instant 参数必须单调递增（duration_since 反向会 panic）。
+    /// 回归：稳定期计时启动、抖动回落且稳定满 30s 后，目标深度应下降。
+    /// 注意：Instant 参数必须单调递增（duration_since 反向会 panic）。
     #[test]
     fn target_shrinks_after_stable_period() {
         let mut b = PlaybackBuffer::new(60);
         let now = Instant::now();
-        // 高抖动（间隔 60+200ms）使目标深度增长到上限。
+        // 高抖动（间隔 260ms）→ 目标深度增长到上限。
         for i in 0..20 {
-            let t = now + std::time::Duration::from_millis(60 + 260 * i);
-            b.observe_arrival(t);
+            b.observe_arrival(now + Duration::from_millis(60 + 260 * i));
         }
-        b.update_target(now + std::time::Duration::from_secs(5));
+        b.update_target(now + Duration::from_secs(5));
         let grown = b.target_ms();
         assert!(grown > 60, "target 未增长: {}", grown);
-        // 增长后首次"无需增长"：启动稳定计时。
-        b.update_target(now + std::time::Duration::from_secs(6));
-        // 抖动归零（严格 60ms 间隔，首帧紧接上轮尾帧）、稳定满 30s：
-        // EWMA 衰减使 desired 回落，应下降至少一帧。
+        // 首次"无需增长"启动稳定计时；随后抖动归零（严格 60ms）、
+        // 稳定满 30s：EWMA 衰减使 desired 回落，应下降至少一帧。
+        b.update_target(now + Duration::from_secs(6));
         for i in 0..20 {
-            let t = now + std::time::Duration::from_millis(5060 + 60 * i);
-            b.observe_arrival(t);
+            b.observe_arrival(now + Duration::from_millis(5060 + 60 * i));
         }
-        b.update_target(now + std::time::Duration::from_secs(38));
+        b.update_target(now + Duration::from_secs(38));
         assert!(
             b.target_ms() < grown,
             "稳定 30s 后 target 未收缩: {} -> {}",

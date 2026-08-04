@@ -392,12 +392,8 @@ mod tests {
         let payload = b"opus-data";
         let frame = build_v3_frame(payload);
         assert_eq!(frame.len(), V3_HEADER_SIZE + payload.len());
-        assert_eq!(frame[0], 0);
-        assert_eq!(frame[1], 0);
-        assert_eq!(
-            u16::from_be_bytes([frame[2], frame[3]]),
-            payload.len() as u16
-        );
+        assert_eq!(&frame[0..2], &[0, 0]);
+        assert_eq!(u16::from_be_bytes([frame[2], frame[3]]), payload.len() as u16);
     }
 
     #[test]

@@ -279,6 +279,57 @@ async fn mqtt_event_loop(
     }
 }
 
+/// UDP 包处理结果。
+enum PktOutcome {
+    /// 校验通过，交付解密后的音频 payload。
+    Deliver(Vec<u8>),
+    /// 丢弃并归类原因（诊断统计）。
+    Drop(PktDrop),
+}
+
+/// UDP 包丢弃原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PktDrop {
+    Short,
+    WrongType,
+    Length,
+    Replay,
+}
+
+/// 校验包头 → 防重放 → 解密。纯函数，便于单元测试。
+/// 返回 `(结果, 是否序列号跳跃)`；跳跃仅诊断，不改变交付。
+fn process_udp_packet(
+    buf: &[u8],
+    n: usize,
+    cipher: &AesCtrCipher,
+    remote_sequence: &mut Option<u32>,
+) -> (PktOutcome, bool) {
+    if n < HEADER_SIZE {
+        return (PktOutcome::Drop(PktDrop::Short), false);
+    }
+    let iv: [u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().unwrap();
+    let hdr = UdpAudioHeader::parse(&iv);
+    if hdr.type_ != TYPE_AUDIO {
+        return (PktOutcome::Drop(PktDrop::WrongType), false);
+    }
+    if HEADER_SIZE + hdr.payload_len as usize != n {
+        return (PktOutcome::Drop(PktDrop::Length), false);
+    }
+    // 防重放：序列号必须单调递增（允许跳跃，丢弃过期包）。
+    let mut jumped = false;
+    if let Some(prev) = *remote_sequence {
+        if hdr.sequence <= prev {
+            return (PktOutcome::Drop(PktDrop::Replay), false);
+        }
+        jumped = hdr.sequence != prev.wrapping_add(1);
+    }
+    *remote_sequence = Some(hdr.sequence);
+
+    let mut payload = buf[HEADER_SIZE..n].to_vec();
+    cipher.apply_keystream(&iv, &mut payload);
+    (PktOutcome::Deliver(payload), jumped)
+}
+
 /// UDP 接收循环：校验包头 → 防重放 → 解密 → Audio。
 async fn udp_recv_loop(
     udp: Arc<UdpSocket>,
@@ -296,43 +347,30 @@ async fn udp_recv_loop(
             recv = udp.recv(&mut buf) => match recv {
                 Ok(n) => {
                     stats.received += 1;
-                    if n < HEADER_SIZE {
-                        stats.short += 1;
-                        continue;
-                    }
-                    let iv: [u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().unwrap();
-                    let hdr = UdpAudioHeader::parse(&iv);
-                    if hdr.type_ != TYPE_AUDIO {
-                        stats.type_dropped += 1;
-                        continue;
-                    }
-                    if HEADER_SIZE + hdr.payload_len as usize != n {
-                        stats.len_dropped += 1;
-                        debug!("UDP 长度不匹配: 实际 {} 声明 {}", n, hdr.payload_len);
-                        continue;
-                    }
-                    // 防重放：序列号必须单调递增（允许跳跃，丢弃过期包）。
-                    if let Some(prev) = remote_sequence {
-                        if hdr.sequence <= prev {
-                            stats.seq_dropped += 1;
-                            debug!("UDP 序列号过期/重放: {} <= {}", hdr.sequence, prev);
-                            continue;
+                    let (outcome, jumped) =
+                        process_udp_packet(&buf, n, &cipher, &mut remote_sequence);
+                    match outcome {
+                        PktOutcome::Deliver(payload) => {
+                            if jumped {
+                                debug!("UDP 序列号跳跃");
+                            }
+                            stats.ok += 1;
+                            if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
+                                break;
+                            }
                         }
-                        if hdr.sequence != prev.wrapping_add(1) {
-                            debug!(
-                                "UDP 序列号跳跃: 期望 {} 得 {}",
-                                prev.wrapping_add(1),
-                                hdr.sequence
-                            );
-                        }
-                    }
-                    remote_sequence = Some(hdr.sequence);
-
-                    let mut payload = buf[HEADER_SIZE..n].to_vec();
-                    cipher.apply_keystream(&iv, &mut payload);
-                    stats.ok += 1;
-                    if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
-                        break;
+                        PktOutcome::Drop(reason) => match reason {
+                            PktDrop::Short => stats.short += 1,
+                            PktDrop::WrongType => stats.type_dropped += 1,
+                            PktDrop::Length => {
+                                stats.len_dropped += 1;
+                                debug!("UDP 长度不匹配");
+                            }
+                            PktDrop::Replay => {
+                                stats.seq_dropped += 1;
+                                debug!("UDP 序列号过期/重放");
+                            }
+                        },
                     }
                 }
                 Err(e) => {
@@ -380,5 +418,96 @@ impl UdpRecvStats {
             seq_dropped: 0,
             ok: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cipher(key_hex: &str) -> AesCtrCipher {
+        AesCtrCipher::from_hex_key(key_hex).unwrap()
+    }
+
+    /// 构造 type=audio、指定 payload/seq 的 UDP 包（明文字段可直接断言）。
+    /// 注意：base nonce 的 [0..2] 是 type/flags 区，需预置 TYPE_AUDIO。
+    fn build_packet(payload: &[u8], seq: u32) -> Vec<u8> {
+        let mut base = [0u8; HEADER_SIZE];
+        base[0] = TYPE_AUDIO;
+        let hdr = UdpAudioHeader {
+            type_: TYPE_AUDIO,
+            flags: 0,
+            payload_len: payload.len() as u16,
+            ssrc: 0,
+            timestamp: 0,
+            sequence: seq,
+        };
+        let mut pkt = hdr.build_iv(&base).to_vec();
+        pkt.extend_from_slice(payload);
+        pkt
+    }
+
+    #[test]
+    fn delivers_first_and_increasing_packets() {
+        let c = cipher("00000000000000000000000000000000");
+        let mut prev = None;
+        let p1 = build_packet(b"hello", 0);
+        let (outcome, jumped) = process_udp_packet(&p1, p1.len(), &c, &mut prev);
+        assert!(matches!(outcome, PktOutcome::Deliver(_)), "首包应交付");
+        assert!(!jumped);
+        let p2 = build_packet(b"world", 1);
+        let (outcome, jumped) = process_udp_packet(&p2, p2.len(), &c, &mut prev);
+        assert!(matches!(outcome, PktOutcome::Deliver(_)));
+        assert!(!jumped);
+    }
+
+    #[test]
+    fn decrypts_payload_correctly() {
+        let c = cipher("abababababababababababababababab");
+        let mut prev = None;
+        let pkt = build_packet(b"secret-audio", 5);
+        let (PktOutcome::Deliver(payload), _) =
+            process_udp_packet(&pkt, pkt.len(), &c, &mut prev)
+        else {
+            panic!("应交付");
+        };
+        // CTR 自反：再加密一次还原原文。
+        let iv: [u8; HEADER_SIZE] = pkt[..HEADER_SIZE].try_into().unwrap();
+        let mut back = payload;
+        c.apply_keystream(&iv, &mut back);
+        assert_eq!(back, b"secret-audio");
+    }
+
+    #[test]
+    fn drops_short_and_wrong_length() {
+        let c = cipher("00000000000000000000000000000000");
+        let mut prev = None;
+        assert!(matches!(
+            process_udp_packet(b"\x01\x02", 2, &c, &mut prev).0,
+            PktOutcome::Drop(PktDrop::Short)
+        ));
+        // 声明长度与实际不符（少传 1 字节）。
+        let pkt = build_packet(b"abc", 0);
+        let (outcome, _) = process_udp_packet(&pkt, pkt.len() - 1, &c, &mut prev);
+        assert!(matches!(outcome, PktOutcome::Drop(PktDrop::Length)));
+    }
+
+    #[test]
+    fn drops_replay_and_reports_jump() {
+        let c = cipher("00000000000000000000000000000000");
+        let mut prev = None;
+        let p1 = build_packet(b"x", 100);
+        process_udp_packet(&p1, p1.len(), &c, &mut prev);
+        // 重放（seq 不递增）→ 丢弃。
+        let p2 = build_packet(b"y", 100);
+        assert!(matches!(
+            process_udp_packet(&p2, p2.len(), &c, &mut prev).0,
+            PktOutcome::Drop(PktDrop::Replay)
+        ));
+        // 跳跃（101 → 200）→ 接受并标记 jumped。
+        let p3 = build_packet(b"z", 200);
+        let (outcome, jumped) = process_udp_packet(&p3, p3.len(), &c, &mut prev);
+        assert!(matches!(outcome, PktOutcome::Deliver(_)));
+        assert!(jumped);
     }
 }

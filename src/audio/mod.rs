@@ -39,7 +39,6 @@ pub enum PlaybackMsg {
     Audio(Vec<u8>),
     /// 清空播放缓冲（TTS 切换）。
     Flush,
-    Shutdown,
 }
 
 /// 音频管理器：持有设备、流与 DSP worker。
@@ -825,10 +824,7 @@ impl PlaybackWorker {
                 }
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else { break };
-                    match msg {
-                        PlaybackMsg::Shutdown => break,
-                        msg => self.handle_msg(msg).await,
-                    }
+                    self.handle_msg(msg).await;
                 }
             }
             self.diag_and_drift();
@@ -880,8 +876,6 @@ impl PlaybackWorker {
                 self.stats.written += before.saturating_sub(self.out.slots()) as u64;
             }
             PlaybackMsg::Flush => self.buf.reset(),
-            // run() 已过滤 Shutdown，此处不可达。
-            PlaybackMsg::Shutdown => unreachable!(),
         }
     }
 
@@ -1023,5 +1017,27 @@ mod tests {
         // 启动即说话（-55dBFS），阈值应从 min_on 起步，不应吞帧。
         let mut vad = Vad::new();
         assert!(vad.decide(0.0018), "启动即说话被 VAD 吞掉");
+    }
+
+    /// 单次调整受速率限制（≤50ppm/s × 最小采样间隔 1ms = 0.05ppm）。
+    #[test]
+    fn drift_controller_rate_limits_step() {
+        let mut d = DriftController::new(2.0);
+        d.move_toward(1_000_000.0); // 远超限幅的目标
+        assert!(d.current_ppm().abs() <= 0.051, "速率限制未生效");
+    }
+
+    /// 长期大幅调整不越限幅边界（±1000ppm）。
+    #[test]
+    fn drift_controller_never_exceeds_ppm_limit() {
+        let mut d = DriftController::new(2.0);
+        for _ in 0..100_000 {
+            d.move_toward(1_000_000.0);
+        }
+        assert!(d.current_ppm() <= MAX_DRIFT_PPM + 1e-6);
+        for _ in 0..100_000 {
+            d.move_toward(-1_000_000.0);
+        }
+        assert!(d.current_ppm() >= -MAX_DRIFT_PPM - 1e-6);
     }
 }

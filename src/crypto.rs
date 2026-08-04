@@ -118,8 +118,7 @@ mod tests {
         };
         let iv = h.build_iv(&base);
         // type/flags/ssrc 区保留 base nonce，其余为覆写区。
-        assert_eq!(iv[0], 0x01);
-        assert_eq!(iv[1], 0x00);
+        assert_eq!(&iv[0..2], &[0x01, 0x00]);
         assert_eq!(&iv[4..8], &base[4..8]);
         assert_eq!(&iv[2..4], &[0x12, 0x34]);
         assert_eq!(&iv[8..12], &[0xDE, 0xAD, 0xBE, 0xEF]);
