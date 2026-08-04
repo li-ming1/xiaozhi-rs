@@ -131,6 +131,11 @@ impl CircuitBreaker {
     }
 }
 
+/// 连接级丢失错误（传输断开或超时），用于 MQTT 熔断决策。
+fn is_transport_loss(e: &VoiceError) -> bool {
+    matches!(e, VoiceError::Transport(_) | VoiceError::Timeout(_))
+}
+
 /// 丢包估计器：按 60ms 帧到达间隙估算 10s 窗口丢包率。
 struct LossEstimator {
     last: Option<Instant>,
@@ -343,9 +348,7 @@ impl VoiceSupervisor {
 
     /// 连接错误处理：MQTT 失败计入熔断。
     fn on_connect_error(&mut self, e: &VoiceError) {
-        if matches!(e, VoiceError::Transport(_) | VoiceError::Timeout(_))
-            && self.current_transport_kind() == TransportKind::MqttUdp
-        {
+        if is_transport_loss(e) && self.current_transport_kind() == TransportKind::MqttUdp {
             self.mqtt_circuit.record_failure();
         }
         if matches!(e, VoiceError::AuthenticationFailed(_)) {
@@ -377,6 +380,8 @@ impl VoiceSupervisor {
             _ => "WebSocket",
         });
 
+        // 下行发送端固定于本会话（audio 会话内不变），避免每帧重复解包+clone。
+        let playback_tx = self.audio.as_ref().and_then(|a| a.playback_sender());
         let mut s = StreamSession::new();
         let result = loop {
             tokio::select! {
@@ -440,7 +445,7 @@ impl VoiceSupervisor {
                             if kind == TransportKind::MqttUdp {
                                 s.loss.observe_frame(Instant::now());
                             }
-                            if let Some(tx) = self.audio.as_ref().and_then(|a| a.playback_sender())
+                            if let Some(tx) = &playback_tx
                                 && let Err(e) = tx.send(PlaybackMsg::Audio(data)).await
                             {
                                 break Err(VoiceError::Audio(format!("下行队列失败: {}", e)));
@@ -486,9 +491,7 @@ impl VoiceSupervisor {
             }
             self.audio = None;
         }
-        if matches!(e, VoiceError::Transport(_) | VoiceError::Timeout(_))
-            && self.epoch == Some(TransportKind::MqttUdp)
-        {
+        if is_transport_loss(e) && self.epoch == Some(TransportKind::MqttUdp) {
             self.mqtt_circuit.record_failure();
         }
         self.epoch = None;
@@ -720,5 +723,44 @@ mod tests {
         assert_eq!(p.subscribe_topic, "device-server");
         assert_eq!(p.publish_topic, "device-server");
         assert!(!p.tls);
+    }
+
+    /// endpoint 无端口时默认 8883 且强制 TLS（与官方一致）。
+    #[test]
+    fn derive_mqtt_endpoint_without_port_defaults_8883_tls() {
+        let m = OtaMqttConfig {
+            endpoint: Some("mqtt.example.com".into()),
+            ..Default::default()
+        };
+        let p = derive_mqtt(&m, "wss://x", "client-1");
+        assert_eq!(p.host, "mqtt.example.com");
+        assert_eq!(p.port, 8883);
+        assert!(p.tls);
+    }
+
+    /// 退避应始终在 [25ms, 30s] 区间，长期运行不越界。
+    #[test]
+    fn backoff_stays_within_bounds() {
+        let mut b = Backoff::new();
+        for _ in 0..40 {
+            let d = b.next();
+            assert!(d >= Duration::from_millis(25), "delay 过小: {:?}", d);
+            assert!(d <= Duration::from_secs(30), "delay 超上限: {:?}", d);
+        }
+    }
+
+    /// 成功后重置，退避重新从 base 区间（≤250ms）起步。
+    #[test]
+    fn backoff_resets_after_success() {
+        let mut b = Backoff::new();
+        b.next();
+        b.next();
+        b.on_success();
+        let first = b.next();
+        assert!(
+            first <= Duration::from_millis(250),
+            "重置后 delay 仍过大: {:?}",
+            first
+        );
     }
 }

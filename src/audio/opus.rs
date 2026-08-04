@@ -51,8 +51,8 @@ pub struct OpusCodec {
     grade: NetworkGrade,
 }
 
+// Opus 句柄非线程安全，仅允许在 worker 间移动（Send）；所有方法均 &mut self 独占，不共享引用。
 unsafe impl Send for OpusCodec {}
-unsafe impl Sync for OpusCodec {}
 
 fn log_opus_version() {
     OPUS_LIB_INFO_ONCE.call_once(|| {

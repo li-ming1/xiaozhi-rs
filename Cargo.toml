@@ -7,67 +7,61 @@ license = "MIT"
 readme = "README.md"
 
 [dependencies]
-# 异步运行时：多线程，DSP/控制/收发独立调度（io-util 由依赖按需联合，无需显式启用）
+
+# ---- 异步运行时 ----
+# 多线程调度：DSP / 控制 / 收发独立 worker（io-util 等由依赖按需联合，无需显式启用）
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
-# 取消令牌
+# 取消令牌：停机信号（Ctrl+C）
 tokio-util = { version = "0.7", features = ["rt"] }
 
-# WebSocket（rustls 纯 Rust TLS；tungstenite 类型经 tokio-tungstenite re-export，无直接依赖）
-# sink 隐式启用 std，StreamExt/SinkExt 均可用
+# ---- 网络传输（WebSocket / MQTT）----
+# WebSocket：rustls 纯 Rust TLS；tungstenite 类型经 tokio-tungstenite re-export，无直接依赖
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# WS 收发流式处理（sink 隐式启用 std，StreamExt/SinkExt 均可用）
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-
-# HTTP 客户端（OTA/激活）— reqwest 共享 rustls/ring（rustls-no-provider 复用全局安装的 ring provider）
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "webpki-roots", "json"] }
-# rustls：为 tokio-tungstenite / reqwest / rumqttc 安装 ring crypto provider
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-
-# MQTT 客户端（use-rustls-no-provider：注入全局 ring provider 的 ClientConfig）
+# MQTT 客户端：use-rustls-no-provider，复用 rustls 的全局 ring provider
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
-# rustls 根证书（MQTT over TLS 用）
+# rustls：ring crypto provider，由 tokio-tungstenite / reqwest / rumqttc 共用
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# 根证书库（MQTT over TLS）
 webpki-roots = "0.26"
 
+# ---- HTTP / OTA ----
+# 共享 rustls 的 ring provider（rustls-no-provider）
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "webpki-roots", "json"] }
+# HTTP 类型：WebSocket 请求构造 / 通用 URI
+http = "1"
+
+# ---- 音频 ----
+cpal = "0.18"
 # 无锁 SPSC 环形缓冲：CPAL 回调 <-> DSP worker
 rtrb = "0.3"
-
-# 高质量重采样（关闭默认 FFT feature）
+# 高质量重采样（关闭默认 FFT feature，固定 sinc 插值）
 rubato = { version = "4.0", default-features = false }
+# Opus 编解码：opusic-sys 内置绑定（bundled 特性，构建期用 cmake 编译 libopus 并静态链接）
+opusic-sys = "0.7"
 
-# AES-CTR（UDP 音频加密）
+# ---- 加密 ----
+# AES-128-CTR：UDP 音频加密（包头即 IV）
 aes = "0.9"
 ctr = "0.10"
-
-# 序列化
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# UUID（仅 v4 生成，序列化走 String，无需 serde feature）
-uuid = { version = "1", features = ["v4"] }
-
-# 日志
-log = "0.4"
-
-# 错误处理
-anyhow = "1"
-thiserror = "2"
-
-# 加密（HMAC 签名）
+# HMAC-SHA256：激活签名
 sha2 = "0.11"
 hmac = "0.13"
 
-# HTTP 类型（WebSocket 请求构造 / 通用 URI）
-http = "1"
-
-# 音频
-cpal = "0.18"
-
-# Opus 编解码（opusic-sys 内置绑定：默认 bundled 特性，构建期用 cmake 编译 libopus 并静态链接）
-opusic-sys = "0.7"
+# ---- 序列化 / 日志 / 错误 ----
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# UUID v4（仅生成，序列化走 String，无需 serde feature）
+uuid = { version = "1", features = ["v4"] }
+log = "0.4"
+anyhow = "1"
+thiserror = "2"
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-# abort：移除 unwind 表，显著减小体积。panic hook 仍会先执行（写退出原因日志）。
+# abort：移除 unwind 表，显著减小体积；panic hook 仍会先执行（写退出原因日志）
 panic = "abort"
 strip = true

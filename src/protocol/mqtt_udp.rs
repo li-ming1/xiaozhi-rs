@@ -287,7 +287,8 @@ async fn udp_recv_loop(
     mut close_rx: watch::Receiver<()>,
 ) {
     let mut buf = vec![0u8; UDP_MAX_PACKET];
-    let mut remote_sequence: u32 = 0;
+    // 防重放基准：None 表示尚未收到首包（首包无条件接受，服务器 seq 可能从 0 开始）。
+    let mut remote_sequence: Option<u32> = None;
     let mut stats = UdpRecvStats::new();
     loop {
         tokio::select! {
@@ -311,19 +312,21 @@ async fn udp_recv_loop(
                         continue;
                     }
                     // 防重放：序列号必须单调递增（允许跳跃，丢弃过期包）。
-                    if hdr.sequence <= remote_sequence {
-                        stats.seq_dropped += 1;
-                        debug!("UDP 序列号过期/重放: {} <= {}", hdr.sequence, remote_sequence);
-                        continue;
+                    if let Some(prev) = remote_sequence {
+                        if hdr.sequence <= prev {
+                            stats.seq_dropped += 1;
+                            debug!("UDP 序列号过期/重放: {} <= {}", hdr.sequence, prev);
+                            continue;
+                        }
+                        if hdr.sequence != prev.wrapping_add(1) {
+                            debug!(
+                                "UDP 序列号跳跃: 期望 {} 得 {}",
+                                prev.wrapping_add(1),
+                                hdr.sequence
+                            );
+                        }
                     }
-                    if hdr.sequence != remote_sequence.wrapping_add(1) {
-                        debug!(
-                            "UDP 序列号跳跃: 期望 {} 得 {}",
-                            remote_sequence.wrapping_add(1),
-                            hdr.sequence
-                        );
-                    }
-                    remote_sequence = hdr.sequence;
+                    remote_sequence = Some(hdr.sequence);
 
                     let mut payload = buf[HEADER_SIZE..n].to_vec();
                     cipher.apply_keystream(&iv, &mut payload);

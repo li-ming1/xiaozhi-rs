@@ -53,12 +53,15 @@ impl PlaybackBuffer {
         } else if let Some(since) = self.stable_since
             && now.duration_since(since) >= SHRINK_STABLE_DURATION
         {
-            // 稳定足够久，每次下降一帧。
+            // 稳定足够久，每次下降一帧（保留 desired 一帧余量，防止过度收缩）。
             let frame = self.frame_ms.max(1);
             if self.target_ms > TARGET_MIN_MS && self.target_ms >= desired + frame {
                 self.target_ms -= frame;
                 self.stable_since = Some(now);
             }
+        } else if self.stable_since.is_none() {
+            // 首次进入"无需增长"：开始稳定计时，满 SHRINK_STABLE_DURATION 后才允许收缩。
+            self.stable_since = Some(now);
         }
     }
 
@@ -96,5 +99,36 @@ mod tests {
         b.update_target(now + std::time::Duration::from_secs(2));
         assert!(b.target_ms() >= 60, "target={}", b.target_ms());
         assert!(b.target_ms() <= TARGET_MAX_MS);
+    }
+
+    /// 回归：稳定期计时启动后，抖动回落且稳定满 30s，目标深度应开始下降。
+    /// 注意：所有 Instant 参数必须单调递增（duration_since 反向会 panic）。
+    #[test]
+    fn target_shrinks_after_stable_period() {
+        let mut b = PlaybackBuffer::new(60);
+        let now = Instant::now();
+        // 高抖动（间隔 60+200ms）使目标深度增长到上限。
+        for i in 0..20 {
+            let t = now + std::time::Duration::from_millis(60 + 260 * i);
+            b.observe_arrival(t);
+        }
+        b.update_target(now + std::time::Duration::from_secs(5));
+        let grown = b.target_ms();
+        assert!(grown > 60, "target 未增长: {}", grown);
+        // 增长后首次"无需增长"：启动稳定计时。
+        b.update_target(now + std::time::Duration::from_secs(6));
+        // 抖动归零（严格 60ms 间隔，首帧紧接上轮尾帧）、稳定满 30s：
+        // EWMA 衰减使 desired 回落，应下降至少一帧。
+        for i in 0..20 {
+            let t = now + std::time::Duration::from_millis(5060 + 60 * i);
+            b.observe_arrival(t);
+        }
+        b.update_target(now + std::time::Duration::from_secs(38));
+        assert!(
+            b.target_ms() < grown,
+            "稳定 30s 后 target 未收缩: {} -> {}",
+            grown,
+            b.target_ms()
+        );
     }
 }

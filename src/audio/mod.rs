@@ -503,22 +503,26 @@ impl Agc {
 
     /// 对一帧做 AGC。`rms`/`peak` 由调用方传入（复用 VAD 已算的帧统计，避免重复遍历）。
     fn process_frame(&mut self, frame: &mut [f32], rms: f32, peak: f32) {
-        if rms >= self.voice_threshold {
-            let mut target = (self.target_rms / rms).clamp(1.0, self.max_gain);
-            // 峰值防削波：增益上限不超过 0.85/peak。
-            if peak > 0.0 {
-                target = target.min(0.85 / peak);
-            }
-            let alpha = if target > self.gain { 0.5 } else { 0.2 };
-            self.gain += (target - self.gain) * alpha;
-            let g = self.gain;
-            for s in frame.iter_mut() {
-                *s = (*s * g).clamp(-0.98, 0.98);
-            }
-        } else {
-            // 静音帧不放大，内部增益缓慢回落待命。
-            self.gain += (1.0 - self.gain) * 0.1;
+        if rms < self.voice_threshold {
+            self.decay();
+            return;
         }
+        let mut target = (self.target_rms / rms).clamp(1.0, self.max_gain);
+        // 峰值防削波：增益上限不超过 0.85/peak。
+        if peak > 0.0 {
+            target = target.min(0.85 / peak);
+        }
+        let alpha = if target > self.gain { 0.5 } else { 0.2 };
+        self.gain += (target - self.gain) * alpha;
+        let g = self.gain;
+        for s in frame.iter_mut() {
+            *s = (*s * g).clamp(-0.98, 0.98);
+        }
+    }
+
+    /// 静音帧：不放大，内部增益缓慢回落待命（由 VAD 静音分支调用）。
+    fn decay(&mut self) {
+        self.gain += (1.0 - self.gain) * 0.1;
     }
 }
 
@@ -717,6 +721,8 @@ impl CaptureWorker {
                 }
             } else {
                 self.stats.silence_frames += 1;
+                // 静音帧：增益回落待命（不放大）。
+                self.agc.decay();
             }
         }
     }

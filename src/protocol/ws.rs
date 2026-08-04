@@ -58,7 +58,6 @@ impl WsTransport {
             sender,
             control_rx,
             audio_rx_slot,
-            binary_version,
             session_start,
             close_rx.clone(),
         ));
@@ -106,7 +105,10 @@ async fn connect_and_handshake(
         .map_err(|e| VoiceError::Transport(format!("WebSocket 连接失败: {}", e)))?;
 
     let (sink, stream) = ws_stream.split();
-    let mut sender = WsSender { sink };
+    let mut sender = WsSender {
+        sink,
+        binary_version,
+    };
     let mut receiver = WsReceiver { stream };
 
     let hello = match binary_version {
@@ -154,12 +156,25 @@ async fn connect_and_handshake(
     Ok((sender, receiver, session_id, server_audio))
 }
 
-/// WebSocket 发送端：独占 SplitSink。
+/// WebSocket 发送端：独占 SplitSink，封装协议版本对应的音频帧构造与分发。
 struct WsSender {
     sink: futures_util::stream::SplitSink<WsStream, WsMessage>,
+    binary_version: u16,
 }
 
 impl WsSender {
+    /// 按协议版本分发音频帧发送（时间戳仅 v2 需要）。
+    async fn send_audio(&mut self, opus: &[u8], session_start: Instant) -> Result<()> {
+        match self.binary_version {
+            2 => {
+                let ts = session_start.elapsed().as_millis() as u32;
+                self.send_audio_v2(opus, ts).await
+            }
+            3 => self.send_audio_v3(opus).await,
+            _ => self.send_audio_raw(opus).await,
+        }
+    }
+
     async fn send_json(&mut self, msg: &ClientMessage) -> Result<()> {
         let json = serde_json::to_string(msg)?;
         debug!("WS 发送 JSON: {}", json);
@@ -173,7 +188,7 @@ impl WsSender {
     async fn send_audio_v2(&mut self, opus: &[u8], timestamp_ms: u32) -> Result<()> {
         // BinaryProtocol2 为网络字节序（大端），version/type/payload_size 均 htons/htonl。
         let mut frame = Vec::with_capacity(V2_HEADER_SIZE + opus.len());
-        frame.extend_from_slice(&2u16.to_be_bytes());
+        frame.extend_from_slice(&self.binary_version.to_be_bytes());
         frame.extend_from_slice(&V2_TYPE_OPUS.to_be_bytes());
         frame.extend_from_slice(&0u32.to_be_bytes());
         frame.extend_from_slice(&timestamp_ms.to_be_bytes());
@@ -255,7 +270,6 @@ async fn send_loop(
     mut sender: WsSender,
     mut control_rx: mpsc::Receiver<ClientMessage>,
     audio_slot: super::LatestSlot<Vec<u8>>,
-    binary_version: u16,
     session_start: Instant,
     mut close_rx: watch::Receiver<()>,
 ) {
@@ -277,15 +291,7 @@ async fn send_loop(
                 }
             }
             opus = audio_slot.take() => {
-                let res = match binary_version {
-                    2 => {
-                        let ts = session_start.elapsed().as_millis() as u32;
-                        sender.send_audio_v2(&opus, ts).await
-                    }
-                    3 => sender.send_audio_v3(&opus).await,
-                    _ => sender.send_audio_raw(&opus).await,
-                };
-                if let Err(e) = res {
+                if let Err(e) = sender.send_audio(&opus, session_start).await {
                     warn!("WS 音频发送失败: {}", e);
                     break;
                 }

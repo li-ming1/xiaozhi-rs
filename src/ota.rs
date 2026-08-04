@@ -197,3 +197,35 @@ pub async fn wait_for_activation(identity: &DeviceIdentity, challenge: &str) -> 
 
     Err(anyhow!("激活码已过期（60秒超时）"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 脱敏必须覆盖 websocket.token 与 mqtt 密码类字段，其余字段原样保留。
+    #[test]
+    fn mask_sensitive_redacts_secrets() {
+        let v = serde_json::json!({
+            "websocket": { "url": "wss://x", "token": "secret-token" },
+            "mqtt": { "endpoint": "mqtt://x", "password": "p1", "pwd": "p2", "secret": "p3" },
+            "other": "keep"
+        });
+        let masked = mask_sensitive(v);
+        assert_eq!(masked["websocket"]["token"], "***");
+        assert_eq!(masked["mqtt"]["password"], "***");
+        assert_eq!(masked["mqtt"]["pwd"], "***");
+        assert_eq!(masked["mqtt"]["secret"], "***");
+        assert_eq!(masked["websocket"]["url"], "wss://x");
+        assert_eq!(masked["mqtt"]["endpoint"], "mqtt://x");
+        assert_eq!(masked["other"], "keep");
+    }
+
+    /// 无敏感字段时不应误改其他字段。
+    #[test]
+    fn mask_sensitive_leaves_absent_fields_untouched() {
+        let v = serde_json::json!({ "websocket": { "url": "wss://x" } });
+        let masked = mask_sensitive(v);
+        assert_eq!(masked["websocket"].get("token"), None);
+        assert_eq!(masked["websocket"]["url"], "wss://x");
+    }
+}

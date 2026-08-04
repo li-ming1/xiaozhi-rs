@@ -51,9 +51,9 @@ async fn main() -> Result<()> {
 
 fn print_usage() {
     println!("小智客户端 v{}", env!("CARGO_PKG_VERSION"));
-    println!("用法: xiaozhi-rs <COMMAND>");
+    println!("用法: xiaozhi-rs <命令>");
     println!();
-    println!("Commands:");
+    println!("命令:");
     println!("  start   启动语音对话");
     println!("  skip    跳过激活直接启动");
     println!("  info    显示设备信息");
