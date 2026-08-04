@@ -9,9 +9,10 @@
 - **Opus 编解码** — 上行 16kHz/单声道/60ms，下行采样率服从服务器协商（16/24/48kHz）；`opusic-sys` 构建期静态内置 libopus，运行时零外部依赖
 - **高质量重采样** — rubato 4.0 `AsyncSincFixedIn`（256-tap BlackmanHarris2），替代旧 Catmull-Rom；±1000ppm 时钟漂移实时补偿
 - **无锁实时管线** — CPAL 回调零锁零分配，捕获/播放独立 DSP worker，rtrb SPSC 环形缓冲
-- **自适应码率** — 按 10s 丢包窗口在 32/28/20kbps + FEC/DTX 间分级切换
+- **语音活动检测** — 本地 VAD 静音抑制：静音帧不编码不上行，降低背景噪声对服务器 ASR/VAD 的干扰，空闲时零上行开销
+- **自适应码率** — 按 10s 丢包窗口分级（Good/Fair/Poor）：编码侧 32/28/20kbps + FEC/DTX 切换，弱网同步启用解码侧 FEC 恢复
 - **流畅听感加固** — 输出欠载 5ms 软静音、Opus PLC、自适应深度播放缓冲（40–240ms）、TTS 切换清缓冲
-- **稳健连接** — 心跳保活 + decorrelated-jitter 无限退避；会话纪元隔离，任何状态不跨连接复用
+- **稳健连接** — 心跳保活 + decorrelated-jitter 无限退避；每次会话重建连接状态，任何状态不跨连接复用
 - **设备激活** — OTA 配置拉取 + HMAC-SHA256 签名激活
 - **跨平台** — Windows / macOS / Linux 一套代码（含 x64 与 ARM64）
 - **纯 Rust TLS** — rustls + ring，无需安装 OpenSSL
@@ -97,8 +98,8 @@ RUST_LOG=debug xiaozhi-rs start
 src/
 ├── main.rs          CLI 入口 + 多线程 runtime + ring TLS provider + 日志器
 ├── lib.rs           模块声明与公共导出
-├── supervisor.rs    VoiceSupervisor 状态机（SelectTransport→Connect→Streaming→Backoff）+ RealtimeVoice 入口
-├── error.rs         类型化错误（认证/瞬态/协议/音频等分级）
+├── supervisor.rs    VoiceSupervisor 状态机（SelectTransport→Connect→Streaming→Backoff）+ RealtimeVoice 入口 + 传输类型
+├── error.rs         类型化错误（认证/瞬态/协议/音频等）
 ├── identity.rs      设备身份（MAC 派生、HMAC、efuse 持久化）
 ├── ota.rs           OTA 配置拉取 + 激活轮询（reqwest）
 ├── crypto.rs        AES-128-CTR + UDP 16 字节包头编解码（IV=包头）
@@ -108,8 +109,8 @@ src/
 │   ├── ws.rs        WebSocket v1/v2/v3 传输（心跳 15s）
 │   └── mqtt_udp.rs  MQTT+UDP 主链路（QoS0、防重放、UDP 黑洞检测）
 └── audio/
-    ├── mod.rs       无锁管线：CPAL 回调 + 独立 DSP worker + 漂移补偿
-    ├── opus.rs      Opus 编解码（opusic-sys 静态内置）+ PLC + 自适应码率
+    ├── mod.rs       无锁管线：CPAL 回调 + 独立 DSP worker（CaptureWorker/PlaybackWorker）+ 漂移补偿
+    ├── opus.rs      Opus 编解码（opusic-sys 静态内置）+ PLC + 网络分级
     ├── resample.rs  rubato AsyncSinc（256-tap BlackmanHarris2）
     └── buffer.rs    自适应深度播放缓冲（40–240ms）
 ```

@@ -15,8 +15,6 @@ fn write_exit_reason(msg: &str) {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
-    #[cfg(windows)]
-    xiaozhi_rs::crash::install();
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("[panic] {:?}", info);
         eprintln!("{}", msg);

@@ -10,17 +10,8 @@ use opusic_sys::{
     OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST,
 };
 use std::ffi::{c_int, CStr};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Once;
 
-/// 崩溃诊断：最近一次执行的 opus 操作（供未处理异常过滤器读取）。
-pub(crate) static LAST_OPUS_CALL: AtomicU8 = AtomicU8::new(0);
-pub(crate) const OPUS_CALL_NONE: u8 = 0;
-pub(crate) const OPUS_CALL_ENCODE: u8 = 1;
-pub(crate) const OPUS_CALL_DECODE: u8 = 2;
-pub(crate) const OPUS_CALL_CTL: u8 = 3;
-pub(crate) const OPUS_CALL_DESTROY: u8 = 4;
-pub(crate) static LAST_OPUS_CTL_REQUEST: AtomicU32 = AtomicU32::new(0);
 /// 进程级：内置库版本信息只打印一次。
 static OPUS_LIB_INFO_ONCE: Once = Once::new();
 
@@ -140,20 +131,16 @@ impl OpusCodec {
             NetworkGrade::Poor => (20_000, 0, 1, 1, 1),
         };
         let set = |request: c_int, value: c_int| {
-            LAST_OPUS_CTL_REQUEST.store(request as u32, Ordering::Relaxed);
             let ret = unsafe { opus_encoder_ctl_fixed(self.encoder, request, value) };
             if ret != OPUS_OK {
                 warn!("opus_encoder_ctl({}) 失败: {}", request, opus_error_desc(ret));
             }
         };
-        LAST_OPUS_CALL.store(OPUS_CALL_CTL, Ordering::Relaxed);
         set(OPUS_SET_BITRATE_REQUEST, bitrate);
         set(OPUS_SET_VBR_REQUEST, vbr);
         set(OPUS_SET_VBR_CONSTRAINT_REQUEST, constrained);
         set(OPUS_SET_INBAND_FEC_REQUEST, fec);
         set(OPUS_SET_DTX_REQUEST, dtx);
-        LAST_OPUS_CTL_REQUEST.store(0, Ordering::Relaxed);
-        LAST_OPUS_CALL.store(OPUS_CALL_NONE, Ordering::Relaxed);
     }
 
     /// 设置编码复杂度（0-10），默认 10。
@@ -173,7 +160,6 @@ impl OpusCodec {
                 ENCODER_FRAME_SIZE
             )));
         }
-        LAST_OPUS_CALL.store(OPUS_CALL_ENCODE, Ordering::Relaxed);
         let len = unsafe {
             opus_encode_float(
                 self.encoder,
@@ -183,7 +169,6 @@ impl OpusCodec {
                 MAX_PACKET_SIZE as c_int,
             )
         };
-        LAST_OPUS_CALL.store(OPUS_CALL_NONE, Ordering::Relaxed);
         if len < 0 {
             return Err(VoiceError::Opus(format!(
                 "Opus 编码失败: {}",
@@ -195,7 +180,6 @@ impl OpusCodec {
 
     /// 解码 Opus 包为 f32 PCM。`input` 为空时执行 PLC；`fec` 为 true 时尝试带内 FEC 恢复。
     pub fn decode(&mut self, input: &[u8], fec: bool) -> Result<Vec<f32>> {
-        LAST_OPUS_CALL.store(OPUS_CALL_DECODE, Ordering::Relaxed);
         let samples = if input.is_empty() {
             unsafe {
                 opus_decode_float(
@@ -219,7 +203,6 @@ impl OpusCodec {
                 )
             }
         };
-        LAST_OPUS_CALL.store(OPUS_CALL_NONE, Ordering::Relaxed);
         if samples < 0 {
             return Err(VoiceError::Opus(format!(
                 "Opus 解码失败: {}",
@@ -232,14 +215,12 @@ impl OpusCodec {
 
 impl Drop for OpusCodec {
     fn drop(&mut self) {
-        LAST_OPUS_CALL.store(OPUS_CALL_DESTROY, Ordering::Relaxed);
         if !self.encoder.is_null() {
             unsafe { opus_encoder_destroy(self.encoder) };
         }
         if !self.decoder.is_null() {
             unsafe { opus_decoder_destroy(self.decoder) };
         }
-        LAST_OPUS_CALL.store(OPUS_CALL_NONE, Ordering::Relaxed);
     }
 }
 

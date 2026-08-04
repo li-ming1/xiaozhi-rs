@@ -64,10 +64,6 @@ cpal = "0.18"
 # Opus 编解码（opusic-sys 内置绑定：默认 bundled 特性，构建期用 cmake 编译 libopus 并静态链接）
 opusic-sys = "0.7"
 
-# Windows 未处理异常过滤器（诊断原生崩溃）
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader"] }
-
 [profile.release]
 opt-level = 3
 lto = "fat"
