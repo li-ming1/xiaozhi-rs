@@ -91,9 +91,7 @@ impl MqttUdpTransport {
                 .await
                 .map_err(|e| VoiceError::Transport(format!("UDP 绑定失败: {}", e)))?,
         );
-        let addr: SocketAddr = format!("{}:{}", negotiated.udp.server, negotiated.udp.port)
-            .parse()
-            .map_err(|e| VoiceError::InvalidConfig(format!("UDP 地址无效: {}", e)))?;
+        let addr = resolve_udp_addr(&negotiated.udp.server, negotiated.udp.port).await?;
         udp_socket
             .connect(addr)
             .await
@@ -126,6 +124,22 @@ impl MqttUdpTransport {
             _close: close_tx,
         })
     }
+}
+
+/// 解析 UDP 服务器地址。服务器可能返回 IP 字面量（IPv4/IPv6）或域名：
+/// 先按 `[host]:port` 解析 SocketAddr，失败再交给系统 DNS 解析（覆盖域名与裸 IPv6）。
+async fn resolve_udp_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    if let Ok(addr) = format!("[{host}]:{port}").parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(addr) = format!("{host}:{port}").parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| VoiceError::InvalidConfig(format!("UDP 地址解析失败: {}", e)))?
+        .next()
+        .ok_or_else(|| VoiceError::InvalidConfig(format!("UDP 地址无解析结果: {}", host)))
 }
 
 /// 构建 MQTT 选项（TLS 用 ring provider 注入的 ClientConfig）。
