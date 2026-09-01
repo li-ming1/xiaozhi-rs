@@ -4,8 +4,8 @@ use anyhow::Result;
 use log::info;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// 设备身份凭证，同时作为 WebSocket 握手载荷。
@@ -190,8 +190,10 @@ impl DeviceIdentity {
     fn generate_mac_address() -> String {
         let bytes = *Uuid::new_v4().as_bytes();
         let b0 = (bytes[0] & 0xFE) | 0x02;
-        format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            b0, bytes[1], bytes[2], bytes[3], bytes[4], bytes[5])
+        format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            b0, bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+        )
     }
 
     /// 测试用 MAC（服务器自动授权）。
@@ -206,8 +208,7 @@ impl DeviceIdentity {
         use hmac::{KeyInit, Mac, SimpleHmac};
         type HmacSha256 = SimpleHmac<Sha256>;
 
-        let mut mac = HmacSha256::new_from_slice(self.hmac_key.as_bytes())
-            .expect("HMAC初始化失败");
+        let mut mac = HmacSha256::new_from_slice(self.hmac_key.as_bytes()).expect("HMAC初始化失败");
         mac.update(challenge.as_bytes());
         to_hex(&mac.finalize().into_bytes())
     }

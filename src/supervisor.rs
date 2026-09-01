@@ -1,5 +1,5 @@
 //! `VoiceSupervisor`：连接生命周期状态机。
-//! `SelectTransport -> Connect -> Streaming -> Backoff`，网络瞬断/热插拔/服务故障均在内部恢复。
+//! `Connect -> Streaming -> Backoff`，网络瞬断/热插拔/服务故障均在内部恢复。
 //! 策略：decorrelated-jitter 退避（250ms~30s）；MQTT 熔断；UDP 黑洞检测；10s 窗口网络分级。
 
 use std::time::{Duration, Instant};
@@ -9,13 +9,11 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::opus::NetworkGrade;
-use crate::audio::{AudioManager, PlaybackMsg};
+use crate::audio::{AudioPipeline, PlaybackMsg};
 use crate::error::{Result, VoiceError};
 use crate::identity::DeviceIdentity;
 use crate::ota::{OtaConfig, OtaMqttConfig};
 use crate::protocol::message::{ClientMessage, ListenState, ServerMessage, TtsState};
-use crate::protocol::mqtt_udp::MqttUdpTransport;
-use crate::protocol::ws::WsTransport;
 use crate::protocol::{
     ConnectParams, IncomingEvent, MqttParams, TransportAdapter, TransportHandles,
 };
@@ -30,10 +28,9 @@ enum TransportKind {
 /// 建连整体超时（TCP/TLS 握手无响应时兜底，避免状态机卡死）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 状态机。
+/// 状态机。传输选择在 Connect 内即时判定，无独立状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    SelectTransport,
     Connect,
     Streaming,
     Backoff,
@@ -58,7 +55,8 @@ impl Backoff {
     }
 
     fn next(&mut self) -> Duration {
-        self.rng = self.rng
+        self.rng = self
+            .rng
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         // shift 恒 ≤ 8，`1 << shift` 不会溢出。
@@ -109,12 +107,15 @@ impl CircuitBreaker {
     /// 记录一次失败；返回是否本次打开熔断。
     fn record_failure(&mut self) -> bool {
         let now = Instant::now();
-        self.failures.retain(|t| now.duration_since(*t) < Self::FAIL_WINDOW);
+        self.failures
+            .retain(|t| now.duration_since(*t) < Self::FAIL_WINDOW);
         self.failures.push(now);
         if self.failures.len() >= 2 {
             self.open_count += 1;
             let multiplier = 1u32.checked_shl(self.open_count.min(4)).unwrap_or(1);
-            let cooldown = Self::OPEN_COOLDOWN.saturating_mul(multiplier).min(Self::OPEN_COOLDOWN_MAX);
+            let cooldown = Self::OPEN_COOLDOWN
+                .saturating_mul(multiplier)
+                .min(Self::OPEN_COOLDOWN_MAX);
             self.cooldown_until = Some(now + cooldown);
             self.failures.clear();
             info!("MQTT 熔断 {}s", cooldown.as_secs());
@@ -199,13 +200,13 @@ impl LossEstimator {
     }
 }
 
-/// 监督器。
+/// 监督器：实时语音客户端入口（由 main 构造并驱动运行）。
 pub struct VoiceSupervisor {
     identity: DeviceIdentity,
     ota: OtaConfig,
     shutdown: CancellationToken,
     state: State,
-    audio: Option<AudioManager>,
+    audio: Option<AudioPipeline>,
     backoff: Backoff,
     mqtt_circuit: CircuitBreaker,
     /// 当前会话的传输类型（每次建连重建，标记"纪元"）。
@@ -216,12 +217,12 @@ pub struct VoiceSupervisor {
 
 impl VoiceSupervisor {
     pub fn new(identity: DeviceIdentity, ota: OtaConfig, shutdown: CancellationToken) -> Self {
-        let audio = AudioManager::new().ok();
+        let audio = AudioPipeline::new().ok();
         Self {
             identity,
             ota,
             shutdown,
-            state: State::SelectTransport,
+            state: State::Connect,
             audio,
             backoff: Backoff::new(),
             mqtt_circuit: CircuitBreaker::new(),
@@ -246,7 +247,6 @@ impl VoiceSupervisor {
                 heartbeat = Instant::now();
             }
             self.state = match self.state {
-                State::SelectTransport => State::Connect,
                 State::Connect => match self.connect().await {
                     Ok(()) => State::Streaming,
                     Err(e) => {
@@ -259,7 +259,7 @@ impl VoiceSupervisor {
                     Ok(()) => {
                         info!("会话正常结束，重新连接");
                         self.cleanup_session();
-                        State::SelectTransport
+                        State::Connect
                     }
                     Err(e) => {
                         warn!("流式会话结束: {}", e);
@@ -277,7 +277,7 @@ impl VoiceSupervisor {
                             return Ok(());
                         }
                     }
-                    State::SelectTransport
+                    State::Connect
                 }
             };
         }
@@ -335,12 +335,14 @@ impl VoiceSupervisor {
             );
         }
         let adapter = match kind {
-            TransportKind::MqttUdp => TransportAdapter::MqttUdp(MqttUdpTransport),
-            TransportKind::WebSocket => TransportAdapter::WebSocket(WsTransport),
+            TransportKind::MqttUdp => TransportAdapter::MqttUdp,
+            TransportKind::WebSocket => TransportAdapter::WebSocket,
         };
         let handles = tokio::time::timeout(CONNECT_TIMEOUT, adapter.connect(&params))
             .await
-            .map_err(|_| VoiceError::Timeout(format!("连接超时（{}s）", CONNECT_TIMEOUT.as_secs())))??;
+            .map_err(|_| {
+                VoiceError::Timeout(format!("连接超时（{}s）", CONNECT_TIMEOUT.as_secs()))
+            })??;
         self.epoch = Some(kind);
         self.handles = Some(handles);
         self.backoff.on_success();
@@ -377,10 +379,13 @@ impl VoiceSupervisor {
             .await
             .map_err(|e| VoiceError::Transport(format!("发送 listen 失败: {}", e)))?;
 
-        info!("会话开始（{}）", match kind {
-            TransportKind::MqttUdp => "MQTT+UDP",
-            _ => "WebSocket",
-        });
+        info!(
+            "会话开始（{}）",
+            match kind {
+                TransportKind::MqttUdp => "MQTT+UDP",
+                _ => "WebSocket",
+            }
+        );
 
         // 下行发送端固定于本会话（audio 会话内不变），避免每帧重复解包+clone。
         let playback_tx = self.audio.as_ref().and_then(|a| a.playback_sender());
@@ -487,7 +492,7 @@ impl VoiceSupervisor {
         encoded_tx: crate::protocol::LatestSlot<Vec<u8>>,
     ) -> Result<()> {
         if self.audio.is_none() {
-            self.audio = Some(AudioManager::new().map_err(|e| {
+            self.audio = Some(AudioPipeline::new().map_err(|e| {
                 warn!("音频设备不可用: {}", e);
                 VoiceError::Audio(format!("音频设备不可用: {}", e))
             })?);
@@ -561,7 +566,10 @@ fn derive_mqtt(m: &OtaMqttConfig, ws_url: &str, client_id: &str) -> MqttParams {
         tls,
         username: m.username.clone().unwrap_or_default(),
         password: m.password.clone().unwrap_or_default(),
-        mqtt_client_id: m.client_id.clone().unwrap_or_else(|| format!("xz-{}", client_id)),
+        mqtt_client_id: m
+            .client_id
+            .clone()
+            .unwrap_or_else(|| format!("xz-{}", client_id)),
         publish_topic,
         subscribe_topic,
     }
@@ -618,7 +626,7 @@ impl StreamSession {
 async fn handle_json(
     msg: ServerMessage,
     ctx: &mut SessionCtx,
-    audio: Option<&AudioManager>,
+    audio: Option<&AudioPipeline>,
 ) -> Result<Option<()>> {
     match msg {
         ServerMessage::Tts { state, text } => match state {
@@ -630,9 +638,9 @@ async fn handle_json(
                 if let Some(a) = audio
                     && let Some(tx) = a.playback_sender()
                 {
-                    tx.send(PlaybackMsg::Flush).await.map_err(|e| {
-                        VoiceError::Audio(format!("TTS 清缓冲失败: {}", e))
-                    })?;
+                    tx.send(PlaybackMsg::Flush)
+                        .await
+                        .map_err(|e| VoiceError::Audio(format!("TTS 清缓冲失败: {}", e)))?;
                 }
             }
             TtsState::Stop => {
@@ -667,25 +675,6 @@ async fn handle_json(
         ServerMessage::Unknown => {}
     }
     Ok(None)
-}
-
-/// 实时语音客户端入口：对外唯一接口，内部由 [`VoiceSupervisor`] 恢复各类故障。
-pub struct RealtimeVoice {
-    identity: DeviceIdentity,
-    ota: OtaConfig,
-}
-
-impl RealtimeVoice {
-    /// 由设备身份与 OTA 配置构造。
-    pub fn from_ota(identity: DeviceIdentity, ota: OtaConfig) -> Result<Self> {
-        Ok(Self { identity, ota })
-    }
-
-    /// 运行至 `shutdown` 取消或不可恢复错误。
-    pub async fn run_until(self, shutdown: CancellationToken) -> Result<()> {
-        let mut supervisor = VoiceSupervisor::new(self.identity, self.ota, shutdown);
-        supervisor.run().await
-    }
 }
 
 #[cfg(test)]

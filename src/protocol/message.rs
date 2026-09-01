@@ -24,10 +24,7 @@ pub enum ClientMessage {
     },
     /// 中断会话：异常结束/主动打断时通知服务器清理其会话状态
     /// （否则服务器滞留旧会话，新会话音频会被忽略约 60s）。
-    Abort {
-        session_id: String,
-        reason: String,
-    },
+    Abort { session_id: String, reason: String },
 }
 
 #[cfg(test)]

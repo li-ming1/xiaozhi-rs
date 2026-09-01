@@ -1,6 +1,6 @@
 //! OTA 配置拉取与激活轮询（reqwest，共享 rustls/ring）。
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -58,9 +58,7 @@ pub struct ActivationData {
 
 /// 脱敏 OTA 响应：websocket.token 与 mqtt 密码字段以 `***` 替代，供日志打印。
 fn mask_sensitive(mut v: serde_json::Value) -> serde_json::Value {
-    if let Some(ws) = v
-        .get_mut("websocket")
-        .and_then(|w| w.as_object_mut())
+    if let Some(ws) = v.get_mut("websocket").and_then(|w| w.as_object_mut())
         && let Some(t) = ws.get_mut("token")
     {
         *t = serde_json::Value::String("***".into());
@@ -111,7 +109,10 @@ pub async fn fetch_config(identity: &DeviceIdentity) -> Result<OtaConfig> {
         .header("Client-Id", &identity.client_id)
         .header(
             "User-Agent",
-            format!("bread-compact-wifi/xiaozhi-rs-{}", env!("CARGO_PKG_VERSION")),
+            format!(
+                "bread-compact-wifi/xiaozhi-rs-{}",
+                env!("CARGO_PKG_VERSION")
+            ),
         )
         .header("Accept-Language", "zh-CN")
         .json(&payload)

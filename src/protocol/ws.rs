@@ -7,13 +7,16 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 use tokio::sync::{mpsc, watch};
 use tokio::time::interval;
+use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
-use tokio_tungstenite::{connect_async_tls_with_config, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
 use crate::error::{Result, VoiceError};
 use crate::protocol::message::{AudioParams, ClientMessage, ServerMessage};
 
-use super::{ConnectParams, IncomingEvent, TransportHandles, CONTROL_CHANNEL_CAP, INCOMING_CHANNEL_CAP};
+use super::{
+    CONTROL_CHANNEL_CAP, ConnectParams, INCOMING_CHANNEL_CAP, IncomingEvent, TransportHandles,
+};
 
 const V2_HEADER_SIZE: usize = 16;
 const V3_HEADER_SIZE: usize = 4;
@@ -22,37 +25,37 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// WebSocket 传输（固定二进制协议 v2）。
-pub struct WsTransport;
+/// WebSocket 传输建连（固定二进制协议 v2）：握手协商 + 启动收发任务。
+pub async fn connect(params: &ConnectParams) -> Result<TransportHandles> {
+    let (sender, receiver, session_id, server_audio) = connect_and_handshake(params).await?;
 
-impl WsTransport {
-    pub async fn connect(self, params: &ConnectParams) -> Result<TransportHandles> {
-        let (sender, receiver, session_id, server_audio) = connect_and_handshake(params).await?;
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
+    let (audio_tx_slot, audio_rx_slot) = super::LatestSlot::<Vec<u8>>::new().pipe();
+    let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
+    // 会话关闭信号：handles drop（Sender 失效）→ 后台任务 `changed()` 返回 Err 退出。
+    let (close_tx, close_rx) = watch::channel(());
 
-        let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
-        let (audio_tx_slot, audio_rx_slot) = super::LatestSlot::<Vec<u8>>::new().pipe();
-        let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
-        // 会话关闭信号：handles drop（Sender 失效）→ 后台任务 `changed()` 返回 Err 退出。
-        let (close_tx, close_rx) = watch::channel(());
+    tokio::spawn(send_loop(
+        sender,
+        control_rx,
+        audio_rx_slot,
+        close_rx.clone(),
+    ));
+    tokio::spawn(recv_loop(receiver, incoming_tx.clone(), close_rx));
 
-        tokio::spawn(send_loop(sender, control_rx, audio_rx_slot, close_rx.clone()));
-        tokio::spawn(recv_loop(receiver, incoming_tx.clone(), close_rx));
-
-        Ok(TransportHandles {
-            session_id,
-            server_audio,
-            control_tx,
-            audio_tx: audio_tx_slot,
-            incoming_rx,
-            _close: close_tx,
-        })
-    }
+    Ok(TransportHandles {
+        session_id,
+        server_audio,
+        control_tx,
+        audio_tx: audio_tx_slot,
+        incoming_rx,
+        _close: close_tx,
+    })
 }
 
 /// 生成 WebSocket 握手 `Sec-WebSocket-Key`（RFC 6455：16 随机字节 → Base64，24 字符）。
 fn ws_sec_key() -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let uuid = uuid::Uuid::new_v4();
     let bytes = uuid.as_bytes();
     let mut out = String::with_capacity(24);
@@ -120,7 +123,9 @@ async fn connect_and_handshake(
     let mut sender = WsSender { sink };
     let mut receiver = WsReceiver { stream };
 
-    sender.send_json(&ClientMessage::hello_websocket_v2()).await?;
+    sender
+        .send_json(&ClientMessage::hello_websocket_v2())
+        .await?;
 
     let session_id;
     let server_audio;
@@ -143,7 +148,7 @@ async fn connect_and_handshake(
                 return Err(VoiceError::Protocol(format!(
                     "期望 hello 响应，收到: {:?}",
                     other
-                )))
+                )));
             }
             ReceivedMessage::Audio(data) => {
                 debug!("握手阶段收到音频 {} 字节，忽略", data.len());
@@ -161,21 +166,7 @@ struct WsSender {
 
 impl WsSender {
     /// 发送音频帧（v2 时间戳为 Unix 毫秒，与 MQTT 一致，供服务器端 AEC 对齐时钟）。
-    async fn send_audio(&mut self, opus: &[u8]) -> Result<()> {
-        self.send_audio_v2(opus, super::now_ms()).await
-    }
-
-    async fn send_json(&mut self, msg: &ClientMessage) -> Result<()> {
-        let json = serde_json::to_string(msg)?;
-        debug!("WS 发送 JSON: {}", json);
-        self.sink
-            .send(WsMessage::Text(json.into()))
-            .await
-            .map_err(|e| VoiceError::Transport(format!("发送失败: {}", e)))?;
-        Ok(())
-    }
-
-    async fn send_audio_v2(&mut self, opus: &[u8], timestamp_ms: u32) -> Result<()> {
+    async fn send_audio(&mut self, opus: &[u8], timestamp_ms: u32) -> Result<()> {
         // BinaryProtocol2 为网络字节序（大端），version/type/payload_size 均 htons/htonl。
         let mut frame = Vec::with_capacity(V2_HEADER_SIZE + opus.len());
         frame.extend_from_slice(&2u16.to_be_bytes());
@@ -188,6 +179,16 @@ impl WsSender {
             .send(WsMessage::Binary(frame.into()))
             .await
             .map_err(|e| VoiceError::Transport(format!("音频发送失败: {}", e)))?;
+        Ok(())
+    }
+
+    async fn send_json(&mut self, msg: &ClientMessage) -> Result<()> {
+        let json = serde_json::to_string(msg)?;
+        debug!("WS 发送 JSON: {}", json);
+        self.sink
+            .send(WsMessage::Text(json.into()))
+            .await
+            .map_err(|e| VoiceError::Transport(format!("发送失败: {}", e)))?;
         Ok(())
     }
 
@@ -207,7 +208,8 @@ struct WsReceiver {
 
 enum ReceivedMessage {
     Json(ServerMessage),
-    Audio(Vec<u8>),
+    /// 二进制音频帧（原始 Bytes，剥头在 recv_loop 完成）。
+    Audio(Bytes),
 }
 
 impl WsReceiver {
@@ -219,14 +221,16 @@ impl WsReceiver {
                     return Ok(ReceivedMessage::Json(msg));
                 }
                 Some(Ok(WsMessage::Binary(data))) => {
-                    return Ok(ReceivedMessage::Audio(data.to_vec()));
+                    return Ok(ReceivedMessage::Audio(data));
                 }
                 Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
                 Some(Ok(WsMessage::Close(f))) => {
                     return Err(VoiceError::Transport(format!("连接已关闭: {:?}", f)));
                 }
                 Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(VoiceError::Transport(format!("WebSocket 错误: {}", e))),
+                Some(Err(e)) => {
+                    return Err(VoiceError::Transport(format!("WebSocket 错误: {}", e)));
+                }
                 None => return Err(VoiceError::Transport("连接已断开".into())),
             }
         }
@@ -258,7 +262,7 @@ async fn send_loop(
                 }
             }
             opus = audio_slot.take() => {
-                if let Err(e) = sender.send_audio(&opus).await {
+                if let Err(e) = sender.send_audio(&opus, super::now_ms()).await {
                     warn!("WS 音频发送失败: {}", e);
                     break;
                 }
@@ -295,7 +299,7 @@ async fn recv_loop(
                     }
                 }
                 Ok(ReceivedMessage::Audio(data)) => {
-                    let payload = strip_binary_header(&data);
+                    let payload = strip_binary_header(data);
                     if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
                         break;
                     }
@@ -310,35 +314,46 @@ async fn recv_loop(
     }
 }
 
-/// 剥离 BinaryProtocol2 帧头：头字段校验匹配则剥头，否则原样返回（裸 Opus 兜底）。
-fn strip_binary_header(data: &[u8]) -> Vec<u8> {
-    // 先按 v2（16B 头）识别。实测服务器下行头 version 字段为 0（非 2），
-    // 故仅校验 type=OPUS 与精确长度；裸 Opus 帧前 2 字节为 TOC（非 0），误判概率极低。
+/// 识别下行二进制帧头长度：16=v2 / 4=v3 / 0=裸 Opus。
+/// 实测服务器 v2 头 version 字段为 0（非 2），故仅校验 type=OPUS 与精确长度；
+/// 裸 Opus 帧前 2 字节为 TOC（非 0），误判概率极低。
+fn binary_header_len(data: &[u8]) -> usize {
     if data.len() >= V2_HEADER_SIZE {
         let ty = u16::from_be_bytes([data[2], data[3]]);
         let payload_size = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
         if ty == V2_TYPE_OPUS && V2_HEADER_SIZE + payload_size == data.len() {
-            return data[V2_HEADER_SIZE..].to_vec();
+            return V2_HEADER_SIZE;
         }
     }
-    // 再按 v3（4B 头）识别：type=0, reserved=0, payload_size（大端）。
+    // v3（4B 头）：type=0, reserved=0, payload_size（大端）。
     // reserved 必须为 0，避免把裸 Opus 帧（首字节恰为 0 的 SILK 8k 帧）误剥 4 字节。
     if data.len() >= V3_HEADER_SIZE {
         let ty = data[0];
         let payload_size = u16::from_be_bytes([data[2], data[3]]) as usize;
-        if ty as u16 == V2_TYPE_OPUS
-            && data[1] == 0
-            && V3_HEADER_SIZE + payload_size == data.len()
+        if ty as u16 == V2_TYPE_OPUS && data[1] == 0 && V3_HEADER_SIZE + payload_size == data.len()
         {
-            return data[V3_HEADER_SIZE..].to_vec();
+            return V3_HEADER_SIZE;
         }
-    }
-    // 均未识别：按裸 Opus 处理，记录前 16 字节便于核对服务器实际格式。
-    if data.len() >= V3_HEADER_SIZE {
+        // 均未识别：按裸 Opus 处理，记录前 16 字节便于核对服务器实际格式。
         let hex: String = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
-        debug!("WS 下行帧头未识别，按裸 Opus 处理 (len={}): {}", data.len(), hex);
+        debug!(
+            "WS 下行帧头未识别，按裸 Opus 处理 (len={}): {}",
+            data.len(),
+            hex
+        );
     }
-    data.to_vec()
+    0
+}
+
+/// 剥离二进制帧头并交付 payload；识别失败按裸 Opus 原样交付。
+/// Bytes 所有权唯一时 split_to/into 均零拷贝，下行音频整条路径无中间复制。
+fn strip_binary_header(data: Bytes) -> Vec<u8> {
+    let head = binary_header_len(&data);
+    let mut payload = data;
+    if head > 0 {
+        let _ = payload.split_to(head); // 丢弃头部，剩余部分即 payload。
+    }
+    payload.into()
 }
 
 #[cfg(test)]
@@ -356,7 +371,7 @@ mod tests {
         frame.extend_from_slice(&12345u32.to_be_bytes());
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload);
-        let out = strip_binary_header(&frame);
+        let out = strip_binary_header(Bytes::from(frame));
         assert_eq!(out, payload);
     }
 
@@ -371,7 +386,7 @@ mod tests {
         frame.extend_from_slice(&0u32.to_be_bytes());
         frame.extend_from_slice(&u32::MAX.to_be_bytes()); // payload_size 与实际不符
         frame.extend_from_slice(payload);
-        let out = strip_binary_header(&frame);
+        let out = strip_binary_header(Bytes::from(frame.clone()));
         assert_eq!(out, frame);
     }
 
@@ -389,5 +404,3 @@ mod tests {
         );
     }
 }
-
-

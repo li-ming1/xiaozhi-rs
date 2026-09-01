@@ -6,8 +6,8 @@ pub mod buffer;
 pub mod opus;
 pub mod resample;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -21,7 +21,7 @@ use crate::error::{Result, VoiceError};
 use crate::protocol::LatestSlot;
 
 use buffer::PlaybackBuffer;
-use opus::{NetworkGrade, OpusCodec, ENCODER_FRAME_SIZE, ENCODER_RATE, FRAME_MS};
+use opus::{ENCODER_FRAME_SIZE, ENCODER_RATE, FRAME_MS, NetworkGrade, OpusCodec};
 use resample::AsyncResampler;
 
 const DRIFT_PERIOD: Duration = Duration::from_millis(500);
@@ -41,8 +41,8 @@ pub enum PlaybackMsg {
     Flush,
 }
 
-/// 音频管理器：持有设备、流与 DSP worker。
-pub struct AudioManager {
+/// 音频管线：持有设备、流与 DSP worker。
+pub struct AudioPipeline {
     input_device: Device,
     output_device: Device,
     input_stream: Option<Stream>,
@@ -53,7 +53,7 @@ pub struct AudioManager {
     playback_grade_tx: Option<mpsc::Sender<NetworkGrade>>,
 }
 
-impl AudioManager {
+impl AudioPipeline {
     /// 探测默认设备。
     pub fn new() -> Result<Self> {
         let host = cpal::default_host();
@@ -234,7 +234,7 @@ fn build_input_stream<S>(
 where
     S: SizedSample + Copy + Send + 'static,
 {
-        let stream = device
+    let stream = device
         .build_input_stream(
             config,
             move |data: &[S], _: &_| {
@@ -671,7 +671,6 @@ struct CaptureWorker {
     pending: Vec<f32>,
     chunk: Vec<f32>,
     resample_out: Vec<f32>,
-    frame: Vec<f32>,
     drift: DriftController,
     window_count: u64,
     window_start: Instant,
@@ -693,7 +692,6 @@ impl CaptureWorker {
             pending: Vec::with_capacity(ENCODER_FRAME_SIZE * 2),
             chunk: Vec::with_capacity(CAPTURE_BATCH),
             resample_out: Vec::with_capacity(CAPTURE_BATCH + 8),
-            frame: Vec::with_capacity(ENCODER_FRAME_SIZE),
             drift: DriftController::new(nominal),
             window_count: 0,
             window_start: Instant::now(),
@@ -729,10 +727,15 @@ impl CaptureWorker {
         }
         self.window_count += self.chunk.len() as u64;
         self.stats.samples += self.chunk.len() as u64;
-        self.stats.sum_sq += self.chunk.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
+        self.stats.sum_sq += self
+            .chunk
+            .iter()
+            .map(|s| (*s as f64) * (*s as f64))
+            .sum::<f64>();
 
         self.resample_out.clear();
-        self.resampler.process(&self.chunk, self.drift.ratio, &mut self.resample_out);
+        self.resampler
+            .process(&self.chunk, self.drift.ratio, &mut self.resample_out);
         self.pending.extend_from_slice(&self.resample_out);
         true
     }
@@ -753,16 +756,16 @@ impl CaptureWorker {
     }
 
     /// 组 60ms 帧：VAD 判定语音才编码上行，空闲时零编码开销。
+    /// AGC/编码直接作用于 pending 前缀，省去独立帧缓冲与逐帧复制。
     async fn encode_pending(&mut self, encoded_tx: &LatestSlot<Vec<u8>>) {
         while self.pending.len() >= ENCODER_FRAME_SIZE {
-            self.frame.clear();
-            self.frame.extend(self.pending.drain(..ENCODER_FRAME_SIZE));
-            let s = frame_stats(&self.frame);
+            let s = frame_stats(&self.pending[..ENCODER_FRAME_SIZE]);
             if self.vad.decide(s.rms) {
                 self.stats.speech_frames += 1;
-                self.agc.process_frame(&mut self.frame, s.rms, s.peak);
+                self.agc
+                    .process_frame(&mut self.pending[..ENCODER_FRAME_SIZE], s.rms, s.peak);
                 self.stats.agc_gain = self.agc.gain;
-                match self.opus.encode(&self.frame) {
+                match self.opus.encode(&self.pending[..ENCODER_FRAME_SIZE]) {
                     Ok(pkt) => {
                         self.stats.frames += 1;
                         encoded_tx.store(pkt).await;
@@ -774,6 +777,7 @@ impl CaptureWorker {
                 // 静音帧：增益回落待命（不放大）。
                 self.agc.decay();
             }
+            self.pending.drain(..ENCODER_FRAME_SIZE);
         }
     }
 
@@ -785,7 +789,11 @@ impl CaptureWorker {
             } else {
                 0.0
             };
-            let db = if rms > 1e-9 { 20.0 * rms.log10() } else { -120.0 };
+            let db = if rms > 1e-9 {
+                20.0 * rms.log10()
+            } else {
+                -120.0
+            };
             let nf_db = 20.0 * self.vad.noise_floor.max(1e-9).log10();
             let on_db = (self.vad.noise_floor * self.vad.on_scale)
                 .max(self.vad.min_on)
@@ -818,7 +826,15 @@ async fn playback_worker(
     cb_count: Arc<AtomicU64>,
     cb_samples: Arc<AtomicU64>,
 ) {
-    match PlaybackWorker::new(rx, grade_rx, out, server_rate, output_rate, cb_count, cb_samples) {
+    match PlaybackWorker::new(
+        rx,
+        grade_rx,
+        out,
+        server_rate,
+        output_rate,
+        cb_count,
+        cb_samples,
+    ) {
         Ok(worker) => worker.run().await,
         Err(e) => warn!("播放管线初始化失败: {}", e),
     }
@@ -846,6 +862,8 @@ struct PlaybackWorker {
     last_frame_at: Instant,
     /// 帧长诊断已告警（一次性，避免刷屏）。
     frame_len_warned: bool,
+    /// 解码输出复用缓冲（每帧原地重写，避免每帧堆分配）。
+    pcm: Vec<f32>,
     /// 重采样输出缓冲常驻复用，避免每帧解码后堆分配。
     out_samples: Vec<f32>,
 }
@@ -878,6 +896,7 @@ impl PlaybackWorker {
             grade: NetworkGrade::Good,
             last_frame_at: Instant::now(),
             frame_len_warned: false,
+            pcm: Vec::with_capacity(server_rate as usize * 60 / 1000),
             out_samples: Vec::with_capacity(960 * 3),
         })
     }
@@ -917,8 +936,8 @@ impl PlaybackWorker {
                 // 正常包恒 fec=false：decode_fec=1 会把带 FEC 的包解码为"上一帧恢复"而非当前帧，
                 // 导致所有帧错位；FEC/PLC 恢复仅在丢包（无帧到达）时由帧定时器触发。
                 self.last_frame_at = Instant::now();
-                match self.decoder.decode(&opus, false) {
-                    Ok(p) => self.write_pcm(p, false),
+                match self.decoder.decode_into(&opus, false, &mut self.pcm) {
+                    Ok(()) => self.write_pcm(false),
                     Err(e) => {
                         self.stats.decoded_fail += 1;
                         debug!("Opus 解码失败(len={}): {}", opus.len(), e);
@@ -930,24 +949,27 @@ impl PlaybackWorker {
         }
     }
 
-    /// 将解码 PCM 重采样后写入输出 ring。
-    fn write_pcm(&mut self, pcm: Vec<f32>, used_plc: bool) {
+    /// 将解码 PCM（`self.pcm`，由 decode_into 填充）重采样后写入输出 ring。
+    fn write_pcm(&mut self, used_plc: bool) {
         if !used_plc {
             // 帧长应等于 server_rate 的 60ms：不符说明服务器实际采样率与声明不一致（音调/语速错乱）。
             let expected = self.server_rate as usize * 60 / 1000;
-            if pcm.len() != expected && !self.frame_len_warned {
+            if self.pcm.len() != expected && !self.frame_len_warned {
                 self.frame_len_warned = true;
                 warn!(
                     "播放帧长异常: 期望 {} 实际 {}（服务器采样率与声明 {}Hz 不符）",
-                    expected, pcm.len(), self.server_rate
+                    expected,
+                    self.pcm.len(),
+                    self.server_rate
                 );
             }
             self.stats.decoded_ok += 1;
         }
-        self.stats.last_pcm_len = pcm.len();
+        self.stats.last_pcm_len = self.pcm.len();
         self.stats.last_needed = self.resampler.input_frames_next();
         self.out_samples.clear();
-        self.resampler.process(&pcm, self.drift.ratio, &mut self.out_samples);
+        self.resampler
+            .process(&self.pcm, self.drift.ratio, &mut self.out_samples);
         self.stats.last_produced = self.out_samples.len();
         if self.out_samples.is_empty() {
             self.stats.zero_produced += 1;
@@ -964,10 +986,10 @@ impl PlaybackWorker {
 
     /// 丢包恢复：请求带内 FEC/PLC 解码一帧（60ms），保持音频流连续。
     fn play_plc(&mut self) {
-        match self.decoder.decode(&[], true) {
-            Ok(p) => {
+        match self.decoder.decode_into(&[], true, &mut self.pcm) {
+            Ok(()) => {
                 self.stats.plc += 1;
-                self.write_pcm(p, true);
+                self.write_pcm(true);
             }
             Err(e) => warn!("PLC 失败: {}", e),
         }
@@ -1004,7 +1026,8 @@ impl PlaybackWorker {
             let target_ms = self.buf.target_ms() as f64;
             if target_ms > 0.0 {
                 let err_ppm = ((occupancy_ms - target_ms) / target_ms) * 1e6 * 0.5;
-                self.drift.move_toward(err_ppm.clamp(-MAX_DRIFT_PPM, MAX_DRIFT_PPM));
+                self.drift
+                    .move_toward(err_ppm.clamp(-MAX_DRIFT_PPM, MAX_DRIFT_PPM));
             }
             self.last_drift = Instant::now();
         }
@@ -1012,12 +1035,7 @@ impl PlaybackWorker {
 }
 
 /// 写入播放环形缓冲；空间不足时丢弃多余（新）样本以封顶延迟。
-fn write_samples(
-    out: &mut Producer<f32>,
-    samples: &[f32],
-    output_rate: u32,
-    capacity: usize,
-) {
+fn write_samples(out: &mut Producer<f32>, samples: &[f32], output_rate: u32, capacity: usize) {
     let free = out.slots();
     let occupancy_ms = ((capacity - free) as f64 / output_rate as f64) * 1000.0;
     // 占用超 280ms 时整体丢弃本轮，让缓冲自然回落。

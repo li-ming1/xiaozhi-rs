@@ -6,7 +6,7 @@ pub mod ws;
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, watch, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 
 use crate::error::Result;
 use message::{AudioParams, ClientMessage, ServerMessage};
@@ -60,16 +60,16 @@ pub struct TransportHandles {
 
 /// 传输适配器闭集：枚举即静态分派，无 dyn / 无 async_trait。
 pub enum TransportAdapter {
-    WebSocket(ws::WsTransport),
-    MqttUdp(mqtt_udp::MqttUdpTransport),
+    WebSocket,
+    MqttUdp,
 }
 
 impl TransportAdapter {
     /// 建连并完成 hello 协商，返回统一句柄。
     pub async fn connect(self, params: &ConnectParams) -> Result<TransportHandles> {
         match self {
-            TransportAdapter::WebSocket(t) => t.connect(params).await,
-            TransportAdapter::MqttUdp(t) => t.connect(params).await,
+            TransportAdapter::WebSocket => ws::connect(params).await,
+            TransportAdapter::MqttUdp => mqtt_udp::connect(params).await,
         }
     }
 }

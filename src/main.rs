@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use xiaozhi_rs::identity::DeviceIdentity;
 use xiaozhi_rs::ota::OtaConfig;
-use xiaozhi_rs::RealtimeVoice;
+use xiaozhi_rs::supervisor::VoiceSupervisor;
 
 /// 退出原因文件（任何路径都写入，防静默崩溃无法定位）。
 fn write_exit_reason(msg: &str) {
@@ -21,7 +21,9 @@ async fn main() -> Result<()> {
         write_exit_reason(&msg);
     }));
     // ring provider 须在任意 HTTPS 调用前注册一次（reqwest/rumqttc 复用）。
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
 
     init_logger();
 
@@ -84,7 +86,12 @@ impl log::Log for SimpleLogger {
         let sec = (secs % 60) as u8;
         eprintln!(
             "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}",
-            year, month, day, hour, min, sec,
+            year,
+            month,
+            day,
+            hour,
+            min,
+            sec,
             record.args()
         );
     }
@@ -111,7 +118,11 @@ fn civil_from_days(z: i64) -> (i32, u8, u8) {
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
-    let m = if mp < 10 { (mp + 3) as u8 } else { (mp - 9) as u8 };
+    let m = if mp < 10 {
+        (mp + 3) as u8
+    } else {
+        (mp - 9) as u8
+    };
     let y = (y + if m <= 2 { 1 } else { 0 }) as i32;
     (y, m, d)
 }
@@ -156,8 +167,8 @@ async fn run_client(skip_activation: bool, shutdown: CancellationToken) -> Resul
 
     let ota_config = ensure_activated(&mut identity, skip_activation).await?;
 
-    let voice = RealtimeVoice::from_ota(identity, ota_config)?;
-    voice.run_until(shutdown).await?;
+    let mut supervisor = VoiceSupervisor::new(identity, ota_config, shutdown);
+    supervisor.run().await?;
     Ok(())
 }
 
@@ -179,7 +190,10 @@ async fn ensure_activated(
             return Ok(ota_config);
         };
         info!("设备需要激活（尝试 {}/{}）", attempt, MAX_RETRIES);
-        info!("请访问 https://xiaozhi.me/ 输入激活码：{}", activation_data.code);
+        info!(
+            "请访问 https://xiaozhi.me/ 输入激活码：{}",
+            activation_data.code
+        );
 
         match xiaozhi_rs::ota::wait_for_activation(identity, &activation_data.challenge).await {
             Ok(_) => {

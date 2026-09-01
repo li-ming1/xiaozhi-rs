@@ -3,13 +3,13 @@
 
 use log::{debug, info, warn};
 use opusic_sys::{
+    OPUS_APPLICATION_VOIP, OPUS_OK, OPUS_SET_BITRATE_REQUEST, OPUS_SET_COMPLEXITY_REQUEST,
+    OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+    OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST, OpusDecoder, OpusEncoder,
     opus_decode_float, opus_decoder_create, opus_decoder_destroy, opus_encode_float,
     opus_encoder_create, opus_encoder_destroy, opus_get_version_string, opus_strerror,
-    OpusDecoder, OpusEncoder, OPUS_APPLICATION_VOIP, OPUS_OK, OPUS_SET_BITRATE_REQUEST,
-    OPUS_SET_COMPLEXITY_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST,
-    OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST,
 };
-use std::ffi::{c_int, CStr};
+use std::ffi::{CStr, c_int};
 use std::sync::Once;
 
 /// 进程级：内置库版本信息只打印一次。
@@ -50,7 +50,6 @@ pub struct OpusCodec {
     /// 解码帧长（decode_rate 的 60ms 样本数）：正常帧与 PLC 帧的统一输出长度。
     decode_frame_size: c_int,
     encode_buf: Vec<u8>,
-    decode_buf: Vec<f32>,
     grade: NetworkGrade,
 }
 
@@ -79,12 +78,7 @@ impl OpusCodec {
 
         let mut error: c_int = 0;
         let encoder = unsafe {
-            opus_encoder_create(
-                ENCODER_RATE as c_int,
-                1,
-                OPUS_APPLICATION_VOIP,
-                &mut error,
-            )
+            opus_encoder_create(ENCODER_RATE as c_int, 1, OPUS_APPLICATION_VOIP, &mut error)
         };
         if error != OPUS_OK || encoder.is_null() {
             return Err(VoiceError::Opus(format!(
@@ -108,7 +102,6 @@ impl OpusCodec {
             decoder,
             decode_frame_size: decode_frame_size as c_int,
             encode_buf: vec![0u8; MAX_PACKET_SIZE],
-            decode_buf: vec![0f32; decode_frame_size],
             grade: NetworkGrade::Good,
         };
         codec.apply_encoder_config(NetworkGrade::Good);
@@ -121,10 +114,7 @@ impl OpusCodec {
         if self.grade == grade {
             return;
         }
-        info!(
-            "网络分级变化 {:?} -> {:?}，调整编码策略",
-            self.grade, grade
-        );
+        info!("网络分级变化 {:?} -> {:?}，调整编码策略", self.grade, grade);
         self.grade = grade;
         self.apply_encoder_config(grade);
     }
@@ -139,7 +129,11 @@ impl OpusCodec {
         let set = |request: c_int, value: c_int| {
             let ret = unsafe { opus_encoder_ctl_fixed(self.encoder, request, value) };
             if ret != OPUS_OK {
-                warn!("opus_encoder_ctl({}) 失败: {}", request, opus_error_desc(ret));
+                warn!(
+                    "opus_encoder_ctl({}) 失败: {}",
+                    request,
+                    opus_error_desc(ret)
+                );
             }
         };
         set(OPUS_SET_BITRATE_REQUEST, bitrate);
@@ -152,9 +146,14 @@ impl OpusCodec {
 
     /// 设置编码复杂度（0-10），默认 10。
     pub fn set_complexity(&mut self, complexity: c_int) {
-        let ret = unsafe { opus_encoder_ctl_fixed(self.encoder, OPUS_SET_COMPLEXITY_REQUEST, complexity) };
+        let ret = unsafe {
+            opus_encoder_ctl_fixed(self.encoder, OPUS_SET_COMPLEXITY_REQUEST, complexity)
+        };
         if ret != OPUS_OK {
-            warn!("设置 Opus 复杂度失败: {}（使用默认值）", opus_error_desc(ret));
+            warn!(
+                "设置 Opus 复杂度失败: {}（使用默认值）",
+                opus_error_desc(ret)
+            );
         }
     }
 
@@ -185,8 +184,10 @@ impl OpusCodec {
         Ok(self.encode_buf[..len as usize].to_vec())
     }
 
-    /// 解码 Opus 包为 f32 PCM。`input` 为空时执行 PLC；`fec` 为 true 时尝试带内 FEC 恢复。
-    pub fn decode(&mut self, input: &[u8], fec: bool) -> Result<Vec<f32>> {
+    /// 解码 Opus 包为 f32 PCM，写入调用方复用的 `out`（容量稳定后零堆分配），
+    /// 并截断为实际样本数。`input` 为空时执行 PLC；`fec` 为 true 时尝试带内 FEC 恢复。
+    pub fn decode_into(&mut self, input: &[u8], fec: bool, out: &mut Vec<f32>) -> Result<()> {
+        out.resize(self.decode_frame_size as usize, 0.0);
         // 空包走 PLC（调用方恒传 fec=false，此处分支显式置 0 更稳健）。
         let (ptr, fec) = if input.is_empty() {
             (std::ptr::null(), 0)
@@ -198,7 +199,7 @@ impl OpusCodec {
                 self.decoder,
                 ptr,
                 input.len() as c_int,
-                self.decode_buf.as_mut_ptr(),
+                out.as_mut_ptr(),
                 self.decode_frame_size,
                 fec,
             )
@@ -209,7 +210,8 @@ impl OpusCodec {
                 opus_error_desc(samples)
             )));
         }
-        Ok(self.decode_buf[..samples as usize].to_vec())
+        out.truncate(samples as usize);
+        Ok(())
     }
 }
 
@@ -248,8 +250,9 @@ mod tests {
     #[test]
     fn decode_empty_requests_plc_frame() {
         let mut codec = OpusCodec::new(16_000).unwrap();
-        let plc = codec.decode(&[], true).unwrap();
-        assert_eq!(plc.len(), 960, "PLC 输出帧长异常: {}", plc.len());
+        let mut out = Vec::new();
+        codec.decode_into(&[], true, &mut out).unwrap();
+        assert_eq!(out.len(), 960, "PLC 输出帧长异常: {}", out.len());
     }
 
     /// 正常包解码（fec=false）应还原信号能量，验证 FEC 参数不再破坏当前帧。
@@ -262,7 +265,8 @@ mod tests {
             .collect();
         let pkt = codec.encode(&frame).unwrap();
         assert!(!pkt.is_empty());
-        let out = codec.decode(&pkt, false).unwrap();
+        let mut out = Vec::new();
+        codec.decode_into(&pkt, false, &mut out).unwrap();
         assert_eq!(out.len(), 960, "解码帧长异常: {}", out.len());
         let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
         assert!(rms > 0.1, "解码后能量过低: RMS={:.4}", rms);

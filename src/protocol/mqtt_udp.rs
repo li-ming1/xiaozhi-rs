@@ -13,13 +13,13 @@ use rustls::ClientConfig;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 
-use crate::crypto::{hex_decode_16, AesCtrCipher, UdpAudioHeader, HEADER_SIZE, TYPE_AUDIO};
+use crate::crypto::{AesCtrCipher, HEADER_SIZE, TYPE_AUDIO, UdpAudioHeader, hex_decode_16};
 use crate::error::{Result, VoiceError};
 use crate::protocol::message::{AudioParams, ClientMessage, ServerMessage};
 
 use super::{
-    now_ms, ConnectParams, IncomingEvent, MqttParams, TransportHandles, CONTROL_CHANNEL_CAP,
-    INCOMING_CHANNEL_CAP,
+    CONTROL_CHANNEL_CAP, ConnectParams, INCOMING_CHANNEL_CAP, IncomingEvent, MqttParams,
+    TransportHandles, now_ms,
 };
 
 const MQTT_KEEP_ALIVE: Duration = Duration::from_secs(240);
@@ -28,102 +28,107 @@ const REQUEST_CAP: usize = 64;
 /// UDP 接收缓冲上限（Opus 最大包 + 包头，留余量）。
 const UDP_MAX_PACKET: usize = 2048;
 
-/// MQTT+UDP 传输。
-pub struct MqttUdpTransport;
+/// MQTT+UDP 传输建连：hello 协商 + 启动出站/MQTT 事件/UDP 接收三个后台任务。
+pub async fn connect(params: &ConnectParams) -> Result<TransportHandles> {
+    let mqtt = params
+        .mqtt
+        .as_ref()
+        .ok_or_else(|| VoiceError::InvalidConfig("缺少 MQTT 参数".into()))?;
+
+    let opts = build_mqtt_options(mqtt)?;
+    let (client, mut eventloop) = AsyncClient::new(opts, REQUEST_CAP);
+    // 网络层：连接超时 10s、TCP_NODELAY（与官方一致）。
+    let mut netopts = NetworkOptions::new();
+    netopts.set_connection_timeout(10);
+    netopts.set_tcp_nodelay(true);
+    eventloop.set_network_options(netopts);
+
+    client
+        .subscribe(mqtt.subscribe_topic.clone(), QoS::AtMostOnce)
+        .await
+        .map_err(|e| VoiceError::Transport(format!("MQTT 订阅失败: {}", e)))?;
+
+    let hello = ClientMessage::hello_mqtt_udp();
+    let hello_json = serde_json::to_string(&hello)?;
+    client
+        .publish(
+            mqtt.publish_topic.clone(),
+            QoS::AtMostOnce,
+            false,
+            hello_json,
+        )
+        .await
+        .map_err(|e| VoiceError::Transport(format!("MQTT 发布 hello 失败: {}", e)))?;
+
+    let negotiated = tokio::time::timeout(HELLO_TIMEOUT, wait_hello(&mut eventloop))
+        .await
+        .map_err(|_| VoiceError::Timeout("MQTT hello 响应超时".into()))??;
+
+    let base_nonce =
+        hex_decode_16(&negotiated.udp.nonce).map_err(|e| VoiceError::Crypto(e.to_string()))?;
+    let cipher = AesCtrCipher::from_hex_key(&negotiated.udp.key)
+        .map_err(|e| VoiceError::Crypto(e.to_string()))?;
+    info!(
+        "MQTT hello 成功，UDP {}:{}，下行 {}Hz/{}ms",
+        negotiated.udp.server,
+        negotiated.udp.port,
+        negotiated.server_audio.sample_rate,
+        negotiated.server_audio.frame_duration
+    );
+
+    let udp_socket = Arc::new(
+        UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| VoiceError::Transport(format!("UDP 绑定失败: {}", e)))?,
+    );
+    let addr = resolve_udp_addr(&negotiated.udp.server, negotiated.udp.port).await?;
+    udp_socket
+        .connect(addr)
+        .await
+        .map_err(|e| VoiceError::Transport(format!("UDP 连接失败: {}", e)))?;
+
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
+    let (audio_tx, audio_rx) = super::LatestSlot::<Vec<u8>>::new().pipe();
+    let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
+    // 会话关闭信号：handles drop（Sender 失效）→ 后台任务 `changed()` 返回 Err 退出。
+    let (close_tx, close_rx) = watch::channel(());
+
+    let outbound = Outbound {
+        client: client.clone(),
+        mqtt: mqtt.clone(),
+        udp: udp_socket.clone(),
+        cipher: cipher.clone(),
+        base_nonce,
+    };
+    tokio::spawn(send_loop(outbound, control_rx, audio_rx, close_rx.clone()));
+
+    tokio::spawn(mqtt_event_loop(
+        eventloop,
+        incoming_tx.clone(),
+        close_rx.clone(),
+    ));
+    tokio::spawn(udp_recv_loop(
+        udp_socket,
+        cipher,
+        incoming_tx.clone(),
+        close_rx,
+    ));
+
+    Ok(TransportHandles {
+        session_id: negotiated.session_id,
+        server_audio: negotiated.server_audio,
+        control_tx,
+        audio_tx,
+        incoming_rx,
+        _close: close_tx,
+    })
+}
 
 /// hello 响应的完整协商结果。
 struct Negotiated {
     session_id: String,
     server_audio: AudioParams,
     udp: crate::protocol::message::UdpChannel,
-}
-
-impl MqttUdpTransport {
-    pub async fn connect(self, params: &ConnectParams) -> Result<TransportHandles> {
-        let mqtt = params
-            .mqtt
-            .as_ref()
-            .ok_or_else(|| VoiceError::InvalidConfig("缺少 MQTT 参数".into()))?;
-
-        let opts = build_mqtt_options(mqtt)?;
-        let (client, mut eventloop) = AsyncClient::new(opts, REQUEST_CAP);
-        // 网络层：连接超时 10s、TCP_NODELAY（与官方一致）。
-        let mut netopts = NetworkOptions::new();
-        netopts.set_connection_timeout(10);
-        netopts.set_tcp_nodelay(true);
-        eventloop.set_network_options(netopts);
-
-        client
-            .subscribe(mqtt.subscribe_topic.clone(), QoS::AtMostOnce)
-            .await
-            .map_err(|e| VoiceError::Transport(format!("MQTT 订阅失败: {}", e)))?;
-
-        let hello = ClientMessage::hello_mqtt_udp();
-        let hello_json = serde_json::to_string(&hello)?;
-        client
-            .publish(
-                mqtt.publish_topic.clone(),
-                QoS::AtMostOnce,
-                false,
-                hello_json,
-            )
-            .await
-            .map_err(|e| VoiceError::Transport(format!("MQTT 发布 hello 失败: {}", e)))?;
-
-        let negotiated = tokio::time::timeout(HELLO_TIMEOUT, wait_hello(&mut eventloop))
-            .await
-            .map_err(|_| VoiceError::Timeout("MQTT hello 响应超时".into()))??;
-
-        let base_nonce = hex_decode_16(&negotiated.udp.nonce)
-            .map_err(|e| VoiceError::Crypto(e.to_string()))?;
-        let cipher = AesCtrCipher::from_hex_key(&negotiated.udp.key)
-            .map_err(|e| VoiceError::Crypto(e.to_string()))?;
-        info!(
-            "MQTT hello 成功，UDP {}:{}，下行 {}Hz/{}ms",
-            negotiated.udp.server,
-            negotiated.udp.port,
-            negotiated.server_audio.sample_rate,
-            negotiated.server_audio.frame_duration
-        );
-
-        let udp_socket = Arc::new(
-            UdpSocket::bind("0.0.0.0:0")
-                .await
-                .map_err(|e| VoiceError::Transport(format!("UDP 绑定失败: {}", e)))?,
-        );
-        let addr = resolve_udp_addr(&negotiated.udp.server, negotiated.udp.port).await?;
-        udp_socket
-            .connect(addr)
-            .await
-            .map_err(|e| VoiceError::Transport(format!("UDP 连接失败: {}", e)))?;
-
-        let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
-        let (audio_tx, audio_rx) = super::LatestSlot::<Vec<u8>>::new().pipe();
-        let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
-        // 会话关闭信号：handles drop（Sender 失效）→ 后台任务 `changed()` 返回 Err 退出。
-        let (close_tx, close_rx) = watch::channel(());
-
-        let outbound = Outbound {
-            client: client.clone(),
-            mqtt: mqtt.clone(),
-            udp: udp_socket.clone(),
-            cipher: cipher.clone(),
-            base_nonce,
-        };
-        tokio::spawn(send_loop(outbound, control_rx, audio_rx, close_rx.clone()));
-
-        tokio::spawn(mqtt_event_loop(eventloop, incoming_tx.clone(), close_rx.clone()));
-        tokio::spawn(udp_recv_loop(udp_socket, cipher, incoming_tx.clone(), close_rx));
-
-        Ok(TransportHandles {
-            session_id: negotiated.session_id,
-            server_audio: negotiated.server_audio,
-            control_tx,
-            audio_tx,
-            incoming_rx,
-            _close: close_tx,
-        })
-    }
 }
 
 /// 解析 UDP 服务器地址。服务器可能返回 IP 字面量（IPv4/IPv6）或域名：
@@ -193,7 +198,6 @@ async fn wait_hello(eventloop: &mut EventLoop) -> Result<Negotiated> {
                     _ => continue,
                 }
             }
-            Event::Incoming(Incoming::ConnAck(_)) => continue,
             _ => continue,
         }
     }
@@ -326,6 +330,7 @@ fn process_udp_packet(
     if n < HEADER_SIZE {
         return (PktOutcome::Drop(PktDrop::Short), false);
     }
+    // 长度已由上方 n < HEADER_SIZE 守卫保证，切片必为 16 字节。
     let iv: [u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().unwrap();
     let hdr = UdpAudioHeader::parse(&iv);
     if hdr.type_ != TYPE_AUDIO {
@@ -333,7 +338,11 @@ fn process_udp_packet(
     }
     if HEADER_SIZE + hdr.payload_len as usize != n {
         // 宽容处理：服务器 payload_len 仅供参考，数据按实际 n 切片，不丢弃。
-        debug!("UDP 长度不匹配: 实际 {} 声明 {}", n - HEADER_SIZE, hdr.payload_len);
+        debug!(
+            "UDP 长度不匹配: 实际 {} 声明 {}",
+            n - HEADER_SIZE,
+            hdr.payload_len
+        );
     }
     // 防重放：序列号必须单调递增（允许跳跃，丢弃过期包）。
     let mut jumped = false;
@@ -543,7 +552,10 @@ mod tests {
         // 第 REPLAY_RESET_THRESHOLD 包：触发重置，接受并恢复交付。
         let p_last = build_packet(b"c", 3);
         let (outcome, _) = process_udp_packet(&p_last, p_last.len(), &c, &mut prev, &mut streak);
-        assert!(matches!(outcome, PktOutcome::Deliver(_)), "重置后应恢复交付");
+        assert!(
+            matches!(outcome, PktOutcome::Deliver(_)),
+            "重置后应恢复交付"
+        );
     }
 
     #[test]

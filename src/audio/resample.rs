@@ -49,6 +49,7 @@ impl AsyncResampler {
     pub fn process(&mut self, input: &[f32], ratio: f64, out: &mut Vec<f32>) {
         self.in_queue.extend(input.iter().copied());
         if (ratio - self.ratio).abs() > 1e-9 {
+            // 漂移限幅 ±1000ppm，远小于重采样器 ±1% 界限，set 不会失败。
             let _ = self.resampler.set_resample_ratio(ratio, true);
             self.ratio = ratio;
         }
@@ -70,9 +71,9 @@ impl AsyncResampler {
             else {
                 break;
             };
-            let Ok((_, written)) = self
-                .resampler
-                .process_into_buffer(&input_adapter, &mut output_adapter, None)
+            let Ok((_, written)) =
+                self.resampler
+                    .process_into_buffer(&input_adapter, &mut output_adapter, None)
             else {
                 break;
             };
