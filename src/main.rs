@@ -279,9 +279,9 @@ fn show_device_info() -> Result<()> {
 fn show_audio_doctor() -> Result<()> {
     use cpal::traits::HostTrait;
 
-    fn describe(device: &cpal::Device, input: bool) {
+    fn describe(device: &cpal::Device, input: bool, is_default: bool) {
         use cpal::traits::DeviceTrait;
-        println!("    {}", device);
+        println!("    {}{}", device, if is_default { "  [默认]" } else { "" });
         let config = if input {
             device.default_input_config()
         } else {
@@ -299,6 +299,8 @@ fn show_audio_doctor() -> Result<()> {
     }
 
     let host = cpal::default_host();
+    let default_input = host.default_input_device().map(|d| d.to_string());
+    let default_output = host.default_output_device().map(|d| d.to_string());
     println!("音频设备检查:");
     println!("  主机: {}", host.id().name());
     println!("  输入设备:");
@@ -307,7 +309,12 @@ fn show_audio_doctor() -> Result<()> {
             let mut any = false;
             for device in devices {
                 any = true;
-                describe(&device, true);
+                let name = device.to_string();
+                describe(
+                    &device,
+                    true,
+                    default_input.as_deref() == Some(name.as_str()),
+                );
             }
             if !any {
                 println!("    未找到");
@@ -321,7 +328,12 @@ fn show_audio_doctor() -> Result<()> {
             let mut any = false;
             for device in devices {
                 any = true;
-                describe(&device, false);
+                let name = device.to_string();
+                describe(
+                    &device,
+                    false,
+                    default_output.as_deref() == Some(name.as_str()),
+                );
             }
             if !any {
                 println!("    未找到");
