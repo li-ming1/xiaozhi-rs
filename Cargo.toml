@@ -1,6 +1,6 @@
 [package]
 name = "xiaozhi-rs"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "小智客户端 - Rust 实现（MQTT+UDP 主链路 / WebSocket 回退）"
 license = "MIT"
