@@ -20,6 +20,7 @@ pub struct AsyncResampler {
     in_queue: VecDeque<f32>,
     in_scratch: Vec<f32>,
     out_scratch: Vec<f32>,
+    nominal_ratio: f64,
     ratio: f64,
 }
 
@@ -41,8 +42,17 @@ impl AsyncResampler {
             in_queue: VecDeque::with_capacity(chunk_size * 2),
             in_scratch: Vec::with_capacity(chunk_size + 8),
             out_scratch: Vec::with_capacity(chunk_size * 2 + 16),
+            nominal_ratio,
             ratio: nominal_ratio,
         })
+    }
+
+    /// TTS 切换：清空排队输入与滤波历史，避免上一句尾音串入新句；
+    /// rubato reset 会把内部比率还原为标称值，下一次 process 会重新应用漂移比率。
+    pub fn reset(&mut self) {
+        self.in_queue.clear();
+        self.resampler.reset();
+        self.ratio = self.nominal_ratio;
     }
 
     /// 喂入输入样本并尝试产出，结果追加到 `out`。
@@ -119,5 +129,34 @@ mod tests {
         let mut out = Vec::new();
         r.process(&input, 2.0 * 1.001, &mut out);
         assert!(!out.is_empty());
+    }
+
+    /// 首块只少滤波器尾部，不能被暖机吞掉（否则每次 TTS 首帧会是静音）。
+    #[test]
+    fn first_chunk_produces_near_full_output() {
+        for (ratio, expected) in [(1.0, 960usize), (2.0, 1920), (3.0, 2880)] {
+            let mut r = AsyncResampler::new(ratio, 960).unwrap();
+            let input = vec![0.1f32; 960];
+            let mut out = Vec::new();
+            r.process(&input, ratio, &mut out);
+            assert!(
+                out.len() >= expected - 16 && out.len() <= expected,
+                "ratio={ratio} out={}",
+                out.len()
+            );
+        }
+    }
+
+    /// reset 后仍能正常产出，且漂移比率会在下一次 process 重新生效。
+    #[test]
+    fn reset_keeps_resampler_healthy() {
+        let mut r = AsyncResampler::new(2.0, 960).unwrap();
+        let input = vec![0.1f32; 960];
+        let mut out = Vec::new();
+        r.process(&input, 2.0, &mut out);
+        r.reset();
+        out.clear();
+        r.process(&input, 2.0 * 1.0005, &mut out);
+        assert!(!out.is_empty(), "reset 后无输出");
     }
 }

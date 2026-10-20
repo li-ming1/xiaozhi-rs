@@ -1052,6 +1052,7 @@ impl PlaybackWorker {
     /// TTS 切换：清空本地播放（含输出环中 flush 之前的残留），捕获侧立即恢复常规灵敏度。
     fn handle_flush(&mut self) {
         self.buf.reset();
+        self.resampler.reset();
         self.duplex.stop_play();
         self.duplex.request_flush(self.total_written);
         self.last_frame_at = Instant::now();
@@ -1266,7 +1267,7 @@ mod tests {
         rtrb::Consumer<f32>,
     ) {
         let (tx, rx) = mpsc::channel(32);
-        let (producer, consumer) = rtrb::RingBuffer::new(8192);
+        let (producer, consumer) = rtrb::RingBuffer::new(OUTPUT_RING_SAMPLES);
         let duplex = Arc::new(DuplexSignal::new());
         let setup = PlaybackSetup {
             out: producer,
@@ -1280,6 +1281,27 @@ mod tests {
         };
         let worker = PlaybackWorker::new(rx, setup).unwrap();
         (worker, tx, duplex, consumer)
+    }
+
+    /// 播放 worker 的清环目标应等于已写入输出环的样本数。
+    #[test]
+    fn playback_flush_target_covers_written_audio() {
+        let (mut worker, tx, duplex, _consumer) = playback_fixture();
+        let packet = {
+            let mut codec = OpusCodec::new(16_000).unwrap();
+            codec.encode(&make_frame(0.1, ENCODER_FRAME_SIZE)).unwrap()
+        };
+        assert!(tx.try_send(PlaybackMsg::Audio(packet)).is_ok());
+        let msg = worker.rx.try_recv().expect("应收到音频消息");
+        worker.handle_msg(msg);
+        let written = worker.total_written;
+        assert!(written > 0, "解码后未写入样本");
+        worker.handle_flush();
+        assert_eq!(
+            duplex.flush_target(),
+            written,
+            "清环目标与已写入样本数不一致"
+        );
     }
 
     /// 无新包时 PLC 补帧封顶：空闲期不能无限续帧（否则播放窗口永不过期）。
