@@ -98,6 +98,15 @@ fn pick_device(host: &cpal::Host, env: &str, input: bool) -> Option<Device> {
     }
 }
 
+/// 按当前规则将选择的输入/输出设备名（doctor 展示用，不打开音频流）。
+pub fn selected_device_names() -> (Option<String>, Option<String>) {
+    let host = cpal::default_host();
+    (
+        pick_device(&host, "XIAOZHI_INPUT_DEVICE", true).map(|d| d.to_string()),
+        pick_device(&host, "XIAOZHI_OUTPUT_DEVICE", false).map(|d| d.to_string()),
+    )
+}
+
 /// 判断设备名是否像显示器/HDMI 音频输出（默认选到它时容易"没声"）。
 fn is_display_audio(name: &str) -> bool {
     let name = name.to_lowercase();
