@@ -3,11 +3,12 @@
 
 use log::{debug, info, warn};
 use opusic_sys::{
-    OPUS_APPLICATION_VOIP, OPUS_OK, OPUS_SET_BITRATE_REQUEST, OPUS_SET_COMPLEXITY_REQUEST,
-    OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
-    OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST, OpusDecoder, OpusEncoder,
-    opus_decode_float, opus_decoder_create, opus_decoder_destroy, opus_encode_float,
-    opus_encoder_create, opus_encoder_destroy, opus_get_version_string, opus_strerror,
+    OPUS_APPLICATION_VOIP, OPUS_OK, OPUS_RESET_STATE, OPUS_SET_BITRATE_REQUEST,
+    OPUS_SET_COMPLEXITY_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST,
+    OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST,
+    OpusDecoder, OpusEncoder, opus_decode_float, opus_decoder_create, opus_decoder_ctl,
+    opus_decoder_destroy, opus_encode_float, opus_encoder_create, opus_encoder_destroy,
+    opus_get_version_string, opus_strerror,
 };
 use std::ffi::{CStr, c_int};
 use std::sync::Once;
@@ -213,6 +214,18 @@ impl OpusCodec {
         out.truncate(samples as usize);
         Ok(())
     }
+
+    /// TTS 切换：重置解码器预测/PLC 历史，避免上一句状态串入新句。
+    pub fn reset_decoder(&mut self) -> Result<()> {
+        let ret = unsafe { opus_decoder_ctl(self.decoder, OPUS_RESET_STATE) };
+        if ret != OPUS_OK {
+            return Err(VoiceError::Opus(format!(
+                "Opus 解码器重置失败: {}",
+                opus_error_desc(ret)
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for OpusCodec {
@@ -270,5 +283,20 @@ mod tests {
         assert_eq!(out.len(), 960, "解码帧长异常: {}", out.len());
         let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
         assert!(rms > 0.1, "解码后能量过低: RMS={:.4}", rms);
+    }
+
+    /// TTS 切换重置解码器后仍能正常解码新包。
+    #[test]
+    fn decoder_reset_keeps_decoding() {
+        let mut codec = OpusCodec::new(16_000).unwrap();
+        let frame: Vec<f32> = (0..ENCODER_FRAME_SIZE)
+            .map(|i| 0.2 * (2.0 * std::f32::consts::PI * 500.0 * i as f32 / 16_000.0).sin())
+            .collect();
+        let pkt = codec.encode(&frame).unwrap();
+        let mut out = Vec::new();
+        codec.decode_into(&pkt, false, &mut out).unwrap();
+        codec.reset_decoder().unwrap();
+        codec.decode_into(&pkt, false, &mut out).unwrap();
+        assert_eq!(out.len(), 960, "重置后解码帧长异常: {}", out.len());
     }
 }

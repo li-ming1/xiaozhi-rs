@@ -1053,6 +1053,9 @@ impl PlaybackWorker {
     fn handle_flush(&mut self) {
         self.buf.reset();
         self.resampler.reset();
+        if let Err(e) = self.decoder.reset_decoder() {
+            warn!("重置 Opus 解码器失败: {}", e);
+        }
         self.duplex.stop_play();
         self.duplex.request_flush(self.total_written);
         self.last_frame_at = Instant::now();
