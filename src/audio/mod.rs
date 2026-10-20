@@ -404,17 +404,31 @@ where
         .build_input_stream(
             config,
             move |data: &[S], _: &_| {
+                // 批量写入：一次提交替代每样本 push，减少采集回调的原子操作；
+                // 环空间不足时丢弃尾部并计数，语义与逐样本 push 一致。
                 let frames = data.len() / channels;
-                for f in 0..frames {
+                let n = frames.min(producer.slots());
+                if n < frames {
+                    input_drops.fetch_add((frames - n) as u64, Ordering::Relaxed);
+                }
+                if n == 0 {
+                    return;
+                }
+                let Ok(mut chunk) = producer.write_chunk(n) else {
+                    input_drops.fetch_add(n as u64, Ordering::Relaxed);
+                    return;
+                };
+                let (a, b) = chunk.as_mut_slices();
+                let inv = 1.0 / channels as f32;
+                for (idx, out) in a.iter_mut().chain(b.iter_mut()).enumerate() {
+                    let base = idx * channels;
                     let mut sum = 0f32;
                     for c in 0..channels {
-                        sum += to_f32(data[f * channels + c]);
+                        sum += to_f32(data[base + c]);
                     }
-                    let mono = sum * (1.0 / channels as f32);
-                    if producer.push(mono).is_err() {
-                        input_drops.fetch_add(1, Ordering::Relaxed);
-                    }
+                    *out = sum * inv;
                 }
+                chunk.commit_all();
             },
             move |err| {
                 warn!("输入流错误: {}", err);
