@@ -310,4 +310,33 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 旧版 efuse 缺 serial/hmac：加载时补齐并落盘，已有 MAC/client_id 保留。
+    #[test]
+    fn legacy_efuse_backfills_missing_credentials() {
+        let dir = std::env::temp_dir().join(format!("xiaozhi-rs-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("efuse.json");
+        std::fs::write(
+            &path,
+            r#"{"mac_address":"02:00:00:00:00:02","client_id":"legacy-client"}"#,
+        )
+        .unwrap();
+
+        let identity = DeviceIdentity::load_from_file(&path).unwrap();
+        assert_eq!(identity.device_id, "02:00:00:00:00:02");
+        assert_eq!(identity.client_id, "legacy-client");
+        assert!(!identity.serial_number.is_empty());
+        assert_eq!(identity.hmac_key.len(), 64);
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["serial_number"].as_str(),
+            Some(identity.serial_number.as_str())
+        );
+        assert_eq!(saved["hmac_key"].as_str(), Some(identity.hmac_key.as_str()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

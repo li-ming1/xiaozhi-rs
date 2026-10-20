@@ -1304,6 +1304,31 @@ mod tests {
         );
     }
 
+    /// 输出占用超 280ms 时整帧丢弃；空环正常写入。
+    #[test]
+    fn write_samples_caps_backlog() {
+        let (mut producer, _consumer) = rtrb::RingBuffer::new(OUTPUT_RING_SAMPLES);
+        for _ in 0..32_000 {
+            producer.push(0.0).unwrap();
+        }
+        let written = write_samples(
+            &mut producer,
+            &[0.0; ENCODER_FRAME_SIZE],
+            16_000,
+            OUTPUT_RING_SAMPLES,
+        );
+        assert_eq!(written, 0, "超占用仍写入");
+
+        let (mut producer, _consumer) = rtrb::RingBuffer::new(OUTPUT_RING_SAMPLES);
+        let written = write_samples(
+            &mut producer,
+            &[0.1; ENCODER_FRAME_SIZE],
+            48_000,
+            OUTPUT_RING_SAMPLES,
+        );
+        assert_eq!(written, ENCODER_FRAME_SIZE, "空环未正常写入");
+    }
+
     /// 无新包时 PLC 补帧封顶：空闲期不能无限续帧（否则播放窗口永不过期）。
     #[test]
     fn plc_frames_are_capped() {
