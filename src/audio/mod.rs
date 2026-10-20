@@ -98,6 +98,12 @@ fn pick_device(host: &cpal::Host, env: &str, input: bool) -> Option<Device> {
     }
 }
 
+/// 判断设备名是否像显示器/HDMI 音频输出（默认选到它时容易"没声"）。
+fn is_display_audio(name: &str) -> bool {
+    let name = name.to_lowercase();
+    name.contains("display audio") || name.contains("hdmi")
+}
+
 impl AudioPipeline {
     /// 探测输入/输出设备（环境变量可按名称子串指定，未匹配回退系统默认）。
     pub fn new() -> Result<Self> {
@@ -113,6 +119,12 @@ impl AudioPipeline {
             })?;
         info!("输入设备: {}", input_device);
         info!("输出设备: {}", output_device);
+        if is_display_audio(&output_device.to_string()) {
+            warn!(
+                "输出设备疑似显示器音频（{}）；若无声可用 XIAOZHI_OUTPUT_DEVICE 指定扬声器/耳机",
+                output_device
+            );
+        }
         Ok(Self {
             input_device,
             output_device,
@@ -1303,6 +1315,15 @@ mod tests {
         assert!(occupancy_ppm(120.0, 60.0) < 0.0, "占用高应降速");
         assert!(occupancy_ppm(20.0, 60.0) > 0.0, "占用低应提速");
         assert!(occupancy_ppm(60.0, 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn display_audio_output_is_detected() {
+        assert!(is_display_audio(
+            "U27U3D (HD Audio Driver for Display Audio)"
+        ));
+        assert!(is_display_audio("NVIDIA HDMI Output"));
+        assert!(!is_display_audio("Speaker (Realtek(R) Audio)"));
     }
 
     /// 单次调整受速率限制（≤50ppm/s × 最小采样间隔 1ms = 0.05ppm）。
