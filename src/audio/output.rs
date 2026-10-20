@@ -86,7 +86,7 @@ impl DuplexSignal {
         self.flush_serial.load(Ordering::Acquire)
     }
 
-    fn flush_target(&self) -> u64 {
+    pub(super) fn flush_target(&self) -> u64 {
         self.flush_target.load(Ordering::Acquire)
     }
 }
