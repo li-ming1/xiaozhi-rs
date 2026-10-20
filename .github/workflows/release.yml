@@ -88,7 +88,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y libasound2-dev
 
       - name: Test
-        run: cargo test --release --locked --lib
+        run: cargo test --release --locked --lib --bins
 
   # ── Tag 推送时创建 GitHub Release ──
   # 独立 job，等全部平台构建与单测通过后再发布一次，

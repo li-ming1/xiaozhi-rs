@@ -361,3 +361,28 @@ fn reset_device() -> Result<()> {
     println!("设备身份已清除，下次启动将重新生成");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::pending;
+
+    #[tokio::test]
+    async fn wait_or_cancel_passes_through_result() {
+        let token = CancellationToken::new();
+        let result: Result<u8> = wait_or_cancel(&token, async { Ok(7) }).await;
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn wait_or_cancel_stops_when_cancelled() {
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            canceller.cancel();
+        });
+        let result: Result<()> = wait_or_cancel(&token, pending()).await;
+        assert!(result.is_err(), "取消后仍等待");
+    }
+}
