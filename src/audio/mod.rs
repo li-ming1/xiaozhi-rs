@@ -486,6 +486,8 @@ struct CaptureStats {
     playing_frames: u64,
     /// 最近一次 AGC 增益。
     agc_gain: f32,
+    /// 上行 Opus 载荷总字节数（诊断：核对实际码率是否符合分级策略）。
+    bytes: u64,
 }
 
 impl CaptureStats {
@@ -499,6 +501,7 @@ impl CaptureStats {
             silence_frames: 0,
             playing_frames: 0,
             agc_gain: 1.0,
+            bytes: 0,
         }
     }
 
@@ -511,6 +514,7 @@ impl CaptureStats {
         self.silence_frames = 0;
         self.playing_frames = 0;
         self.agc_gain = 1.0;
+        self.bytes = 0;
         self.flush_at = Instant::now();
     }
 }
@@ -839,6 +843,7 @@ impl CaptureWorker {
                 match self.opus.encode(&self.pending[..ENCODER_FRAME_SIZE]) {
                     Ok(pkt) => {
                         self.stats.frames += 1;
+                        self.stats.bytes += pkt.len() as u64;
                         encoded_tx.store(pkt).await;
                     }
                     Err(e) => warn!("Opus 编码失败: {}", e),
@@ -891,6 +896,7 @@ impl CaptureWorker {
             match self.opus.encode(frame) {
                 Ok(pkt) => {
                     self.stats.frames += 1;
+                    self.stats.bytes += pkt.len() as u64;
                     encoded_tx.store(pkt).await;
                 }
                 Err(e) => warn!("Opus 编码失败: {}", e),
@@ -921,8 +927,15 @@ impl CaptureWorker {
                 .log10()
                 * 20.0;
             let input_drops = self.input_drops.swap(0, Ordering::Relaxed);
+            // 上行实际码率（仅语音帧计入）：核对网络分级策略是否生效。
+            let kbps = if self.stats.frames > 0 {
+                self.stats.bytes as f64 * 8.0 / (self.stats.frames as f64 * FRAME_MS as f64 / 1000.0)
+                    / 1000.0
+            } else {
+                0.0
+            };
             debug!(
-                "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 丢弃输入={}, 编码帧={} (语音{} 静音{} 播放期{}), AGC增益={:.1}x, 噪声底={:.1}dBFS, 触发阈值={:.1}dBFS",
+                "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 丢弃输入={}, 编码帧={} (语音{} 静音{} 播放期{}), 上行={:.1}kbps/{}B每帧, AGC增益={:.1}x, 噪声底={:.1}dBFS, 触发阈值={:.1}dBFS",
                 db,
                 self.stats.samples,
                 input_drops,
@@ -930,6 +943,12 @@ impl CaptureWorker {
                 self.stats.speech_frames,
                 self.stats.silence_frames,
                 self.stats.playing_frames,
+                kbps,
+                if self.stats.frames > 0 {
+                    self.stats.bytes / self.stats.frames
+                } else {
+                    0
+                },
                 self.stats.agc_gain,
                 nf_db,
                 on_db

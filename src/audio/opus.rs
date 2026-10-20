@@ -5,10 +5,10 @@ use log::{debug, info, warn};
 use opusic_sys::{
     OPUS_APPLICATION_VOIP, OPUS_OK, OPUS_RESET_STATE, OPUS_SET_BITRATE_REQUEST,
     OPUS_SET_COMPLEXITY_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST,
-    OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST,
-    OpusDecoder, OpusEncoder, opus_decode_float, opus_decoder_create, opus_decoder_ctl,
-    opus_decoder_destroy, opus_encode_float, opus_encoder_create, opus_encoder_destroy,
-    opus_get_version_string, opus_strerror,
+    OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_SIGNAL_REQUEST, OPUS_SET_VBR_CONSTRAINT_REQUEST,
+    OPUS_SET_VBR_REQUEST, OPUS_SIGNAL_VOICE, OpusDecoder, OpusEncoder, opus_decode_float,
+    opus_decoder_create, opus_decoder_ctl, opus_decoder_destroy, opus_encode_float,
+    opus_encoder_create, opus_encoder_destroy, opus_get_version_string, opus_strerror,
 };
 use std::ffi::{CStr, c_int};
 use std::sync::Once;
@@ -35,13 +35,17 @@ unsafe extern "C" {
 }
 
 /// 网络质量分级，驱动编码策略。
+///
+/// 上行是 16kHz 单声道语音，60ms 一帧：**一帧丢包 = 60ms 语音整段丢失**，
+/// 而语音里 60ms 足以吞掉一个音节，ASR 直接错词。因此带内 FEC 常开
+/// （最便宜的"抗丢包"手段，代价约 10~20% 码率），只在弱网进一步降码率 + DTX。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkGrade {
-    /// 32kbps VBR / FEC off / DTX off。
+    /// 40kbps VBR / FEC(5%) / DTX off。
     Good,
-    /// 28kbps + FEC。
+    /// 32kbps VBR / FEC(10%)。
     Fair,
-    /// 20kbps constrained-VBR / FEC / DTX。
+    /// 24kbps constrained-VBR / FEC(15%) / DTX。
     Poor,
 }
 
@@ -123,9 +127,9 @@ impl OpusCodec {
     fn apply_encoder_config(&mut self, grade: NetworkGrade) {
         // loss_perc（预期丢包率）是带内 FEC 的前提：不设置时编码器不会添加冗余，FEC 形同虚设。
         let (bitrate, vbr, constrained, fec, dtx, loss_perc) = match grade {
-            NetworkGrade::Good => (32_000, 1, 0, 0, 0, 0),
-            NetworkGrade::Fair => (28_000, 1, 0, 1, 0, 10),
-            NetworkGrade::Poor => (20_000, 0, 1, 1, 1, 15),
+            NetworkGrade::Good => (40_000, 1, 0, 1, 0, 5),
+            NetworkGrade::Fair => (32_000, 1, 0, 1, 0, 10),
+            NetworkGrade::Poor => (24_000, 0, 1, 1, 1, 15),
         };
         let set = |request: c_int, value: c_int| {
             let ret = unsafe { opus_encoder_ctl_fixed(self.encoder, request, value) };
@@ -143,6 +147,9 @@ impl OpusCodec {
         set(OPUS_SET_INBAND_FEC_REQUEST, fec);
         set(OPUS_SET_PACKET_LOSS_PERC_REQUEST, loss_perc);
         set(OPUS_SET_DTX_REQUEST, dtx);
+        // 强制语音信号：避免噪声段被判成音乐而切到 CELT 音乐模式
+        // （该模式把码率摊到全频带，语音清晰度反而下降、频谱发"毛"）。
+        set(OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_VOICE);
     }
 
     /// 设置编码复杂度（0-10），默认 10。

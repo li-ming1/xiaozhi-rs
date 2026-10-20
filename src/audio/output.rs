@@ -91,11 +91,16 @@ impl DuplexSignal {
     }
 }
 
-/// 输出欠载状态：播放断流时做 5ms 斜坡静音（避免爆音）；状态全在回调闭包内。
+/// 输出欠载状态：断流时 5ms 斜坡淡出、恢复时 5ms 淡入（两侧都消爆音）。
+///
+/// 只做淡出会在"静音 → 有声"的边界留下阶跃（每次回复第一个字都"啪"一声），
+/// 因此欠载期记录 `fade_in_left`，下一批真实样本按同一斜坡从 0 抬起。
 struct Underrun {
     last_out: f32,
     ramp_left: usize,
     ramp_pending: bool,
+    /// 淡入剩余样本数（>0 表示刚从静音恢复，输出需按斜坡抬起）。
+    fade_in_left: usize,
     ramp_len: usize,
     /// 已从环中取出的样本总数（含清环丢弃），用于精确的清环边界。
     consumed: u64,
@@ -107,37 +112,57 @@ impl Underrun {
             last_out: 0.0,
             ramp_left: 0,
             ramp_pending: true,
+            fade_in_left: 0,
             ramp_len: ramp_len.max(1),
             consumed: 0,
         }
     }
 
-    /// 清环后复位播放状态；`consumed` 是环的累计进度，跨清环保留。
-    fn reset(&mut self) {
-        self.last_out = 0.0;
-        self.ramp_left = 0;
+    /// 清环（TTS 切换）：先按当前电平淡出再静音，避免"说到一半被切断"的爆音。
+    /// `consumed` 是环的累计进度，跨清环保留。
+    fn begin_silence(&mut self) {
         self.ramp_pending = false;
+        self.ramp_left = if self.last_out.abs() > 1e-4 {
+            self.ramp_len
+        } else {
+            0
+        };
+        self.fade_in_left = self.ramp_len;
     }
 
-    /// 取一个单声道样本；ring 空时返回欠载斜坡值。
+    /// 取一个单声道样本；ring 空时返回淡出/静音值，恢复后从 0 淡入。
     #[inline]
     fn next(&mut self, consumer: &mut Consumer<f32>) -> f32 {
         let Some(v) = consumer.pop().ok() else {
             if self.ramp_pending {
                 self.ramp_pending = false;
-                if self.last_out.abs() > 1e-4 {
-                    self.ramp_left = self.ramp_len - 1;
-                }
+                self.ramp_left = if self.last_out.abs() > 1e-4 {
+                    self.ramp_len - 1
+                } else {
+                    0
+                };
             }
+            // 断流期间保持"下一批样本需淡入"的待办状态。
+            self.fade_in_left = self.ramp_len;
             if self.ramp_left > 0 {
                 self.ramp_left -= 1;
+                // 以"最后一个真实样本"为基准线性衰减：不能把已衰减值再乘一次（会变成指数骤降）。
                 return self.last_out * (self.ramp_left as f32 / self.ramp_len as f32);
             }
+            self.last_out = 0.0;
             return 0.0;
         };
-        self.last_out = v;
         self.ramp_pending = true;
         self.consumed += 1;
+        if self.fade_in_left > 0 {
+            self.fade_in_left -= 1;
+            // 1/ramp_len → 1.0：首样本接近静音，5ms 内抬到满幅。
+            let gain = 1.0 - self.fade_in_left as f32 / self.ramp_len as f32;
+            let out = v * gain;
+            self.last_out = out;
+            return out;
+        }
+        self.last_out = v;
         v
     }
 }
@@ -299,7 +324,7 @@ impl OutputState {
                     break;
                 }
             }
-            self.underrun.reset();
+            self.underrun.begin_silence();
             // 清环后的静音是预期行为，不计为欠载。
             self.starving = true;
         }
@@ -427,6 +452,49 @@ mod tests {
             "闪避未生效: {}",
             tail
         );
+    }
+
+    /// 断流后恢复必须淡入：首批样本从接近 0 抬起，5ms 内到满幅。
+    /// 否则每次回复第一个字都会"啪"一声（0 → 满幅阶跃）。
+    #[test]
+    fn output_fades_in_after_underrun() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(8192);
+        let duplex = DuplexSignal::new();
+        let cb = AtomicU64::new(0);
+        let mut state = OutputState::new(48_000, 240, &duplex, Arc::new(AtomicU64::new(0)));
+        let mut data = [1.0f32; 480];
+        // 环空：整块静音，内部进入"待淡入"状态。
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert!(data.iter().all(|s| *s == 0.0), "空环应输出静音");
+
+        for _ in 0..480 {
+            producer.push(1.0).unwrap();
+        }
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert!(data[0] < 0.02, "首样本未淡入: {}", data[0]);
+        assert!(data[239] > 0.9, "淡入未在 5ms 内完成: {}", data[239]);
+        assert!((data[479] - 1.0).abs() < 1e-3, "淡入后未到满幅");
+    }
+
+    /// 清环（TTS 被打断/切换）必须淡出：不能从满幅直接跳 0。
+    #[test]
+    fn output_fades_out_on_flush() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(8192);
+        for _ in 0..2048 {
+            producer.push(1.0).unwrap();
+        }
+        let duplex = DuplexSignal::new();
+        let cb = AtomicU64::new(0);
+        let mut state = OutputState::new(48_000, 240, &duplex, Arc::new(AtomicU64::new(0)));
+        let mut data = [0f32; 480];
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert!((data[479] - 1.0).abs() < 1e-3, "前置播放异常");
+
+        duplex.request_flush(2048);
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert!(data[0] > 0.9, "淡出起点应接近原电平: {}", data[0]);
+        assert!(data[239].abs() < 0.02, "淡出未在 5ms 内完成: {}", data[239]);
+        assert_eq!(data[479], 0.0, "淡出后应保持静音");
     }
 
     /// 环形缓冲不足一块时记一次欠载；连续空回调与清环静音不重复计数。

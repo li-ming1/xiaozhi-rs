@@ -1,9 +1,15 @@
-//! 播放缓冲目标深度控制：目标 = clamp(40ms + 4×jitter_EWMA, 40, 240)，增长即时、稳定后下降。
+//! 播放缓冲目标深度控制：目标 = clamp(下限 + 4×jitter_EWMA, 下限, 240)，增长即时、稳定后下降。
 
 use std::time::Instant;
 
-pub const INITIAL_TARGET_MS: u64 = 60;
-pub const TARGET_MIN_MS: u64 = 40;
+/// 初始目标深度：2 帧（120ms）。
+pub const INITIAL_TARGET_MS: u64 = 120;
+/// 目标下限。
+///
+/// 下行按 60ms 一帧成块到达、输出回调按 10~20ms 成块消费，缓冲占用天然是锯齿波
+/// （振幅 = 一帧 60ms）。下限若小于一帧，锯齿谷底会周期性触到 0 → 每帧都插入一次
+/// 淡出/淡入 → 听感"发毛、有颗粒感"。80ms 覆盖 1.3 帧，谷底仍有 ~20ms 余量。
+pub const TARGET_MIN_MS: u64 = 80;
 pub const TARGET_MAX_MS: u64 = 240;
 /// 目标稳定多久后开始下降。
 pub const SHRINK_STABLE_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
@@ -15,16 +21,25 @@ pub struct PlaybackBuffer {
     target_ms: u64,
     jitter_ewma_ms: f64,
     frame_ms: u64,
+    /// 目标深度下限（默认 [`TARGET_MIN_MS`]，可经 `XIAOZHI_PLAY_TARGET_MIN_MS` 覆盖：
+    /// 调小换延迟、调大换平滑，不得小于一帧）。
+    min_ms: u64,
     last_arrival: Option<Instant>,
     stable_since: Option<Instant>,
 }
 
 impl PlaybackBuffer {
     pub fn new(frame_ms: u64) -> Self {
+        let min_ms = std::env::var("XIAOZHI_PLAY_TARGET_MIN_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(TARGET_MIN_MS)
+            .clamp(frame_ms, TARGET_MAX_MS);
         Self {
-            target_ms: INITIAL_TARGET_MS,
+            target_ms: INITIAL_TARGET_MS.max(min_ms),
             jitter_ewma_ms: 0.0,
             frame_ms,
+            min_ms,
             last_arrival: None,
             stable_since: None,
         }
@@ -49,8 +64,8 @@ impl PlaybackBuffer {
 
     /// 依据当前 jitter 重算目标深度：增长即时（保流畅），稳定后逐步回落到期望值（降延迟）。
     pub fn update_target(&mut self, now: Instant) {
-        let desired = (TARGET_MIN_MS as f64 + 4.0 * self.jitter_ewma_ms) as u64;
-        let desired = desired.clamp(TARGET_MIN_MS, TARGET_MAX_MS);
+        let desired = (self.min_ms as f64 + 4.0 * self.jitter_ewma_ms) as u64;
+        let desired = desired.clamp(self.min_ms, TARGET_MAX_MS);
         if desired > self.target_ms {
             self.target_ms = desired;
             self.stable_since = None;
@@ -85,9 +100,13 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn initial_target_is_60ms() {
+    fn initial_target_covers_at_least_one_frame() {
         let b = PlaybackBuffer::new(60);
-        assert_eq!(b.target_ms(), 60);
+        assert_eq!(b.target_ms(), INITIAL_TARGET_MS);
+        assert!(
+            b.target_ms() > 60,
+            "初始目标深度不足一帧，锯齿谷底会周期性欠载"
+        );
     }
 
     #[test]
@@ -177,10 +196,11 @@ mod tests {
         b.observe_arrival(now + Duration::from_millis(180)); // 120ms 间隔 = 丢 1 帧
         b.update_target(now + Duration::from_secs(1));
         assert!(
-            b.target_ms() <= 100,
+            b.target_ms() <= INITIAL_TARGET_MS,
             "单次迟到帧把目标顶到 {}ms",
             b.target_ms()
         );
+        assert!(b.target_ms() < TARGET_MAX_MS);
     }
 
     /// TTS 切换只断开到达序列，不应丢掉已学到的网络抖动估计。
