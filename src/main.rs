@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use log::{info, warn};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use xiaozhi_rs::identity::DeviceIdentity;
@@ -85,13 +86,14 @@ impl log::Log for SimpleLogger {
         let min = ((secs % 3600) / 60) as u8;
         let sec = (secs % 60) as u8;
         eprintln!(
-            "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}",
+            "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {:<5} {}",
             year,
             month,
             day,
             hour,
             min,
             sec,
+            record.level(),
             record.args()
         );
     }
@@ -165,20 +167,62 @@ async fn run_client(skip_activation: bool, shutdown: CancellationToken) -> Resul
         info!("使用测试 MAC 地址: {}", identity.device_id);
     }
 
-    let ota_config = ensure_activated(&mut identity, skip_activation).await?;
+    let ota_config = ensure_activated(&mut identity, skip_activation, &shutdown).await?;
 
     let mut supervisor = VoiceSupervisor::new(identity, ota_config, shutdown);
     supervisor.run().await?;
     Ok(())
 }
 
+/// 在取消信号与异步操作之间做选择；取消时返回"已取消"，避免激活阶段 Ctrl+C 无响应。
+async fn wait_or_cancel<F, T>(shutdown: &CancellationToken, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    tokio::select! {
+        _ = shutdown.cancelled() => Err(anyhow::anyhow!("已取消")),
+        r = fut => r,
+    }
+}
+
+/// 拉取 OTA 配置：启动期网络抖动重试 3 次（1s/3s），并响应取消信号。
+async fn fetch_config_retry(
+    identity: &DeviceIdentity,
+    shutdown: &CancellationToken,
+) -> Result<OtaConfig> {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match wait_or_cancel(shutdown, xiaozhi_rs::ota::fetch_config(identity)).await {
+            Ok(config) => return Ok(config),
+            Err(e) if shutdown.is_cancelled() => return Err(e),
+            Err(e) if attempt < MAX_ATTEMPTS => {
+                let delay = Duration::from_secs(if attempt == 1 { 1 } else { 3 });
+                warn!(
+                    "OTA 获取失败（{}/{}）: {}，{}s 后重试",
+                    attempt,
+                    MAX_ATTEMPTS,
+                    e,
+                    delay.as_secs()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown.cancelled() => return Err(anyhow::anyhow!("已取消")),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(anyhow::anyhow!("OTA 获取失败"))
+}
+
 /// 保证设备已激活，返回 OTA 配置；未激活则进入轮询授权流程。
 async fn ensure_activated(
     identity: &mut DeviceIdentity,
     skip_activation: bool,
+    shutdown: &CancellationToken,
 ) -> Result<OtaConfig> {
     info!("正在从 OTA 服务器获取配置...");
-    let mut ota_config = xiaozhi_rs::ota::fetch_config(identity).await?;
+    let mut ota_config = fetch_config_retry(identity, shutdown).await?;
 
     if skip_activation || identity.is_activated() {
         return Ok(ota_config);
@@ -195,15 +239,21 @@ async fn ensure_activated(
             activation_data.code
         );
 
-        match xiaozhi_rs::ota::wait_for_activation(identity, &activation_data.challenge).await {
+        let activation = wait_or_cancel(
+            shutdown,
+            xiaozhi_rs::ota::wait_for_activation(identity, &activation_data.challenge),
+        )
+        .await;
+        match activation {
             Ok(_) => {
                 info!("激活成功！");
                 identity.set_activated()?;
                 return Ok(ota_config);
             }
+            Err(e) if shutdown.is_cancelled() => return Err(e),
             Err(_) if attempt < MAX_RETRIES => {
                 info!("激活码已过期，正在重新获取...");
-                ota_config = xiaozhi_rs::ota::fetch_config(identity).await?;
+                ota_config = fetch_config_retry(identity, shutdown).await?;
             }
             Err(e) => return Err(anyhow::anyhow!("激活失败，已达到最大重试次数: {}", e)),
         }

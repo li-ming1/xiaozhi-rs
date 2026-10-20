@@ -1,7 +1,7 @@
 //! 设备身份：MAC 派生、UUID、序列号/HMAC 生成与 efuse 持久化。
 
 use anyhow::Result;
-use log::info;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -119,7 +119,17 @@ impl DeviceIdentity {
 
         let data: EfuseData = match serde_json::from_str(&content) {
             Ok(d) => d,
-            Err(_) => return Self::create_new(efuse_path),
+            Err(e) => {
+                // 损坏文件先留档再重建，避免直接覆盖掉可恢复的设备身份。
+                let backup = efuse_path.with_extension("corrupt.json");
+                let _ = fs::copy(efuse_path, &backup);
+                warn!(
+                    "efuse 解析失败({})，已备份到 {} 并重新生成身份",
+                    e,
+                    backup.display()
+                );
+                return Self::create_new(efuse_path);
+            }
         };
 
         let client_id_missing = data.client_id.is_empty();
@@ -133,8 +143,26 @@ impl DeviceIdentity {
         } else {
             data.mac_address
         };
-        let serial_number = data.serial_number;
-        let hmac_key = data.hmac_key;
+        // 旧版 efuse 可能缺 serial/hmac：按与首次创建相同的规则补齐并落盘；
+        // 已有字段原样保留，避免改动可用的序列号。
+        let credentials_missing = data.serial_number.is_empty() || data.hmac_key.is_empty();
+        let (serial_number, hmac_key) = if credentials_missing {
+            let (serial, hmac) = derive_credentials(&device_id, &client_id);
+            (
+                if data.serial_number.is_empty() {
+                    serial
+                } else {
+                    data.serial_number
+                },
+                if data.hmac_key.is_empty() {
+                    hmac
+                } else {
+                    data.hmac_key
+                },
+            )
+        } else {
+            (data.serial_number, data.hmac_key)
+        };
 
         let identity = DeviceIdentity {
             device_id,
@@ -145,10 +173,10 @@ impl DeviceIdentity {
             efuse_path: efuse_path.to_path_buf(),
         };
 
-        // 补出的 client_id 必须落盘，否则每次启动都会生成不同 UUID。
-        if client_id_missing {
+        // 补出的字段必须落盘，否则每次启动都会重新生成。
+        if client_id_missing || credentials_missing {
             identity.save()?;
-            info!("已为设备身份补齐 client_id: {}", identity.client_id);
+            info!("已补齐设备身份字段: {}", identity.device_id);
         }
 
         info!("已加载设备身份: {}", identity.device_id);
@@ -161,15 +189,7 @@ impl DeviceIdentity {
 
         let device_id = Self::generate_mac_address();
         let client_id = Uuid::new_v4().to_string();
-
-        // 序列号 = SN-{hash[:8]}-{mac_clean}；HMAC 密钥绑定主机名，防止凭证跨机复用。
-        let mac_clean = device_id.replace(":", "").to_lowercase();
-        let hash = to_hex(&Sha256::digest(mac_clean.as_bytes()));
-        let serial_number = format!("SN-{}-{}", hash[..8].to_uppercase(), mac_clean);
-
-        let hostname = hostname_str();
-        let hmac_input = format!("{}||{}||{}", hostname, device_id, client_id);
-        let hmac_key = to_hex(&Sha256::digest(hmac_input.as_bytes()));
+        let (serial_number, hmac_key) = derive_credentials(&device_id, &client_id);
 
         let identity = DeviceIdentity {
             device_id,
@@ -236,5 +256,58 @@ impl DeviceIdentity {
         self.activation_status = true;
         self.save()?;
         Ok(())
+    }
+}
+
+/// 序列号 = SN-{hash[:8]}-{mac_clean}；HMAC 密钥绑定主机名，防止凭证跨机复用。
+/// 首次创建与旧版 efuse 补字段共用同一规则，保证同一设备派生结果一致。
+fn derive_credentials(device_id: &str, client_id: &str) -> (String, String) {
+    let mac_clean = device_id.replace(':', "").to_lowercase();
+    let hash = to_hex(&Sha256::digest(mac_clean.as_bytes()));
+    let serial_number = format!("SN-{}-{}", hash[..8].to_uppercase(), mac_clean);
+    let hmac_input = format!("{}||{}||{}", hostname_str(), device_id, client_id);
+    let hmac_key = to_hex(&Sha256::digest(hmac_input.as_bytes()));
+    (serial_number, hmac_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 同一 MAC/client_id 必须派生稳定且格式正确的凭证。
+    #[test]
+    fn derive_credentials_is_stable_and_well_formed() {
+        let (serial, key) = derive_credentials("02:00:00:00:00:01", "client-1");
+        assert!(serial.starts_with("SN-"), "序列号前缀异常: {}", serial);
+        assert!(
+            serial.ends_with("020000000001"),
+            "序列号后缀异常: {}",
+            serial
+        );
+        assert_eq!(key.len(), 64, "HMAC 密钥应为 32 字节 hex");
+        assert_eq!(
+            (serial.clone(), key.clone()),
+            derive_credentials("02:00:00:00:00:01", "client-1")
+        );
+    }
+
+    /// 损坏的 efuse 必须先备份，再重建身份，避免静默丢失 MAC/序列号/HMAC。
+    #[test]
+    fn corrupt_efuse_is_backed_up_before_recreate() {
+        let dir = std::env::temp_dir().join(format!("xiaozhi-rs-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("efuse.json");
+        std::fs::write(&path, "{not-json").unwrap();
+
+        let identity = DeviceIdentity::load_from_file(&path).unwrap();
+        assert!(!identity.device_id.is_empty());
+        let backup = path.with_extension("corrupt.json");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "{not-json",
+            "损坏文件未备份"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
