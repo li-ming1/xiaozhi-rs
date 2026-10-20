@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
         Some("start") => run_with_signal(false).await?,
         Some("skip") => run_with_signal(true).await?,
         Some("info") => show_device_info()?,
+        Some("doctor") => show_audio_doctor()?,
         Some("reset") => reset_device()?,
         Some("-h") | Some("--help") => print_usage(),
         Some(other) => {
@@ -60,6 +61,7 @@ fn print_usage() {
     println!("  start   启动语音对话");
     println!("  skip    跳过激活直接启动");
     println!("  info    显示设备信息");
+    println!("  doctor  检查默认音频设备与格式");
     println!("  reset   重置设备身份");
 }
 
@@ -270,6 +272,43 @@ fn show_device_info() -> Result<()> {
     println!("  已激活: {}", identity.is_activated());
     println!();
     println!("配置文件: {}", identity.efuse_path.display());
+    Ok(())
+}
+
+/// 打印默认音频设备与格式，供实机验收前快速确认硬件路径。
+fn show_audio_doctor() -> Result<()> {
+    use cpal::traits::HostTrait;
+
+    fn describe(label: &str, device: Option<cpal::Device>, input: bool) {
+        use cpal::traits::DeviceTrait;
+        let Some(device) = device else {
+            println!("  {}: 未找到", label);
+            return;
+        };
+        println!("  {}: {}", label, device);
+        let config = if input {
+            device.default_input_config()
+        } else {
+            device.default_output_config()
+        };
+        match config {
+            Ok(c) => println!(
+                "    {}Hz / {}ch / {:?}",
+                c.sample_rate(),
+                c.channels(),
+                c.sample_format()
+            ),
+            Err(e) => println!("    获取配置失败: {}", e),
+        }
+    }
+
+    let host = cpal::default_host();
+    println!("音频设备检查:");
+    println!("  主机: {}", host.id().name());
+    describe("默认输入", host.default_input_device(), true);
+    describe("默认输出", host.default_output_device(), false);
+    println!();
+    println!("提示: 实机对话请运行 `RUST_LOG=debug xiaozhi-rs start`");
     Ok(())
 }
 

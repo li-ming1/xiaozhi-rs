@@ -89,6 +89,7 @@ git tag v0.1.3 && git push origin v0.1.3
 xiaozhi-rs start                 # 启动语音对话
 xiaozhi-rs skip                  # 跳过激活直接启动（测试用）
 xiaozhi-rs info                  # 查看设备身份
+xiaozhi-rs doctor                # 检查默认音频设备与格式
 xiaozhi-rs reset                 # 重置设备身份（重新生成 MAC/序列号，需重新激活）
 ```
 
