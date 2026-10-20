@@ -124,6 +124,8 @@ impl AudioPipeline {
         let duplex = Arc::new(DuplexSignal::new());
         // CPAL 错误回调（设备拔出/USB 故障）只置位，由监督器异步发现并重建。
         let device_error = Arc::new(AtomicBool::new(false));
+        // 输入环满时回调只能丢样本；计数供捕获诊断区分“没声”与“处理不过来”。
+        let input_drops = Arc::new(AtomicU64::new(0));
 
         let input_stream = match input_format {
             SampleFormat::I16 => build_input_stream::<i16>(
@@ -133,6 +135,7 @@ impl AudioPipeline {
                 |s: i16| s as f32 / 32768.0,
                 in_producer,
                 device_error.clone(),
+                input_drops.clone(),
             )?,
             SampleFormat::I8 => build_input_stream::<i8>(
                 &self.input_device,
@@ -141,6 +144,7 @@ impl AudioPipeline {
                 |s: i8| s as f32 / 128.0,
                 in_producer,
                 device_error.clone(),
+                input_drops.clone(),
             )?,
             SampleFormat::I32 => build_input_stream::<i32>(
                 &self.input_device,
@@ -149,6 +153,7 @@ impl AudioPipeline {
                 |s: i32| s as f32 / 2_147_483_648.0,
                 in_producer,
                 device_error.clone(),
+                input_drops.clone(),
             )?,
             SampleFormat::I64 => build_input_stream::<i64>(
                 &self.input_device,
@@ -157,6 +162,7 @@ impl AudioPipeline {
                 |s: i64| (s as f64 / 9_223_372_036_854_775_808.0) as f32,
                 in_producer,
                 device_error.clone(),
+                input_drops.clone(),
             )?,
             SampleFormat::U8 => build_input_stream::<u8>(
                 &self.input_device,
@@ -165,6 +171,7 @@ impl AudioPipeline {
                 |s: u8| (s as f32 - 128.0) / 128.0,
                 in_producer,
                 device_error.clone(),
+                input_drops.clone(),
             )?,
             SampleFormat::U32 => build_input_stream::<u32>(
                 &self.input_device,
@@ -173,6 +180,7 @@ impl AudioPipeline {
                 |s: u32| ((s as f64 - 2_147_483_648.0) / 2_147_483_648.0) as f32,
                 in_producer,
                 device_error.clone(),
+                input_drops.clone(),
             )?,
             SampleFormat::U64 => build_input_stream::<u64>(
                 &self.input_device,
@@ -183,6 +191,7 @@ impl AudioPipeline {
                 },
                 in_producer,
                 device_error.clone(),
+                input_drops.clone(),
             )?,
             SampleFormat::U16 => build_input_stream::<u16>(
                 &self.input_device,
@@ -191,6 +200,7 @@ impl AudioPipeline {
                 |s: u16| (s as f32 - 32768.0) / 32768.0,
                 in_producer,
                 device_error.clone(),
+                input_drops.clone(),
             )?,
             SampleFormat::F32 => build_input_stream::<f32>(
                 &self.input_device,
@@ -199,6 +209,7 @@ impl AudioPipeline {
                 |s: f32| s,
                 in_producer,
                 device_error.clone(),
+                input_drops.clone(),
             )?,
             SampleFormat::F64 => build_input_stream::<f64>(
                 &self.input_device,
@@ -207,6 +218,7 @@ impl AudioPipeline {
                 |s: f64| s as f32,
                 in_producer,
                 device_error.clone(),
+                input_drops.clone(),
             )?,
             other => return Err(VoiceError::Audio(format!("不支持的输入格式: {:?}", other))),
         };
@@ -253,7 +265,7 @@ impl AudioPipeline {
         let tuning = AudioTuning::from_env();
         // 同步构造 worker：初始化失败直接让 start 返回 Err，由监督器走设备重建/重连，
         // 而不是任务静默退出、会话"没声音也不重连"。
-        let capture = CaptureWorker::new(input_rate, tuning.vad, duplex.clone())?;
+        let capture = CaptureWorker::new(input_rate, tuning.vad, duplex.clone(), input_drops)?;
         let playback = PlaybackWorker::new(
             playback_rx,
             PlaybackSetup {
@@ -323,6 +335,7 @@ fn build_input_stream<S>(
     to_f32: fn(S) -> f32,
     mut producer: Producer<f32>,
     device_error: Arc<AtomicBool>,
+    input_drops: Arc<AtomicU64>,
 ) -> Result<Stream>
 where
     S: SizedSample + Copy + Send + 'static,
@@ -338,7 +351,9 @@ where
                         sum += to_f32(data[f * channels + c]);
                     }
                     let mono = sum * (1.0 / channels as f32);
-                    let _ = producer.push(mono);
+                    if producer.push(mono).is_err() {
+                        input_drops.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             },
             move |err| {
@@ -582,12 +597,19 @@ struct CaptureWorker {
     start_roll: Vec<f32>,
     /// 播放活跃/插话闪避信号（播放 worker 写，捕获 worker 读）。
     duplex: Arc<DuplexSignal>,
+    /// 输入环满导致的样本丢弃数（回调写，诊断读）。
+    input_drops: Arc<AtomicU64>,
     /// 本轮 TTS 是否已记录过插话（观测用，一轮只打一条）。
     barge_logged: bool,
 }
 
 impl CaptureWorker {
-    fn new(device_rate: u32, vad_config: VadConfig, duplex: Arc<DuplexSignal>) -> Result<Self> {
+    fn new(
+        device_rate: u32,
+        vad_config: VadConfig,
+        duplex: Arc<DuplexSignal>,
+        input_drops: Arc<AtomicU64>,
+    ) -> Result<Self> {
         let nominal = 16_000.0 / device_rate as f64;
         let vad = Vad::with_config(&vad_config);
         let onset_capacity = vad.on_confirm_frames.saturating_sub(1) as usize * ENCODER_FRAME_SIZE;
@@ -610,6 +632,7 @@ impl CaptureWorker {
             high_pass: HighPass::new(ENCODER_RATE),
             start_roll: Vec::with_capacity(onset_capacity),
             duplex,
+            input_drops,
             barge_logged: false,
         })
     }
@@ -772,10 +795,12 @@ impl CaptureWorker {
                 .max(1e-9)
                 .log10()
                 * 20.0;
+            let input_drops = self.input_drops.swap(0, Ordering::Relaxed);
             debug!(
-                "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 编码帧={} (语音{} 静音{} 播放期{}), AGC增益={:.1}x, 噪声底={:.1}dBFS, 触发阈值={:.1}dBFS",
+                "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 丢弃输入={}, 编码帧={} (语音{} 静音{} 播放期{}), AGC增益={:.1}x, 噪声底={:.1}dBFS, 触发阈值={:.1}dBFS",
                 db,
                 self.stats.samples,
+                input_drops,
                 self.stats.frames,
                 self.stats.speech_frames,
                 self.stats.silence_frames,
@@ -1163,7 +1188,8 @@ mod tests {
     #[tokio::test]
     async fn onset_frames_are_flushed_on_trigger() {
         let duplex = Arc::new(DuplexSignal::new());
-        let mut worker = CaptureWorker::new(16_000, test_config(), duplex).unwrap();
+        let mut worker =
+            CaptureWorker::new(16_000, test_config(), duplex, Arc::new(AtomicU64::new(0))).unwrap();
         let slot = LatestSlot::<Vec<u8>>::new();
         worker.pending.extend(make_frame(0.02, ENCODER_FRAME_SIZE));
         worker.pending.extend(make_frame(0.02, ENCODER_FRAME_SIZE));
