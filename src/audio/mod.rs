@@ -49,6 +49,19 @@ pub enum PlaybackMsg {
     Flush,
 }
 
+/// 本地 VAD 的说话起止事件。
+///
+/// 静音帧不上行（省带宽/降噪），但服务端 VAD 靠"收到的静音帧"计时判定句子结束，
+/// 只发 720ms 尾随静音达不到服务端默认的 1000ms 静音阈值，句子永远不结束。
+/// 因此由客户端在本地判定后显式下发 `listen stop` / `listen start`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureEvent {
+    /// 本地 VAD 判定开始说话（用于恢复监听：`listen start`）。
+    SpeechStart,
+    /// 本地 VAD 判定说完（尾随静音走完，用于结束识别：`listen stop`）。
+    SpeechEnd,
+}
+
 /// 音频管线：持有设备、流与 DSP worker。
 pub struct AudioPipeline {
     input_device: Device,
@@ -58,6 +71,8 @@ pub struct AudioPipeline {
     workers: Vec<JoinHandle<()>>,
     playback_tx: Option<mpsc::Sender<PlaybackMsg>>,
     grade_tx: Option<mpsc::Sender<NetworkGrade>>,
+    /// 本地 VAD 起止事件接收端（每次 start 重建，由监督器取走）。
+    capture_events: Option<mpsc::Receiver<CaptureEvent>>,
     /// CPAL 流错误标志：监督器检测到后结束会话并重建音频管线。
     device_error: Option<Arc<AtomicBool>>,
 }
@@ -142,6 +157,7 @@ impl AudioPipeline {
             workers: Vec::new(),
             playback_tx: None,
             grade_tx: None,
+            capture_events: None,
             device_error: None,
         })
     }
@@ -322,6 +338,8 @@ impl AudioPipeline {
 
         let (playback_tx, playback_rx) = mpsc::channel::<PlaybackMsg>(32);
         let (grade_tx, grade_rx) = mpsc::channel::<NetworkGrade>(4);
+        // 说话起止事件：容量 4 足够（起/止交替产生），满时丢弃不影响主链路。
+        let (capture_tx, capture_rx) = mpsc::channel::<CaptureEvent>(4);
         let tuning = AudioTuning::from_env();
         // 同步构造 worker：初始化失败直接让 start 返回 Err，由监督器走设备重建/重连，
         // 而不是任务静默退出、会话"没声音也不重连"。
@@ -331,6 +349,7 @@ impl AudioPipeline {
             duplex.clone(),
             input_drops,
             tuning.opus_complexity,
+            capture_tx,
         )?;
         let playback = PlaybackWorker::new(
             playback_rx,
@@ -357,6 +376,7 @@ impl AudioPipeline {
         self.output_stream = Some(output_stream);
         self.playback_tx = Some(playback_tx);
         self.grade_tx = Some(grade_tx);
+        self.capture_events = Some(capture_rx);
         self.device_error = Some(device_error);
         Ok(())
     }
@@ -370,7 +390,13 @@ impl AudioPipeline {
         }
         self.playback_tx = None;
         self.grade_tx = None;
+        self.capture_events = None;
         self.device_error = None;
+    }
+
+    /// 取走本地 VAD 起止事件接收端（每次 start 后可用一次）。
+    pub fn take_capture_events(&mut self) -> Option<mpsc::Receiver<CaptureEvent>> {
+        self.capture_events.take()
     }
 
     /// 音频流是否发生过 CPAL 错误（设备热拔/流故障）。
@@ -681,6 +707,8 @@ struct CaptureWorker {
     input_drops: Arc<AtomicU64>,
     /// 本轮 TTS 是否已记录过插话（观测用，一轮只打一条）。
     barge_logged: bool,
+    /// 本地 VAD 起止事件出口（监督器据此下发 listen stop/start）。
+    events: mpsc::Sender<CaptureEvent>,
 }
 
 impl CaptureWorker {
@@ -690,6 +718,7 @@ impl CaptureWorker {
         duplex: Arc<DuplexSignal>,
         input_drops: Arc<AtomicU64>,
         opus_complexity: i32,
+        events: mpsc::Sender<CaptureEvent>,
     ) -> Result<Self> {
         let nominal = 16_000.0 / device_rate as f64;
         let vad = Vad::with_config(&vad_config);
@@ -715,6 +744,7 @@ impl CaptureWorker {
             duplex,
             input_drops,
             barge_logged: false,
+            events,
         })
     }
 
@@ -786,6 +816,7 @@ impl CaptureWorker {
             }
             let was_speech = self.vad.speech;
             let send = self.vad.decide(s.rms, playing);
+            self.report_speech_transition(was_speech, send);
             if playing && (send || self.vad.awaiting_onset()) {
                 // 候选帧即预闪避：不等防抖确认，先让路 60ms，也顺带压低扬声器回声；
                 // 语音帧持续刷新窗口，用户不停口 TTS 就一直让路。
@@ -824,6 +855,19 @@ impl CaptureWorker {
                 self.agc.decay();
             }
             self.pending.drain(..ENCODER_FRAME_SIZE);
+        }
+    }
+
+    /// VAD 状态翻转时上报事件：起点 → `listen start`，终点 → `listen stop`。
+    /// 能量钳制触发的释放是"误触发纠正"，不是用户说完，不能当作句子结束（否则截断整句）。
+    fn report_speech_transition(&mut self, was_speech: bool, send: bool) {
+        if send == was_speech {
+            return;
+        }
+        if send {
+            let _ = self.events.try_send(CaptureEvent::SpeechStart);
+        } else if !self.vad.released_by_clamp() {
+            let _ = self.events.try_send(CaptureEvent::SpeechEnd);
         }
     }
 
@@ -1273,12 +1317,14 @@ mod tests {
     #[tokio::test]
     async fn onset_frames_are_flushed_on_trigger() {
         let duplex = Arc::new(DuplexSignal::new());
+        let (events, _rx) = mpsc::channel(4);
         let mut worker = CaptureWorker::new(
             16_000,
             test_config(),
             duplex,
             Arc::new(AtomicU64::new(0)),
             10,
+            events,
         )
         .unwrap();
         let slot = LatestSlot::<Vec<u8>>::new();
@@ -1287,6 +1333,45 @@ mod tests {
         worker.encode_pending(&slot).await;
         assert_eq!(worker.stats.frames, 2, "防抖期首帧未被补发");
         assert_eq!(worker.stats.speech_frames, 2);
+    }
+
+    /// 本地 VAD 起止必须上报事件：起点一次（触发 `listen start`）、
+    /// 尾随静音走完一次（触发 `listen stop`）。服务端靠这两条消息判定句子边界。
+    #[tokio::test]
+    async fn vad_transitions_emit_capture_events() {
+        let (events, mut rx) = mpsc::channel(4);
+        let mut worker = CaptureWorker::new(
+            16_000,
+            test_config(),
+            Arc::new(DuplexSignal::new()),
+            Arc::new(AtomicU64::new(0)),
+            10,
+            events,
+        )
+        .unwrap();
+        let slot = LatestSlot::<Vec<u8>>::new();
+
+        // 底噪 3 帧：不触发。
+        for _ in 0..3 {
+            worker.pending.extend(make_frame(0.0002, ENCODER_FRAME_SIZE));
+        }
+        worker.encode_pending(&slot).await;
+        assert!(rx.try_recv().is_err(), "静音帧不应产生事件");
+
+        // 语音 3 帧：防抖确认后上报 SpeechStart。
+        for _ in 0..3 {
+            worker.pending.extend(make_frame(0.02, ENCODER_FRAME_SIZE));
+        }
+        worker.encode_pending(&slot).await;
+        assert_eq!(rx.try_recv().unwrap(), CaptureEvent::SpeechStart);
+
+        // 尾随静音 14 帧（> hangover 12 帧）：释放并上报 SpeechEnd。
+        for _ in 0..14 {
+            worker.pending.extend(make_frame(0.00008, ENCODER_FRAME_SIZE));
+        }
+        worker.encode_pending(&slot).await;
+        assert_eq!(rx.try_recv().unwrap(), CaptureEvent::SpeechEnd);
+        assert!(rx.try_recv().is_err(), "释放后不应重复上报");
     }
 
     /// 播放 worker 测试夹具：返回 worker、消息发送端、协同信号与输出环消费者。

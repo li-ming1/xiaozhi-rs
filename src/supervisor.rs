@@ -5,11 +5,12 @@
 use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::opus::NetworkGrade;
-use crate::audio::{AudioPipeline, PlaybackMsg};
+use crate::audio::{AudioPipeline, CaptureEvent, PlaybackMsg};
 use crate::error::{Result, VoiceError};
 use crate::identity::DeviceIdentity;
 use crate::ota::{OtaConfig, OtaMqttConfig};
@@ -353,16 +354,18 @@ impl VoiceSupervisor {
         self.ensure_audio(handles.server_audio.sample_rate, handles.audio_tx.clone())
             .await?;
 
-        handles
-            .control_tx
-            .send(ClientMessage::Listen {
-                session_id: handles.session_id.clone(),
-                state: ListenState::Start,
-                mode: Some("realtime".to_string()),
-                text: None,
-            })
-            .await
-            .map_err(|e| VoiceError::Transport(format!("发送 listen 失败: {}", e)))?;
+        // 本地 VAD 起止事件：静音帧不上行，服务端只能靠收到的静音帧计时，
+        // 因此句子结束必须由客户端显式下发 `listen stop`（否则服务端一直等）。
+        let mut capture_events = self.audio.as_mut().and_then(|a| a.take_capture_events());
+        let mut listening = true;
+
+        send_listen(
+            &handles.control_tx,
+            &handles.session_id,
+            ListenState::Start,
+            Some("realtime"),
+        )
+        .await?;
 
         info!(
             "会话开始（{}）",
@@ -378,6 +381,37 @@ impl VoiceSupervisor {
         let result = loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break Ok(()),
+                event = next_capture_event(&mut capture_events) => {
+                    match event {
+                        Some(CaptureEvent::SpeechStart) if !listening => {
+                            if let Err(e) = send_listen(
+                                &handles.control_tx,
+                                &handles.session_id,
+                                ListenState::Start,
+                                None,
+                            ).await {
+                                break Err(e);
+                            }
+                            listening = true;
+                            debug!("检测到语音起始：恢复监听");
+                        }
+                        Some(CaptureEvent::SpeechEnd) if listening => {
+                            if let Err(e) = send_listen(
+                                &handles.control_tx,
+                                &handles.session_id,
+                                ListenState::Stop,
+                                None,
+                            ).await {
+                                break Err(e);
+                            }
+                            listening = false;
+                            debug!("检测到说话结束：通知服务器开始识别");
+                        }
+                        Some(_) => {}
+                        // 事件通道关闭（音频管线重建）：本会话不再依赖本地事件。
+                        None => capture_events = None,
+                    }
+                }
                 _ = s.tick.tick() => {
                     // CPAL 流错误先于黑洞判定：设备故障不应被误计为传输失败（MQTT 熔断）。
                     if self.audio.as_ref().is_some_and(|a| a.has_device_error()) {
@@ -409,8 +443,22 @@ impl VoiceSupervisor {
                     match incoming {
                         Some(IncomingEvent::Json(msg)) => {
                             match handle_json(msg, &mut s.ctx, self.audio.as_ref()).await {
-                                Ok(Some(())) => break Ok(()),   // goodbye
-                                Ok(None) => {}
+                                Ok(JsonAction::EndSession) => break Ok(()),   // goodbye
+                                Ok(JsonAction::ResumeListening) => {
+                                    // TTS 播完：重新开始监听，同时让服务端复位上一轮的音频状态。
+                                    if !listening {
+                                        if let Err(e) = send_listen(
+                                            &handles.control_tx,
+                                            &handles.session_id,
+                                            ListenState::Start,
+                                            None,
+                                        ).await {
+                                            break Err(e);
+                                        }
+                                        listening = true;
+                                    }
+                                }
+                                Ok(JsonAction::Continue) => {}
                                 Err(e) => break Err(e),
                             }
                         }
@@ -558,6 +606,33 @@ fn derive_mqtt(m: &OtaMqttConfig, ws_url: &str, client_id: &str) -> MqttParams {
     }
 }
 
+/// 下发监听控制消息（`listen start` / `listen stop`）。
+async fn send_listen(
+    tx: &mpsc::Sender<ClientMessage>,
+    session_id: &str,
+    state: ListenState,
+    mode: Option<&str>,
+) -> Result<()> {
+    tx.send(ClientMessage::Listen {
+        session_id: session_id.to_string(),
+        state,
+        mode: mode.map(str::to_string),
+        text: None,
+    })
+    .await
+    .map_err(|e| VoiceError::Transport(format!("发送 listen 失败: {}", e)))
+}
+
+/// 等待下一个本地 VAD 事件；无接收端时永久挂起（select 分支保持静默）。
+async fn next_capture_event(
+    rx: &mut Option<mpsc::Receiver<CaptureEvent>>,
+) -> Option<CaptureEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// 会话上下文：TTS 状态与媒体跟踪（每次流式会话重建）。
 struct SessionCtx {
     tts_active: bool,
@@ -619,12 +694,22 @@ impl StreamSession {
     }
 }
 
-/// 处理服务器 JSON 消息。返回 Some(()) 表示会话应结束（goodbye）。
+/// 服务器 JSON 消息处理结果。
+enum JsonAction {
+    /// 继续当前会话。
+    Continue,
+    /// 服务器发送 goodbye，会话结束。
+    EndSession,
+    /// 整段 TTS 播完：应重新下发 `listen start` 进入下一轮。
+    ResumeListening,
+}
+
+/// 处理服务器 JSON 消息。
 async fn handle_json(
     msg: ServerMessage,
     ctx: &mut SessionCtx,
     audio: Option<&AudioPipeline>,
-) -> Result<Option<()>> {
+) -> Result<JsonAction> {
     match msg {
         ServerMessage::Tts { state, text } => match state {
             TtsState::Start => {
@@ -645,6 +730,8 @@ async fn handle_json(
                 ctx.tts_active = false;
                 ctx.sentence_has_media = false;
                 ctx.tts_started_at = None;
+                // 整段回复播完 → 客户端重新进入监听（服务端同时复位上一轮音频状态）。
+                return Ok(JsonAction::ResumeListening);
             }
             TtsState::SentenceStart => {
                 // 逐句重置：上一句的首包/断流状态不能泄漏到下一句，
@@ -674,11 +761,11 @@ async fn handle_json(
         ServerMessage::Listen { state } => debug!("监听状态: {}", state),
         ServerMessage::Goodbye { .. } => {
             info!("服务器发送 goodbye，会话结束");
-            return Ok(Some(()));
+            return Ok(JsonAction::EndSession);
         }
         ServerMessage::Unknown => {}
     }
-    Ok(None)
+    Ok(JsonAction::Continue)
 }
 
 #[cfg(test)]

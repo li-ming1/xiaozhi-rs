@@ -27,3 +27,5 @@ Thumbs.db
 mqtt-udp_zh.md
 websocket_zh.md
 AGENTS.md
+# 本地 AI 工作区（个人记忆/配置，不随仓库提交）
+.workbuddy-ai/

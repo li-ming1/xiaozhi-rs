@@ -167,6 +167,8 @@ pub(super) struct Vad {
     play_boost: f32,
     /// 播放期 hangover / 钳制窗口的缩减除数（尾音与误触发都更快释放）。
     play_div: u32,
+    /// 本次释放是否由能量钳制触发（而非正常说完）：调用方据此决定是否上报句子结束。
+    clamp_release: bool,
 }
 
 impl Vad {
@@ -189,12 +191,19 @@ impl Vad {
             min_off: db_to_lin(cfg.min_off_db),
             play_boost: db_to_lin(cfg.play_boost_db),
             play_div: 2,
+            clamp_release: false,
         }
+    }
+
+    /// 最近一次释放是否由能量钳制触发（噪声误触发纠正，非用户说完）。
+    pub(super) fn released_by_clamp(&self) -> bool {
+        self.clamp_release
     }
 
     /// 输入一帧 RMS 与播放态，返回是否应发送该帧（true=语音，false=静音跳过）。
     /// `playing` 为真表示 TTS 正在外放：此时抬阈值、缩尾随、停学底噪。
     pub(super) fn decide(&mut self, rms: f32, playing: bool) -> bool {
+        self.clamp_release = false;
         let on = (self.noise_floor * self.on_scale).max(self.min_on)
             * if playing { self.play_boost } else { 1.0 };
         let off = (self.noise_floor * self.off_scale).max(self.min_off);
@@ -214,6 +223,7 @@ impl Vad {
                     self.speech = false;
                     self.hangover = 0;
                     self.low_speech_run = 0;
+                    self.clamp_release = true;
                     // 播放期不重估：TTS 回声会污染底噪，导致停止播放后阈值虚高。
                     if !playing {
                         self.noise_floor = self.noise_floor * 0.5 + rms * 0.5;
