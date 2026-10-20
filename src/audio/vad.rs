@@ -61,6 +61,7 @@ fn db_to_lin(db: f32) -> f32 {
 /// | `XIAOZHI_VAD_ON_FRAMES` | 2 | 触发防抖帧数（×60ms） |
 /// | `XIAOZHI_VAD_HANGOVER_MS` | 720 | 语音结束后仍发送的尾随时长 |
 /// | `XIAOZHI_VAD_STRONG_DB` | -52 | 语音态内视为"强音"的门限；轻声说话老被钳制释放可调低 |
+/// | `XIAOZHI_VAD_CLAMP_MS` | 2000 | 语音态无强音多久后强制释放（防噪声卡住） |
 /// | `XIAOZHI_VAD_PLAY_BOOST_DB` | 12 | 播放期触发阈值额外抬升（0=关闭抑制） |
 /// | `XIAOZHI_VAD_PLAY_TAIL_MS` | 300 | 播放活跃判定的尾随窗口（缓冲排空余量） |
 pub(super) struct VadConfig {
@@ -71,6 +72,7 @@ pub(super) struct VadConfig {
     on_confirm_frames: u32,
     hangover_ms: u32,
     speech_min_db: f32,
+    clamp_ms: u32,
     play_boost_db: f32,
 }
 
@@ -85,6 +87,7 @@ impl VadConfig {
             on_confirm_frames: env_num("XIAOZHI_VAD_ON_FRAMES", 2u32).clamp(1, 8),
             hangover_ms: env_num("XIAOZHI_VAD_HANGOVER_MS", 720u32),
             speech_min_db: env_num("XIAOZHI_VAD_STRONG_DB", -52.0),
+            clamp_ms: env_num("XIAOZHI_VAD_CLAMP_MS", 2000u32).max(FRAME_MS),
             play_boost_db: env_num("XIAOZHI_VAD_PLAY_BOOST_DB", 12.0),
         }
     }
@@ -95,24 +98,33 @@ pub(super) struct AudioTuning {
     pub(super) vad: VadConfig,
     /// 播放活跃尾随窗口（ms）：覆盖播放缓冲排空时间。
     pub(super) play_tail_ms: u64,
+    /// Opus 编码复杂度（0-10）：越低越省 CPU，默认 10。
+    pub(super) opus_complexity: i32,
 }
 
 impl AudioTuning {
     pub(super) fn from_env() -> Self {
         let vad = VadConfig::from_env();
         let play_tail_ms = env_num("XIAOZHI_VAD_PLAY_TAIL_MS", PLAY_TAIL_MS);
+        let opus_complexity = env_num("XIAOZHI_OPUS_COMPLEXITY", 10i32).clamp(0, 10);
         debug!(
-            "音频调参: VAD 触发=噪声底{:+.0}dB(下限{:.0}dBFS), 释放={:+.0}dB, 防抖{}帧, 尾随{}ms, 强音{:+.0}dBFS, 播放期抑制{:+.0}dB/尾窗{}ms",
+            "音频调参: VAD 触发=噪声底{:+.0}dB(下限{:.0}dBFS), 释放={:+.0}dB, 防抖{}帧, 尾随{}ms, 强音{:+.0}dBFS, 钳制{}ms, 播放期抑制{:+.0}dB/尾窗{}ms, Opus复杂度{}",
             vad.on_db,
             vad.min_on_db,
             vad.off_db,
             vad.on_confirm_frames,
             vad.hangover_ms,
             vad.speech_min_db,
+            vad.clamp_ms,
             vad.play_boost_db,
-            play_tail_ms
+            play_tail_ms,
+            opus_complexity
         );
-        Self { vad, play_tail_ms }
+        Self {
+            vad,
+            play_tail_ms,
+            opus_complexity,
+        }
     }
 }
 
@@ -171,7 +183,7 @@ impl Vad {
             off_scale: db_to_lin(cfg.off_db),
             hangover_frames: (cfg.hangover_ms / FRAME_MS).max(1),
             on_confirm_frames: cfg.on_confirm_frames,
-            force_release_frames: 34,
+            force_release_frames: cfg.clamp_ms.div_ceil(FRAME_MS).max(1),
             speech_min_rms: db_to_lin(cfg.speech_min_db),
             min_on: db_to_lin(cfg.min_on_db),
             min_off: db_to_lin(cfg.min_off_db),
@@ -260,6 +272,7 @@ pub(super) fn test_config() -> VadConfig {
         on_confirm_frames: 2,
         hangover_ms: 720,
         speech_min_db: -52.0,
+        clamp_ms: 2000,
         play_boost_db: 12.0,
     }
 }

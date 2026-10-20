@@ -325,7 +325,13 @@ impl AudioPipeline {
         let tuning = AudioTuning::from_env();
         // 同步构造 worker：初始化失败直接让 start 返回 Err，由监督器走设备重建/重连，
         // 而不是任务静默退出、会话"没声音也不重连"。
-        let capture = CaptureWorker::new(input_rate, tuning.vad, duplex.clone(), input_drops)?;
+        let capture = CaptureWorker::new(
+            input_rate,
+            tuning.vad,
+            duplex.clone(),
+            input_drops,
+            tuning.opus_complexity,
+        )?;
         let playback = PlaybackWorker::new(
             playback_rx,
             PlaybackSetup {
@@ -683,6 +689,7 @@ impl CaptureWorker {
         vad_config: VadConfig,
         duplex: Arc<DuplexSignal>,
         input_drops: Arc<AtomicU64>,
+        opus_complexity: i32,
     ) -> Result<Self> {
         let nominal = 16_000.0 / device_rate as f64;
         let vad = Vad::with_config(&vad_config);
@@ -691,7 +698,7 @@ impl CaptureWorker {
             resampler: AsyncResampler::new(nominal, 160)?,
             opus: {
                 let mut o = OpusCodec::new(16_000)?;
-                o.set_complexity(10);
+                o.set_complexity(opus_complexity);
                 o
             },
             pending: Vec::with_capacity(ENCODER_FRAME_SIZE * 2),
@@ -1266,8 +1273,14 @@ mod tests {
     #[tokio::test]
     async fn onset_frames_are_flushed_on_trigger() {
         let duplex = Arc::new(DuplexSignal::new());
-        let mut worker =
-            CaptureWorker::new(16_000, test_config(), duplex, Arc::new(AtomicU64::new(0))).unwrap();
+        let mut worker = CaptureWorker::new(
+            16_000,
+            test_config(),
+            duplex,
+            Arc::new(AtomicU64::new(0)),
+            10,
+        )
+        .unwrap();
         let slot = LatestSlot::<Vec<u8>>::new();
         worker.pending.extend(make_frame(0.02, ENCODER_FRAME_SIZE));
         worker.pending.extend(make_frame(0.02, ENCODER_FRAME_SIZE));

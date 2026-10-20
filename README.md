@@ -115,6 +115,9 @@ RUST_LOG=debug xiaozhi-rs start
 | `XIAOZHI_VAD_ON_FRAMES` | `2` | 触发防抖帧数（×60ms），调大更不容易误触发 |
 | `XIAOZHI_VAD_HANGOVER_MS` | `720` | 语音结束后仍发送的尾随时长，调小更快"说完" |
 | `XIAOZHI_VAD_STRONG_DB` | `-52` | 语音态内视为"强音"的门限；说话轻、老被钳制释放可调低（如 `-58`） |
+| `XIAOZHI_VAD_CLAMP_MS` | `2000` | 语音态持续无强音多久后强制释放，防环境噪声把客户端卡在说话态 |
+
+`XIAOZHI_OPUS_COMPLEXITY`（0–10，默认 `10`）：编码复杂度；CPU 紧张时可降到 `5–7`，以略低音质换更低占用。
 
 ```powershell
 # Windows PowerShell：干扰较多时
