@@ -7,7 +7,7 @@ pub mod opus;
 pub mod resample;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -33,6 +33,20 @@ const OUTPUT_RING_SAMPLES: usize = 32 * 1024;
 const INPUT_RING_SAMPLES: usize = 12 * 1024;
 /// 捕获批次上限（一次循环尽量读空 rtrb）。
 const CAPTURE_BATCH: usize = 4096;
+/// 连续补帧上限：超过约 3 帧（180ms）仍无新包说明不是瞬态丢包，宁可静音也不无限 PLC。
+const MAX_PLC_FRAMES: u32 = 3;
+/// 下行音频积压上限（帧，约 240ms）：超过即丢弃过期音频，防止一次卡顿把延迟推到数秒。
+const MAX_AUDIO_BACKLOG: usize = 4;
+/// 用户插话时的本地 TTS 闪避增益（约 -9dB）：让用户听清自己，同时削弱扬声器回声。
+const DUCK_GAIN: f32 = 0.35;
+/// 闪避建立时间（10ms）：打断要"立刻让路"，但不能产生爆音。
+const DUCK_ATTACK_MS: f32 = 10.0;
+/// 闪避恢复时间（250ms）：用户停口后平滑回到原音量。
+const DUCK_RELEASE_MS: f32 = 250.0;
+/// 用户插话闪避保持窗口：语音帧持续刷新；停口后 400ms 恢复 TTS 音量。
+const DUCK_HOLD_MS: u64 = 400;
+/// 播放期底噪学习暂停、尾随缩短的默认配置。
+const PLAY_TAIL_MS: u64 = 300;
 
 /// 下行到播放 worker 的消息。
 pub enum PlaybackMsg {
@@ -50,7 +64,8 @@ pub struct AudioPipeline {
     workers: Vec<JoinHandle<()>>,
     playback_tx: Option<mpsc::Sender<PlaybackMsg>>,
     grade_tx: Option<mpsc::Sender<NetworkGrade>>,
-    playback_grade_tx: Option<mpsc::Sender<NetworkGrade>>,
+    /// CPAL 流错误标志：监督器检测到后结束会话并重建音频管线。
+    device_error: Option<Arc<AtomicBool>>,
 }
 
 impl AudioPipeline {
@@ -73,7 +88,7 @@ impl AudioPipeline {
             workers: Vec::new(),
             playback_tx: None,
             grade_tx: None,
-            playback_grade_tx: None,
+            device_error: None,
         })
     }
 
@@ -99,12 +114,22 @@ impl AudioPipeline {
         let output_format = output_cfg.sample_format();
 
         info!(
-            "音频管线: 输入 {}Hz/{}ch → 16kHz 编码; 下行 {}Hz → 输出 {}Hz/{}ch",
-            input_rate, input_channels, server_rate, output_rate, output_channels
+            "音频管线: 输入 {}Hz/{}ch/{:?} → 16kHz 编码; 下行 {}Hz → 输出 {}Hz/{}ch/{:?}",
+            input_rate,
+            input_channels,
+            input_format,
+            server_rate,
+            output_rate,
+            output_channels,
+            output_format
         );
 
         let (in_producer, in_consumer) = rtrb::RingBuffer::new(INPUT_RING_SAMPLES);
         let (out_producer, out_consumer) = rtrb::RingBuffer::new(OUTPUT_RING_SAMPLES);
+        // 捕获/播放协同信号先于两条流创建：输出回调与两个 DSP worker 共享同一单调时钟。
+        let duplex = Arc::new(DuplexSignal::new());
+        // CPAL 错误回调（设备拔出/USB 故障）只置位，由监督器异步发现并重建。
+        let device_error = Arc::new(AtomicBool::new(false));
 
         let input_stream = match input_format {
             SampleFormat::I16 => build_input_stream::<i16>(
@@ -113,6 +138,31 @@ impl AudioPipeline {
                 input_channels,
                 |s: i16| s as f32 / 32768.0,
                 in_producer,
+                device_error.clone(),
+            )?,
+            SampleFormat::I8 => build_input_stream::<i8>(
+                &self.input_device,
+                input_cfg.into(),
+                input_channels,
+                |s: i8| s as f32 / 128.0,
+                in_producer,
+                device_error.clone(),
+            )?,
+            SampleFormat::I32 => build_input_stream::<i32>(
+                &self.input_device,
+                input_cfg.into(),
+                input_channels,
+                |s: i32| s as f32 / 2_147_483_648.0,
+                in_producer,
+                device_error.clone(),
+            )?,
+            SampleFormat::U16 => build_input_stream::<u16>(
+                &self.input_device,
+                input_cfg.into(),
+                input_channels,
+                |s: u16| (s as f32 - 32768.0) / 32768.0,
+                in_producer,
+                device_error.clone(),
             )?,
             SampleFormat::F32 => build_input_stream::<f32>(
                 &self.input_device,
@@ -120,42 +170,43 @@ impl AudioPipeline {
                 input_channels,
                 |s: f32| s,
                 in_producer,
+                device_error.clone(),
+            )?,
+            SampleFormat::F64 => build_input_stream::<f64>(
+                &self.input_device,
+                input_cfg.into(),
+                input_channels,
+                |s: f64| s as f32,
+                in_producer,
+                device_error.clone(),
             )?,
             other => return Err(VoiceError::Audio(format!("不支持的输入格式: {:?}", other))),
         };
         let ramp_len = (output_rate as usize * 5) / 1000;
         let cb_count = Arc::new(AtomicU64::new(0));
         let cb_samples = Arc::new(AtomicU64::new(0));
-        let cb_count_out = cb_count.clone();
-        let cb_samples_out = cb_samples.clone();
+        let underruns = Arc::new(AtomicU64::new(0));
+        let target = OutputTarget {
+            device: &self.output_device,
+            config: output_cfg.into(),
+            channels: output_channels,
+            sample_rate: output_rate,
+            ramp_len,
+        };
+        let shared = OutputShared {
+            cb_count: cb_count.clone(),
+            cb_samples: cb_samples.clone(),
+            underruns: underruns.clone(),
+            duplex: duplex.clone(),
+            device_error: device_error.clone(),
+        };
         let output_stream = match output_format {
-            SampleFormat::I16 => build_output_stream::<i16>(
-                &self.output_device,
-                output_cfg.into(),
-                output_channels,
-                out_consumer,
-                ramp_len,
-                cb_count,
-                cb_samples,
-            )?,
-            SampleFormat::F32 => build_output_stream::<f32>(
-                &self.output_device,
-                output_cfg.into(),
-                output_channels,
-                out_consumer,
-                ramp_len,
-                cb_count,
-                cb_samples,
-            )?,
-            SampleFormat::U16 => build_output_stream::<u16>(
-                &self.output_device,
-                output_cfg.into(),
-                output_channels,
-                out_consumer,
-                ramp_len,
-                cb_count,
-                cb_samples,
-            )?,
+            SampleFormat::I16 => build_output_stream::<i16>(target, out_consumer, shared)?,
+            SampleFormat::I8 => build_output_stream::<i8>(target, out_consumer, shared)?,
+            SampleFormat::I32 => build_output_stream::<i32>(target, out_consumer, shared)?,
+            SampleFormat::F32 => build_output_stream::<f32>(target, out_consumer, shared)?,
+            SampleFormat::F64 => build_output_stream::<f64>(target, out_consumer, shared)?,
+            SampleFormat::U16 => build_output_stream::<u16>(target, out_consumer, shared)?,
             other => return Err(VoiceError::Audio(format!("不支持的输出格式: {:?}", other))),
         };
         input_stream
@@ -167,28 +218,36 @@ impl AudioPipeline {
 
         let (playback_tx, playback_rx) = mpsc::channel::<PlaybackMsg>(32);
         let (grade_tx, grade_rx) = mpsc::channel::<NetworkGrade>(4);
-        let (playback_grade_tx, playback_grade_rx) = mpsc::channel::<NetworkGrade>(4);
+        let tuning = AudioTuning::from_env();
+        // 同步构造 worker：初始化失败直接让 start 返回 Err，由监督器走设备重建/重连，
+        // 而不是任务静默退出、会话"没声音也不重连"。
+        let capture = CaptureWorker::new(input_rate, tuning.vad, duplex.clone())?;
+        let playback = PlaybackWorker::new(
+            playback_rx,
+            PlaybackSetup {
+                out: out_producer,
+                server_rate,
+                output_rate,
+                play_tail_ms: tuning.play_tail_ms,
+                cb_count,
+                cb_samples,
+                underruns,
+                duplex,
+            },
+        )?;
         self.workers.push(tokio::spawn(capture_worker(
             in_consumer,
             encoded_tx,
             grade_rx,
-            input_rate,
+            capture,
         )));
-        self.workers.push(tokio::spawn(playback_worker(
-            playback_rx,
-            playback_grade_rx,
-            out_producer,
-            server_rate,
-            output_rate,
-            cb_count_out,
-            cb_samples_out,
-        )));
+        self.workers.push(tokio::spawn(playback_worker(playback)));
 
         self.input_stream = Some(input_stream);
         self.output_stream = Some(output_stream);
         self.playback_tx = Some(playback_tx);
         self.grade_tx = Some(grade_tx);
-        self.playback_grade_tx = Some(playback_grade_tx);
+        self.device_error = Some(device_error);
         Ok(())
     }
 
@@ -201,7 +260,14 @@ impl AudioPipeline {
         }
         self.playback_tx = None;
         self.grade_tx = None;
-        self.playback_grade_tx = None;
+        self.device_error = None;
+    }
+
+    /// 音频流是否发生过 CPAL 错误（设备热拔/流故障）。
+    pub fn has_device_error(&self) -> bool {
+        self.device_error
+            .as_ref()
+            .is_some_and(|e| e.load(Ordering::Relaxed))
     }
 
     /// 下行发送端。忽略返回值会导致下行静默失效。
@@ -215,12 +281,6 @@ impl AudioPipeline {
     pub fn grade_sender(&self) -> Option<mpsc::Sender<NetworkGrade>> {
         self.grade_tx.clone()
     }
-
-    /// 播放侧网络分级控制端（更新解码 FEC 策略）。忽略返回值会导致分级链路失效。
-    #[must_use]
-    pub fn playback_grade_sender(&self) -> Option<mpsc::Sender<NetworkGrade>> {
-        self.playback_grade_tx.clone()
-    }
 }
 
 /// 输入回调：格式转换 + 下混单声道 + rtrb 入队。
@@ -230,6 +290,7 @@ fn build_input_stream<S>(
     channels: usize,
     to_f32: fn(S) -> f32,
     mut producer: Producer<f32>,
+    device_error: Arc<AtomicBool>,
 ) -> Result<Stream>
 where
     S: SizedSample + Copy + Send + 'static,
@@ -248,19 +309,95 @@ where
                     let _ = producer.push(mono);
                 }
             },
-            |err| warn!("输入流错误: {}", err),
+            move |err| {
+                warn!("输入流错误: {}", err);
+                device_error.store(true, Ordering::Relaxed);
+            },
             None,
         )
         .map_err(|e| VoiceError::Audio(format!("构建输入流失败: {}", e)))?;
     Ok(stream)
 }
 
-/// 输出欠载状态：点击抑制所需状态为闭包局部变量，无需锁/原子。
+/// 捕获 ↔ 播放 实时协同信号：单调时钟 + 播放活跃窗口 + 用户插话窗口 + 输出清环代号。
+///
+/// 全部为原子标量，CPAL 回调与 DSP worker 均可无锁访问；时间统一以共享
+/// `Instant` 为基准，不受系统墙钟调整影响。
+struct DuplexSignal {
+    epoch: Instant,
+    /// 播放活跃截止（ms，自 epoch）；0 = 未播放。
+    play_until_ms: AtomicU64,
+    /// 用户插话闪避截止（ms）；语音帧持续刷新。
+    duck_until_ms: AtomicU64,
+    /// 输出清环代号：播放 worker 递增，输出回调发现变化即丢弃环内残留。
+    flush_serial: AtomicU64,
+    /// 清环时的累计写入样本数：只丢弃该序号之前的样本，新 TTS 首帧不会被误删。
+    flush_target: AtomicU64,
+}
+
+impl DuplexSignal {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            play_until_ms: AtomicU64::new(0),
+            duck_until_ms: AtomicU64::new(0),
+            flush_serial: AtomicU64::new(0),
+            flush_target: AtomicU64::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// 收到下行音频：把播放活跃窗口推进到 `now + tail_ms`。
+    fn touch_play(&self, tail_ms: u64) {
+        self.play_until_ms
+            .store(self.now_ms() + tail_ms, Ordering::Relaxed);
+    }
+
+    fn stop_play(&self) {
+        self.play_until_ms.store(0, Ordering::Relaxed);
+    }
+
+    fn is_playing(&self) -> bool {
+        self.now_ms() < self.play_until_ms.load(Ordering::Relaxed)
+    }
+
+    /// 用户插话：TTS 立即让路（输出回调按 10ms 包络闪避）。
+    fn mark_barge_in(&self, hold_ms: u64) {
+        self.duck_until_ms
+            .store(self.now_ms() + hold_ms, Ordering::Relaxed);
+    }
+
+    fn is_ducked(&self) -> bool {
+        self.now_ms() < self.duck_until_ms.load(Ordering::Relaxed)
+    }
+
+    /// TTS 切换：请求输出回调丢弃 `written_total` 之前写入的残留音频。
+    fn request_flush(&self, written_total: u64) {
+        // 先写目标再推进代号：回调看到新代号时目标已可见（Release/Acquire 配对）。
+        self.flush_target.store(written_total, Ordering::Release);
+        self.flush_serial.fetch_add(1, Ordering::Release);
+    }
+
+    fn flush_serial(&self) -> u64 {
+        self.flush_serial.load(Ordering::Acquire)
+    }
+
+    fn flush_target(&self) -> u64 {
+        self.flush_target.load(Ordering::Acquire)
+    }
+}
+
+/// 输出欠载状态：播放断流时做 5ms 斜坡静音（避免爆音）；状态全在回调闭包内。
 struct Underrun {
     last_out: f32,
     ramp_left: usize,
     ramp_pending: bool,
     ramp_len: usize,
+    /// 已从环中取出的样本总数（含清环丢弃），用于精确的清环边界。
+    consumed: u64,
 }
 
 impl Underrun {
@@ -269,25 +406,115 @@ impl Underrun {
             last_out: 0.0,
             ramp_left: 0,
             ramp_pending: true,
-            ramp_len,
+            ramp_len: ramp_len.max(1),
+            consumed: 0,
         }
+    }
+
+    /// 清环后复位播放状态；`consumed` 是环的累计进度，跨清环保留。
+    fn reset(&mut self) {
+        self.last_out = 0.0;
+        self.ramp_left = 0;
+        self.ramp_pending = false;
+    }
+
+    /// 取一个单声道样本；ring 空时返回欠载斜坡值。
+    #[inline]
+    fn next(&mut self, consumer: &mut Consumer<f32>) -> f32 {
+        let Some(v) = consumer.pop().ok() else {
+            if self.ramp_pending {
+                self.ramp_pending = false;
+                if self.last_out.abs() > 1e-4 {
+                    self.ramp_left = self.ramp_len - 1;
+                }
+            }
+            if self.ramp_left > 0 {
+                self.ramp_left -= 1;
+                return self.last_out * (self.ramp_left as f32 / self.ramp_len as f32);
+            }
+            return 0.0;
+        };
+        self.last_out = v;
+        self.ramp_pending = true;
+        self.consumed += 1;
+        v
     }
 }
 
-/// 输出回调：rtrb 读单声道 → 声道展开 + 格式转换；欠载 5ms 斜坡静音。
-fn build_output_stream<T>(
-    device: &Device,
+/// 输出音量包络：用户插话时快速闪避、停口后缓慢恢复，逐样本平滑（无 zipper 噪声）。
+struct OutputGain {
+    current: f32,
+    attack: f32,
+    release: f32,
+}
+
+impl OutputGain {
+    fn new(sample_rate: u32) -> Self {
+        let coef = |ms: f32| 1.0 - (-1.0 / (ms * sample_rate as f32 / 1000.0)).exp();
+        Self {
+            current: 1.0,
+            attack: coef(DUCK_ATTACK_MS),
+            release: coef(DUCK_RELEASE_MS),
+        }
+    }
+
+    #[inline]
+    fn next(&mut self, target: f32) -> f32 {
+        let coef = if target < self.current {
+            self.attack
+        } else {
+            self.release
+        };
+        self.current += (target - self.current) * coef;
+        if (target - self.current).abs() < 1e-3 {
+            self.current = target;
+        }
+        self.current
+    }
+}
+
+/// 输出流构建参数（设备侧固定配置）。
+struct OutputTarget<'a> {
+    device: &'a Device,
     config: StreamConfig,
     channels: usize,
-    mut consumer: Consumer<f32>,
+    sample_rate: u32,
     ramp_len: usize,
+}
+
+/// 输出回调共享信号（回调闭包与 DSP worker 各持一份 Arc）。
+struct OutputShared {
     cb_count: Arc<AtomicU64>,
     cb_samples: Arc<AtomicU64>,
+    /// 输出欠载事件数（供播放诊断读取）。
+    underruns: Arc<AtomicU64>,
+    duplex: Arc<DuplexSignal>,
+    device_error: Arc<AtomicBool>,
+}
+
+/// 输出回调：rtrb 读单声道 → 插话闪避 → 声道展开 + 格式转换；欠载 5ms 斜坡静音。
+fn build_output_stream<T>(
+    target: OutputTarget<'_>,
+    mut consumer: Consumer<f32>,
+    shared: OutputShared,
 ) -> Result<Stream>
 where
     T: FromSample<f32> + SizedSample + Copy + Send + 'static,
 {
-    let mut underrun = Underrun::new(ramp_len);
+    let OutputTarget {
+        device,
+        config,
+        channels,
+        sample_rate,
+        ramp_len,
+    } = target;
+    let mut state = OutputState::new(
+        sample_rate,
+        ramp_len,
+        &shared.duplex,
+        shared.underruns.clone(),
+    );
+    let device_error = shared.device_error.clone();
     // cb_samples 由回调本地累积，批量提交原子（每累计 960 样本一次 fetch_add，
     // 约 10-20ms @96/48kHz，避免每样本原子操作）。
     let mut local_cb: u64 = 0;
@@ -295,64 +522,105 @@ where
         .build_output_stream(
             config,
             move |data: &mut [T], _: &_| {
-                let consumed = fill_output(data, channels, &mut consumer, &mut underrun, &cb_count);
+                let consumed = state.fill(
+                    data,
+                    channels,
+                    &mut consumer,
+                    &shared.duplex,
+                    &shared.cb_count,
+                );
                 local_cb += consumed as u64;
                 if local_cb >= 960 {
-                    cb_samples.fetch_add(local_cb, Ordering::Relaxed);
+                    shared.cb_samples.fetch_add(local_cb, Ordering::Relaxed);
                     local_cb = 0;
                 }
             },
-            |err| warn!("输出流错误: {}", err),
+            move |err| {
+                warn!("输出流错误: {}", err);
+                device_error.store(true, Ordering::Relaxed);
+            },
             None,
         )
         .map_err(|e| VoiceError::Audio(format!("构建输出流失败: {}", e)))?;
     Ok(stream)
 }
 
-/// 输出回调体（无锁、零分配、零日志）。
-fn fill_output<T>(
-    data: &mut [T],
-    channels: usize,
-    consumer: &mut Consumer<f32>,
-    u: &mut Underrun,
-    cb_count: &AtomicU64,
-) -> usize
-where
-    T: FromSample<f32> + Copy,
-{
-    cb_count.fetch_add(1, Ordering::Relaxed);
-    let frames = data.len() / channels;
-    let ramp_len = u.ramp_len.max(1);
-    let mut consumed = 0;
-    for i in 0..frames {
-        let sample = match consumer.pop().ok() {
-            Some(v) => {
-                consumed += 1;
-                u.last_out = v;
-                u.ramp_pending = true;
-                v
-            }
-            None => {
-                if u.ramp_pending {
-                    u.ramp_pending = false;
-                    if u.last_out.abs() > 1e-4 {
-                        u.ramp_left = ramp_len - 1;
-                    }
-                }
-                if u.ramp_left > 0 {
-                    u.ramp_left -= 1;
-                    u.last_out * (u.ramp_left as f32 / ramp_len as f32)
-                } else {
-                    0.0
-                }
-            }
-        };
-        let converted = T::from_sample_(sample);
-        for c in 0..channels {
-            data[i * channels + c] = converted;
+/// 输出回调状态（无锁、零分配、零日志）。
+struct OutputState {
+    underrun: Underrun,
+    gain: OutputGain,
+    /// 已处理的清环代号。
+    flush_seen: u64,
+    /// 欠载事件计数（回调 → 诊断）。
+    underruns: Arc<AtomicU64>,
+    /// 上一次回调是否已处于"取不满"状态，用于只计事件沿。
+    starving: bool,
+}
+
+impl OutputState {
+    fn new(
+        sample_rate: u32,
+        ramp_len: usize,
+        duplex: &DuplexSignal,
+        underruns: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            underrun: Underrun::new(ramp_len),
+            gain: OutputGain::new(sample_rate),
+            flush_seen: duplex.flush_serial(),
+            underruns,
+            starving: true,
         }
     }
-    consumed
+
+    fn fill<T>(
+        &mut self,
+        data: &mut [T],
+        channels: usize,
+        consumer: &mut Consumer<f32>,
+        duplex: &DuplexSignal,
+        cb_count: &AtomicU64,
+    ) -> usize
+    where
+        T: FromSample<f32> + Copy,
+    {
+        cb_count.fetch_add(1, Ordering::Relaxed);
+        // TTS 切换：只丢弃 flush 之前写入的样本；新 TTS 首帧即使在回调观察前
+        // 已入环也不会被误删（否则每次回复可能吞掉第一个字）。
+        let serial = duplex.flush_serial();
+        if serial != self.flush_seen {
+            self.flush_seen = serial;
+            let drop_n = duplex.flush_target().saturating_sub(self.underrun.consumed);
+            for _ in 0..drop_n {
+                if consumer.pop().is_ok() {
+                    self.underrun.consumed += 1;
+                } else {
+                    break;
+                }
+            }
+            self.underrun.reset();
+            // 清环后的静音是预期行为，不计为欠载。
+            self.starving = true;
+        }
+        let duck = if duplex.is_ducked() { DUCK_GAIN } else { 1.0 };
+        let readable = consumer.slots();
+        let frames = data.len() / channels;
+        // 取不满一整块 = 本次回调会触发欠载斜坡；只记"够→不够"的事件沿。
+        let starving = readable < frames;
+        if starving && !self.starving {
+            self.underruns.fetch_add(1, Ordering::Relaxed);
+        }
+        self.starving = starving;
+        let consumed_before = self.underrun.consumed;
+        for i in 0..frames {
+            let sample = self.underrun.next(consumer);
+            let converted = T::from_sample_(sample * self.gain.next(duck));
+            for c in 0..channels {
+                data[i * channels + c] = converted;
+            }
+        }
+        (self.underrun.consumed - consumed_before) as usize
+    }
 }
 
 /// 捕获统计（每 2s 诊断日志，确认麦克风数据真实流入）。
@@ -365,6 +633,8 @@ struct CaptureStats {
     speech_frames: u64,
     /// VAD 判定后跳过的静音帧数。
     silence_frames: u64,
+    /// 处于 TTS 播放期的帧数（用于观察播放期抑制是否生效）。
+    playing_frames: u64,
     /// 最近一次 AGC 增益。
     agc_gain: f32,
 }
@@ -378,6 +648,7 @@ impl CaptureStats {
             frames: 0,
             speech_frames: 0,
             silence_frames: 0,
+            playing_frames: 0,
             agc_gain: 1.0,
         }
     }
@@ -389,6 +660,7 @@ impl CaptureStats {
         self.frames = 0;
         self.speech_frames = 0;
         self.silence_frames = 0;
+        self.playing_frames = 0;
         self.agc_gain = 1.0;
         self.flush_at = Instant::now();
     }
@@ -401,6 +673,8 @@ struct PlaybackStats {
     decoded_ok: u64,
     decoded_fail: u64,
     plc: u64,
+    /// 因下行积压被丢弃的过期音频帧数。
+    trimmed: u64,
     written: u64,
     last_pcm_len: usize,
     last_needed: usize,
@@ -416,6 +690,7 @@ impl PlaybackStats {
             decoded_ok: 0,
             decoded_fail: 0,
             plc: 0,
+            trimmed: 0,
             written: 0,
             last_pcm_len: 0,
             last_needed: 0,
@@ -506,7 +781,7 @@ impl Agc {
 
     /// 对一帧做 AGC。`rms`/`peak` 由调用方传入（复用 VAD 已算的帧统计，避免重复遍历）。
     fn process_frame(&mut self, frame: &mut [f32], rms: f32, peak: f32) {
-        if rms < self.voice_threshold {
+        if rms < self.voice_threshold || frame.is_empty() {
             self.decay();
             return;
         }
@@ -516,11 +791,19 @@ impl Agc {
             target = target.min(0.85 / peak);
         }
         let alpha = if target > self.gain { 0.5 } else { 0.2 };
-        self.gain += (target - self.gain) * alpha;
-        let g = self.gain;
+        let next = (self.gain + (target - self.gain) * alpha).min(if peak > 0.0 {
+            0.9 / peak
+        } else {
+            self.max_gain
+        });
+        // 帧内线性过渡：逐帧突变会在帧边界留下阶跃（周期性咔哒），平滑后上行更干净。
+        let step = (next - self.gain) / frame.len() as f32;
+        let mut g = self.gain;
         for s in frame.iter_mut() {
+            g += step;
             *s = (*s * g).clamp(-0.98, 0.98);
         }
+        self.gain = next;
     }
 
     /// 静音帧：不放大，内部增益缓慢回落待命（由 VAD 静音分支调用）。
@@ -529,13 +812,125 @@ impl Agc {
     }
 }
 
+/// 一阶高通（≈80Hz）：滤除直流偏置与空调/风扇低频隆隆声，
+/// 避免 VAD 被低频能量误触，同时让上行语音更干净（每样本 2 次乘加）。
+struct HighPass {
+    alpha: f32,
+    prev_in: f32,
+    prev_out: f32,
+}
+
+impl HighPass {
+    fn new(sample_rate: u32) -> Self {
+        // alpha = RC / (RC + dt)，截止频率 80Hz。
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * 80.0);
+        let dt = 1.0 / sample_rate as f32;
+        Self {
+            alpha: rc / (rc + dt),
+            prev_in: 0.0,
+            prev_out: 0.0,
+        }
+    }
+
+    fn process(&mut self, frame: &mut [f32]) {
+        for s in frame {
+            let y = self.alpha * (self.prev_out + *s - self.prev_in);
+            self.prev_in = *s;
+            self.prev_out = y;
+            *s = y;
+        }
+    }
+}
+
+/// 环境变量取值：解析失败或未设置回落默认值。
+fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<T>().ok())
+        .unwrap_or(default)
+}
+
+/// dB → 线性幅度比。
+fn db_to_lin(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+/// VAD 可调参数（环境变量覆盖，未设置回落默认）。
+///
+/// | 变量 | 默认 | 含义 |
+/// |------|------|------|
+/// | `XIAOZHI_VAD_ON_DB` | 8 | 触发阈值高于噪声底的 dB |
+/// | `XIAOZHI_VAD_OFF_DB` | 4 | 释放阈值高于噪声底的 dB |
+/// | `XIAOZHI_VAD_MIN_ON_DB` | -68 | 触发阈值绝对下限（dBFS） |
+/// | `XIAOZHI_VAD_MIN_OFF_DB` | -74 | 释放阈值绝对下限（dBFS） |
+/// | `XIAOZHI_VAD_ON_FRAMES` | 2 | 触发防抖帧数（×60ms） |
+/// | `XIAOZHI_VAD_HANGOVER_MS` | 720 | 语音结束后仍发送的尾随时长 |
+/// | `XIAOZHI_VAD_STRONG_DB` | -52 | 语音态内视为"强音"的门限；轻声说话老被钳制释放可调低 |
+/// | `XIAOZHI_VAD_PLAY_BOOST_DB` | 12 | 播放期触发阈值额外抬升（0=关闭抑制） |
+/// | `XIAOZHI_VAD_PLAY_TAIL_MS` | 300 | 播放活跃判定的尾随窗口（缓冲排空余量） |
+struct VadConfig {
+    on_db: f32,
+    off_db: f32,
+    min_on_db: f32,
+    min_off_db: f32,
+    on_confirm_frames: u32,
+    hangover_ms: u32,
+    speech_min_db: f32,
+    play_boost_db: f32,
+}
+
+impl VadConfig {
+    fn from_env() -> Self {
+        Self {
+            on_db: env_num("XIAOZHI_VAD_ON_DB", 8.0),
+            off_db: env_num("XIAOZHI_VAD_OFF_DB", 4.0),
+            min_on_db: env_num("XIAOZHI_VAD_MIN_ON_DB", -68.0),
+            min_off_db: env_num("XIAOZHI_VAD_MIN_OFF_DB", -74.0),
+            // 上限 8 帧：防抖窗口同时决定起始前导缓存长度，避免异常配置放大内存。
+            on_confirm_frames: env_num("XIAOZHI_VAD_ON_FRAMES", 2u32).clamp(1, 8),
+            hangover_ms: env_num("XIAOZHI_VAD_HANGOVER_MS", 720u32),
+            speech_min_db: env_num("XIAOZHI_VAD_STRONG_DB", -52.0),
+            play_boost_db: env_num("XIAOZHI_VAD_PLAY_BOOST_DB", 12.0),
+        }
+    }
+}
+
+/// 音频可调参数：环境变量在会话启动时一次性读取，捕获/播放两侧共享同一份。
+struct AudioTuning {
+    vad: VadConfig,
+    /// 播放活跃尾随窗口（ms）：覆盖播放缓冲排空时间。
+    play_tail_ms: u64,
+}
+
+impl AudioTuning {
+    fn from_env() -> Self {
+        let vad = VadConfig::from_env();
+        let play_tail_ms = env_num("XIAOZHI_VAD_PLAY_TAIL_MS", PLAY_TAIL_MS);
+        debug!(
+            "音频调参: VAD 触发=噪声底{:+.0}dB(下限{:.0}dBFS), 释放={:+.0}dB, 防抖{}帧, 尾随{}ms, 强音{:+.0}dBFS, 播放期抑制{:+.0}dB/尾窗{}ms",
+            vad.on_db,
+            vad.min_on_db,
+            vad.off_db,
+            vad.on_confirm_frames,
+            vad.hangover_ms,
+            vad.speech_min_db,
+            vad.play_boost_db,
+            play_tail_ms
+        );
+        Self { vad, play_tail_ms }
+    }
+}
+
 /// 语音活动检测：静音帧不编码不上行，降低背景噪声对服务器 VAD/ASR 干扰。
 /// 防误触设计：
-/// 1. 触发防抖——连续 2 帧超阈值才进入语音（过滤点击/碰撞等 <120ms 瞬态噪声）。
+/// 1. 触发防抖——连续 2 帧超阈值才进入语音（过滤点击/碰撞等 <120ms 瞬态噪声）；
+///    防抖期候选帧由捕获管线暂存，确认后补发，不会吞掉首音节。
 /// 2. 自适应噪声底——非语音段持续学习，持续底噪会把触发阈值推高到噪声之上。
-/// 3. 能量钳制——语音态若连续 2s 无强音（≥ -52dBFS）则判为噪声误触发，立即释放并重估噪声底，
-///    避免环境声把客户端卡在"说话态"。
+/// 3. 能量钳制——语音态若连续 2s 无强音（默认 ≥ -52dBFS，可经环境变量调整）则判为噪声误触发，
+///    立即释放并重估噪声底，避免环境声把客户端卡在"说话态"。
 /// 4. 滞回 + hangover 0.72s——尾随防切词（宁多勿漏，避免吞字）。
+/// 5. 播放期抑制——TTS 播放中抬高触发阈值、缩短 hangover、暂停底噪学习，
+///    使旁人说话/扬声器回声不足以打断，只有近讲真人能插话。
 struct Vad {
     speech: bool,
     /// 连续超阈值帧数（触发防抖计数）。
@@ -555,16 +950,20 @@ struct Vad {
     on_confirm_frames: u32,
     /// 能量钳制：语音态连续超过该帧数仍无强音则释放（2s @ 60ms）。
     force_release_frames: u32,
-    /// 视为"强音"的最小 RMS（≈ -52dBFS，正常语音的音素能量必然周期性超过）。
+    /// 视为"强音"的最小 RMS（默认 ≈ -52dBFS，可经 `XIAOZHI_VAD_STRONG_DB` 调整）。
     speech_min_rms: f32,
     /// 触发阈值绝对下限（≈ -68dBFS，噪声底收敛前保证不因阈值过低误触发）。
     min_on: f32,
     /// 释放阈值绝对下限（≈ -74dBFS，语音尾音不被提前切掉）。
     min_off: f32,
+    /// 播放期触发阈值倍数（= 10^(12dB/20)）。
+    play_boost: f32,
+    /// 播放期 hangover / 钳制窗口的缩减除数（尾音与误触发都更快释放）。
+    play_div: u32,
 }
 
 impl Vad {
-    fn new() -> Self {
+    fn with_config(cfg: &VadConfig) -> Self {
         Self {
             speech: false,
             on_count: 0,
@@ -573,38 +972,51 @@ impl Vad {
             // 初始噪声底取很低值（-80dBFS），使触发阈值从一开始就是
             // 绝对下限 min_on，启动后即使立刻说话也不会被吞。
             noise_floor: 0.0001,
-            on_scale: 10f32.powf(8.0 / 20.0),
-            off_scale: 10f32.powf(4.0 / 20.0),
-            hangover_frames: 12,
-            on_confirm_frames: 2,
+            on_scale: db_to_lin(cfg.on_db),
+            off_scale: db_to_lin(cfg.off_db),
+            hangover_frames: (cfg.hangover_ms / FRAME_MS).max(1),
+            on_confirm_frames: cfg.on_confirm_frames,
             force_release_frames: 34,
-            speech_min_rms: 0.0025,
-            min_on: 0.0004,
-            min_off: 0.0002,
+            speech_min_rms: db_to_lin(cfg.speech_min_db),
+            min_on: db_to_lin(cfg.min_on_db),
+            min_off: db_to_lin(cfg.min_off_db),
+            play_boost: db_to_lin(cfg.play_boost_db),
+            play_div: 2,
         }
     }
 
-    /// 输入一帧 RMS，返回是否应发送该帧（true=语音，false=静音跳过）。
-    fn decide(&mut self, rms: f32) -> bool {
-        let on = (self.noise_floor * self.on_scale).max(self.min_on);
+    /// 输入一帧 RMS 与播放态，返回是否应发送该帧（true=语音，false=静音跳过）。
+    /// `playing` 为真表示 TTS 正在外放：此时抬阈值、缩尾随、停学底噪。
+    fn decide(&mut self, rms: f32, playing: bool) -> bool {
+        let on = (self.noise_floor * self.on_scale).max(self.min_on)
+            * if playing { self.play_boost } else { 1.0 };
         let off = (self.noise_floor * self.off_scale).max(self.min_off);
+        let div = if playing { self.play_div } else { 1 };
+        let release_at = (self.force_release_frames / div).max(1);
+        let hang_at = (self.hangover_frames / div).max(1);
         if self.speech {
             // 能量钳制：长时无强音判为噪声误触发，释放并重估底噪。
-            if rms >= self.speech_min_rms {
+            // 播放期已按抬高后的门限判入，同样门限即视为有效话音，
+            // 否则用户插话超过 1s 会被误判为回声而截断句中。
+            let active = rms >= self.speech_min_rms || (playing && rms >= on);
+            if active {
                 self.low_speech_run = 0;
             } else {
                 self.low_speech_run += 1;
-                if self.low_speech_run >= self.force_release_frames {
+                if self.low_speech_run >= release_at {
                     self.speech = false;
                     self.hangover = 0;
                     self.low_speech_run = 0;
-                    self.noise_floor = self.noise_floor * 0.5 + rms * 0.5;
+                    // 播放期不重估：TTS 回声会污染底噪，导致停止播放后阈值虚高。
+                    if !playing {
+                        self.noise_floor = self.noise_floor * 0.5 + rms * 0.5;
+                    }
                     return false;
                 }
             }
             if rms < off {
                 self.hangover += 1;
-                if self.hangover >= self.hangover_frames {
+                if self.hangover >= hang_at {
                     self.speech = false;
                     self.hangover = 0;
                     self.low_speech_run = 0;
@@ -626,11 +1038,19 @@ impl Vad {
         } else {
             self.on_count = 0;
         }
-        // 非语音段总是更新噪声底：持续高电平环境噪声会把阈值推高，
+        // 非语音段更新噪声底：持续高电平环境噪声会把阈值推高，
         // 自适应解除误触发；待确认帧用慢速，避免语音开头污染底噪。
-        let rate = if rms >= on { 0.02 } else { 0.05 };
-        self.noise_floor = self.noise_floor * (1.0 - rate) + rms * rate;
+        // 播放期跳过学习，否则 TTS 回声会把阈值抬到正常语音之上。
+        if !playing {
+            let rate = if rms >= on { 0.02 } else { 0.05 };
+            self.noise_floor = self.noise_floor * (1.0 - rate) + rms * rate;
+        }
         self.speech
+    }
+
+    /// 是否处于触发防抖的待确认阶段（候选起始帧应保留而非丢弃）。
+    fn awaiting_onset(&self) -> bool {
+        !self.speech && self.on_count > 0
     }
 }
 
@@ -639,22 +1059,16 @@ async fn capture_worker(
     mut input: Consumer<f32>,
     encoded_tx: LatestSlot<Vec<u8>>,
     mut grade_rx: mpsc::Receiver<NetworkGrade>,
-    device_rate: u32,
+    mut worker: CaptureWorker,
 ) {
-    let mut worker = match CaptureWorker::new(device_rate) {
-        Ok(w) => w,
-        Err(e) => {
-            warn!("捕获管线初始化失败: {}", e);
-            return;
-        }
-    };
     let mut tick = tokio::time::interval(Duration::from_millis(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             grade = grade_rx.recv() => {
-                if let Some(g) = grade {
-                    worker.opus.set_network_grade(g);
+                match grade {
+                    Some(g) => worker.opus.set_network_grade(g),
+                    None => break,
                 }
             }
             _ = tick.tick() => {
@@ -677,11 +1091,20 @@ struct CaptureWorker {
     stats: CaptureStats,
     agc: Agc,
     vad: Vad,
+    high_pass: HighPass,
+    /// 触发防抖期间的候选起始帧（原始 PCM）：确认后补发，避免吞掉首音节。
+    start_roll: Vec<f32>,
+    /// 播放活跃/插话闪避信号（播放 worker 写，捕获 worker 读）。
+    duplex: Arc<DuplexSignal>,
+    /// 本轮 TTS 是否已记录过插话（观测用，一轮只打一条）。
+    barge_logged: bool,
 }
 
 impl CaptureWorker {
-    fn new(device_rate: u32) -> Result<Self> {
+    fn new(device_rate: u32, vad_config: VadConfig, duplex: Arc<DuplexSignal>) -> Result<Self> {
         let nominal = 16_000.0 / device_rate as f64;
+        let vad = Vad::with_config(&vad_config);
+        let onset_capacity = vad.on_confirm_frames.saturating_sub(1) as usize * ENCODER_FRAME_SIZE;
         Ok(Self {
             resampler: AsyncResampler::new(nominal, 160)?,
             opus: {
@@ -697,7 +1120,11 @@ impl CaptureWorker {
             window_start: Instant::now(),
             stats: CaptureStats::new(),
             agc: Agc::new(),
-            vad: Vad::new(),
+            vad,
+            high_pass: HighPass::new(ENCODER_RATE),
+            start_roll: Vec::with_capacity(onset_capacity),
+            duplex,
+            barge_logged: false,
         })
     }
 
@@ -759,8 +1186,31 @@ impl CaptureWorker {
     /// AGC/编码直接作用于 pending 前缀，省去独立帧缓冲与逐帧复制。
     async fn encode_pending(&mut self, encoded_tx: &LatestSlot<Vec<u8>>) {
         while self.pending.len() >= ENCODER_FRAME_SIZE {
+            self.high_pass
+                .process(&mut self.pending[..ENCODER_FRAME_SIZE]);
             let s = frame_stats(&self.pending[..ENCODER_FRAME_SIZE]);
-            if self.vad.decide(s.rms) {
+            // 播放期：VAD 抬阈值 + 缩尾随，抑制旁人说话与扬声器回声造成的误打断。
+            let playing = self.duplex.is_playing();
+            if playing {
+                self.stats.playing_frames += 1;
+            }
+            let was_speech = self.vad.speech;
+            let send = self.vad.decide(s.rms, playing);
+            if playing && (send || self.vad.awaiting_onset()) {
+                // 候选帧即预闪避：不等防抖确认，先让路 60ms，也顺带压低扬声器回声；
+                // 语音帧持续刷新窗口，用户不停口 TTS 就一直让路。
+                self.duplex.mark_barge_in(DUCK_HOLD_MS);
+                if send && !self.barge_logged {
+                    self.barge_logged = true;
+                    debug!("用户插话：TTS 本地闪避");
+                }
+            } else if !playing {
+                self.barge_logged = false;
+            }
+            if send {
+                if !was_speech {
+                    self.flush_onset(encoded_tx).await;
+                }
                 self.stats.speech_frames += 1;
                 self.agc
                     .process_frame(&mut self.pending[..ENCODER_FRAME_SIZE], s.rms, s.peak);
@@ -773,12 +1223,48 @@ impl CaptureWorker {
                     Err(e) => warn!("Opus 编码失败: {}", e),
                 }
             } else {
-                self.stats.silence_frames += 1;
+                if self.vad.awaiting_onset() {
+                    self.stage_onset();
+                } else {
+                    self.stats.silence_frames +=
+                        (self.start_roll.len() / ENCODER_FRAME_SIZE + 1) as u64;
+                    self.start_roll.clear();
+                }
                 // 静音帧：增益回落待命（不放大）。
                 self.agc.decay();
             }
             self.pending.drain(..ENCODER_FRAME_SIZE);
         }
+    }
+
+    /// 暂存触发防抖期的候选起始帧；确认成立后由 [`Self::flush_onset`] 补发。
+    fn stage_onset(&mut self) {
+        // 容量恰为 on_confirm_frames-1 帧，正常路径不会溢出。
+        self.start_roll
+            .extend_from_slice(&self.pending[..ENCODER_FRAME_SIZE]);
+    }
+
+    /// 补发确认前已到达的起始帧：防抖不应以吞掉用户首音节为代价。
+    async fn flush_onset(&mut self, encoded_tx: &LatestSlot<Vec<u8>>) {
+        if self.start_roll.is_empty() {
+            return;
+        }
+        let mut roll = std::mem::take(&mut self.start_roll);
+        for frame in roll.as_chunks_mut::<ENCODER_FRAME_SIZE>().0 {
+            let s = frame_stats(frame);
+            self.agc.process_frame(frame, s.rms, s.peak);
+            self.stats.speech_frames += 1;
+            match self.opus.encode(frame) {
+                Ok(pkt) => {
+                    self.stats.frames += 1;
+                    encoded_tx.store(pkt).await;
+                }
+                Err(e) => warn!("Opus 编码失败: {}", e),
+            }
+        }
+        self.stats.agc_gain = self.agc.gain;
+        roll.clear();
+        self.start_roll = roll;
     }
 
     /// 每 2s 输出一次捕获诊断并清零统计。
@@ -801,12 +1287,13 @@ impl CaptureWorker {
                 .log10()
                 * 20.0;
             debug!(
-                "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 编码帧={} (语音{} 静音{}), AGC增益={:.1}x, 噪声底={:.1}dBFS, 触发阈值={:.1}dBFS",
+                "捕获诊断: RMS={:.1}dBFS, 输入样本={}, 编码帧={} (语音{} 静音{} 播放期{}), AGC增益={:.1}x, 噪声底={:.1}dBFS, 触发阈值={:.1}dBFS",
                 db,
                 self.stats.samples,
                 self.stats.frames,
                 self.stats.speech_frames,
                 self.stats.silence_frames,
+                self.stats.playing_frames,
                 self.stats.agc_gain,
                 nf_db,
                 on_db
@@ -816,48 +1303,40 @@ impl CaptureWorker {
     }
 }
 
-/// 播放 DSP worker：Opus → 解码（服务器率）→ 设备率 → rtrb。
-async fn playback_worker(
-    rx: mpsc::Receiver<PlaybackMsg>,
-    grade_rx: mpsc::Receiver<NetworkGrade>,
+/// 播放 worker 装配参数（设备/编解码时钟与协同信号）。
+struct PlaybackSetup {
     out: Producer<f32>,
     server_rate: u32,
     output_rate: u32,
+    play_tail_ms: u64,
     cb_count: Arc<AtomicU64>,
     cb_samples: Arc<AtomicU64>,
-) {
-    match PlaybackWorker::new(
-        rx,
-        grade_rx,
-        out,
-        server_rate,
-        output_rate,
-        cb_count,
-        cb_samples,
-    ) {
-        Ok(worker) => worker.run().await,
-        Err(e) => warn!("播放管线初始化失败: {}", e),
-    }
+    underruns: Arc<AtomicU64>,
+    duplex: Arc<DuplexSignal>,
+}
+
+/// 播放 DSP worker：Opus → 解码（服务器率）→ 设备率 → rtrb。
+async fn playback_worker(worker: PlaybackWorker) {
+    worker.run().await;
 }
 
 /// 播放管线状态：DSP 组件 + 播放缓冲 + 诊断统计（与 `CaptureWorker` 对称）。
 struct PlaybackWorker {
     rx: mpsc::Receiver<PlaybackMsg>,
-    grade_rx: mpsc::Receiver<NetworkGrade>,
     out: Producer<f32>,
     /// 服务器声明采样率（解码帧长基准）。
     server_rate: u32,
     output_rate: u32,
     cb_count: Arc<AtomicU64>,
     cb_samples: Arc<AtomicU64>,
+    /// 输出回调累计的欠载事件（每 2s 诊断后清零）。
+    underruns: Arc<AtomicU64>,
     resampler: AsyncResampler,
     decoder: OpusCodec,
     buf: PlaybackBuffer,
     drift: DriftController,
     last_drift: Instant,
     stats: PlaybackStats,
-    /// 当前网络分级（弱网时丢包窗口启用带内 FEC/PLC 恢复）。
-    grade: NetworkGrade,
     /// 距上一帧到达的时间：丢包判定基准（超时由帧定时器补恢复帧）。
     last_frame_at: Instant,
     /// 帧长诊断已告警（一次性，避免刷屏）。
@@ -866,38 +1345,51 @@ struct PlaybackWorker {
     pcm: Vec<f32>,
     /// 重采样输出缓冲常驻复用，避免每帧解码后堆分配。
     out_samples: Vec<f32>,
+    /// 捕获/播放协同：播放活跃窗口、插话闪避与输出清环。
+    duplex: Arc<DuplexSignal>,
+    /// 播放活跃尾随窗口（ms）：覆盖播放缓冲排空时间。
+    play_tail_ms: u64,
+    /// 连续 PLC 补帧计数：无新包时封顶，避免空闲期无限补帧。
+    plc_run: u32,
+    /// 累计写入输出环的样本数：清环边界以此为准。
+    total_written: u64,
 }
 
 impl PlaybackWorker {
-    fn new(
-        rx: mpsc::Receiver<PlaybackMsg>,
-        grade_rx: mpsc::Receiver<NetworkGrade>,
-        out: Producer<f32>,
-        server_rate: u32,
-        output_rate: u32,
-        cb_count: Arc<AtomicU64>,
-        cb_samples: Arc<AtomicU64>,
-    ) -> Result<Self> {
+    fn new(rx: mpsc::Receiver<PlaybackMsg>, setup: PlaybackSetup) -> Result<Self> {
+        let PlaybackSetup {
+            out,
+            server_rate,
+            output_rate,
+            play_tail_ms,
+            cb_count,
+            cb_samples,
+            underruns,
+            duplex,
+        } = setup;
         let nominal = output_rate as f64 / server_rate as f64;
         Ok(Self {
             rx,
-            grade_rx,
             out,
             server_rate,
             output_rate,
             cb_count,
             cb_samples,
+            underruns,
             resampler: AsyncResampler::new(nominal, 960)?,
             decoder: OpusCodec::new(server_rate)?,
             buf: PlaybackBuffer::new(60),
             drift: DriftController::new(nominal),
             last_drift: Instant::now(),
             stats: PlaybackStats::new(),
-            grade: NetworkGrade::Good,
             last_frame_at: Instant::now(),
             frame_len_warned: false,
             pcm: Vec::with_capacity(server_rate as usize * 60 / 1000),
             out_samples: Vec::with_capacity(960 * 3),
+            duplex,
+            play_tail_ms,
+            plc_run: 0,
+            total_written: 0,
         })
     }
 
@@ -906,19 +1398,18 @@ impl PlaybackWorker {
         let mut tick = tokio::time::interval(Duration::from_millis(FRAME_MS as u64));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            self.trim_backlog();
             tokio::select! {
-                g = self.grade_rx.recv() => {
-                    if let Some(g) = g {
-                        self.grade = g;
-                    }
-                }
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else { break };
-                    self.handle_msg(msg).await;
+                    self.handle_msg(msg);
                 }
                 _ = tick.tick() => {
-                    // 超过两帧时长无新帧 → 判定丢包，补一帧 FEC/PLC 恢复。
-                    if self.last_frame_at.elapsed() >= Duration::from_millis(FRAME_MS as u64 * 2) {
+                    // 仅在上一次真实帧的播放窗口内补帧：句间/会话空闲不生成 PLC，
+                    // 否则新 TTS 的首帧前会先插入最多 180ms 的静音假帧。
+                    if self.duplex.is_playing()
+                        && self.last_frame_at.elapsed() >= Duration::from_millis(FRAME_MS as u64 * 2)
+                    {
                         self.play_plc();
                     }
                 }
@@ -928,25 +1419,72 @@ impl PlaybackWorker {
     }
 
     /// 处理一条下行消息（Audio/Flush）。
-    async fn handle_msg(&mut self, msg: PlaybackMsg) {
+    fn handle_msg(&mut self, msg: PlaybackMsg) {
         match msg {
-            PlaybackMsg::Audio(opus) => {
-                self.stats.received += 1;
-                self.buf.observe_arrival(Instant::now());
-                // 正常包恒 fec=false：decode_fec=1 会把带 FEC 的包解码为"上一帧恢复"而非当前帧，
-                // 导致所有帧错位；FEC/PLC 恢复仅在丢包（无帧到达）时由帧定时器触发。
-                self.last_frame_at = Instant::now();
-                match self.decoder.decode_into(&opus, false, &mut self.pcm) {
-                    Ok(()) => self.write_pcm(false),
-                    Err(e) => {
-                        self.stats.decoded_fail += 1;
-                        debug!("Opus 解码失败(len={}): {}", opus.len(), e);
-                        self.play_plc();
+            PlaybackMsg::Audio(opus) => self.handle_audio(opus),
+            PlaybackMsg::Flush => self.handle_flush(),
+        }
+    }
+
+    /// 下行积压超过上限时丢弃过期音频：保留最后一次 Flush 之后的最后一条，
+    /// 其余直接跳过（解码器按丢包处理），避免对话延迟随卡顿时长线性增长。
+    fn trim_backlog(&mut self) {
+        let mut flush = false;
+        let mut latest: Option<Vec<u8>> = None;
+        let mut dropped = 0u64;
+        while self.rx.len() > MAX_AUDIO_BACKLOG {
+            match self.rx.try_recv() {
+                Ok(PlaybackMsg::Audio(a)) => {
+                    if latest.replace(a).is_some() {
+                        dropped += 1;
                     }
                 }
+                Ok(PlaybackMsg::Flush) => {
+                    if latest.take().is_some() {
+                        dropped += 1;
+                    }
+                    flush = true;
+                }
+                Err(_) => break,
             }
-            PlaybackMsg::Flush => self.buf.reset(),
         }
+        if dropped > 0 {
+            self.stats.trimmed += dropped;
+            debug!("下行积压，丢弃 {} 帧过期音频", dropped);
+        }
+        if flush {
+            self.handle_flush();
+        }
+        if let Some(opus) = latest {
+            self.handle_audio(opus);
+        }
+    }
+
+    fn handle_audio(&mut self, opus: Vec<u8>) {
+        self.stats.received += 1;
+        self.plc_run = 0;
+        self.buf.observe_arrival(Instant::now());
+        self.duplex.touch_play(self.play_tail_ms);
+        // 正常包恒 fec=false：decode_fec=1 会把带 FEC 的包解码为"上一帧恢复"而非当前帧，
+        // 导致所有帧错位；FEC/PLC 恢复仅在丢包（无帧到达）时由帧定时器触发。
+        self.last_frame_at = Instant::now();
+        match self.decoder.decode_into(&opus, false, &mut self.pcm) {
+            Ok(()) => self.write_pcm(false),
+            Err(e) => {
+                self.stats.decoded_fail += 1;
+                debug!("Opus 解码失败(len={}): {}", opus.len(), e);
+                self.play_plc();
+            }
+        }
+    }
+
+    /// TTS 切换：清空本地播放（含输出环中 flush 之前的残留），捕获侧立即恢复常规灵敏度。
+    fn handle_flush(&mut self) {
+        self.buf.reset();
+        self.duplex.stop_play();
+        self.duplex.request_flush(self.total_written);
+        self.last_frame_at = Instant::now();
+        self.plc_run = 0;
     }
 
     /// 将解码 PCM（`self.pcm`，由 decode_into 填充）重采样后写入输出 ring。
@@ -974,21 +1512,32 @@ impl PlaybackWorker {
         if self.out_samples.is_empty() {
             self.stats.zero_produced += 1;
         }
-        let before = self.out.slots();
-        write_samples(
+        let written = write_samples(
             &mut self.out,
             &self.out_samples,
             self.output_rate,
             OUTPUT_RING_SAMPLES,
         );
-        self.stats.written += before.saturating_sub(self.out.slots()) as u64;
+        self.total_written += written as u64;
+        self.stats.written += written as u64;
     }
 
     /// 丢包恢复：请求带内 FEC/PLC 解码一帧（60ms），保持音频流连续。
     fn play_plc(&mut self) {
+        // 真实丢包会在 1-2 帧内恢复；再久就是句间静默，继续补帧会制造无限拖尾，
+        // 并让播放活跃窗口永不到期（TTS 结束后 VAD 仍被强化抑制）。
+        if self.plc_run >= MAX_PLC_FRAMES {
+            return;
+        }
+        self.plc_run += 1;
+        if self.plc_run == MAX_PLC_FRAMES {
+            debug!("连续 {} 帧无下行，停止 PLC 补帧", MAX_PLC_FRAMES);
+        }
         match self.decoder.decode_into(&[], true, &mut self.pcm) {
             Ok(()) => {
                 self.stats.plc += 1;
+                // 恢复帧仍在发声，播放窗口须续期，否则丢包期间抑制会失效。
+                self.duplex.touch_play(self.play_tail_ms);
                 self.write_pcm(true);
             }
             Err(e) => warn!("PLC 失败: {}", e),
@@ -1000,19 +1549,28 @@ impl PlaybackWorker {
         if self.stats.flush_at.elapsed() >= Duration::from_secs(2) {
             let cb = self.cb_count.swap(0, Ordering::Relaxed);
             let cbs = self.cb_samples.swap(0, Ordering::Relaxed);
+            let underruns = self.underruns.swap(0, Ordering::Relaxed);
+            let occupancy_ms = (OUTPUT_RING_SAMPLES.saturating_sub(self.out.slots()) as f64
+                / self.output_rate as f64)
+                * 1000.0;
             debug!(
-                "播放诊断: 收帧={}, 解码成功={}, 失败={}, PLC={}, 写入={}, pcm={}, needed={}, 产出={}, 零产出={} | 回调={}次, 消费样本={}",
+                "播放诊断: 收帧={}, 解码成功={}, 失败={}, PLC={}, 丢弃={}, 写入={}, pcm={}, needed={}, 产出={}, 零产出={} | 回调={}次, 消费样本={}, 欠载={}次, 占用={:.0}ms/目标={}ms, 漂移={:+.0}ppm",
                 self.stats.received,
                 self.stats.decoded_ok,
                 self.stats.decoded_fail,
                 self.stats.plc,
+                self.stats.trimmed,
                 self.stats.written,
                 self.stats.last_pcm_len,
                 self.stats.last_needed,
                 self.stats.last_produced,
                 self.stats.zero_produced,
                 cb,
-                cbs
+                cbs,
+                underruns,
+                occupancy_ms,
+                self.buf.target_ms(),
+                self.drift.current_ppm()
             );
             self.stats = PlaybackStats::new();
         }
@@ -1025,22 +1583,35 @@ impl PlaybackWorker {
             let occupancy_ms = ((cap - free) / self.output_rate as f64) * 1000.0;
             let target_ms = self.buf.target_ms() as f64;
             if target_ms > 0.0 {
-                let err_ppm = ((occupancy_ms - target_ms) / target_ms) * 1e6 * 0.5;
-                self.drift
-                    .move_toward(err_ppm.clamp(-MAX_DRIFT_PPM, MAX_DRIFT_PPM));
+                // 占用高于目标 → 降低产出比率（负反馈），低于目标 → 提高。
+                let err_ppm = occupancy_ppm(occupancy_ms, target_ms);
+                self.drift.move_toward(err_ppm);
             }
             self.last_drift = Instant::now();
         }
     }
 }
 
-/// 写入播放环形缓冲；空间不足时丢弃多余（新）样本以封顶延迟。
-fn write_samples(out: &mut Producer<f32>, samples: &[f32], output_rate: u32, capacity: usize) {
+/// 播放缓冲占用误差 → 重采样比率修正（ppm）：占用高则降速、低则提速（负反馈）。
+fn occupancy_ppm(occupancy_ms: f64, target_ms: f64) -> f64 {
+    if target_ms <= 0.0 {
+        return 0.0;
+    }
+    ((target_ms - occupancy_ms) / target_ms * 1e6 * 0.5).clamp(-MAX_DRIFT_PPM, MAX_DRIFT_PPM)
+}
+
+/// 写入播放环形缓冲，返回实际写入样本数；空间不足时丢弃多余（新）样本以封顶延迟。
+fn write_samples(
+    out: &mut Producer<f32>,
+    samples: &[f32],
+    output_rate: u32,
+    capacity: usize,
+) -> usize {
     let free = out.slots();
     let occupancy_ms = ((capacity - free) as f64 / output_rate as f64) * 1000.0;
     // 占用超 280ms 时整体丢弃本轮，让缓冲自然回落。
     if occupancy_ms > 280.0 {
-        return;
+        return 0;
     }
     let n = samples.len().min(free);
     let mut written = 0;
@@ -1060,6 +1631,7 @@ fn write_samples(out: &mut Producer<f32>, samples: &[f32], output_rate: u32, cap
             Err(_) => break,
         }
     }
+    written
 }
 
 #[cfg(test)]
@@ -1100,64 +1672,383 @@ mod tests {
         assert!(s.rms < 0.0001, "静音帧被放大: RMS={}", s.rms);
     }
 
+    /// 测试用固定配置（不受环境变量影响，保证断言确定性）。
+    fn test_config() -> VadConfig {
+        VadConfig {
+            on_db: 8.0,
+            off_db: 4.0,
+            min_on_db: -68.0,
+            min_off_db: -74.0,
+            on_confirm_frames: 2,
+            hangover_ms: 720,
+            speech_min_db: -52.0,
+            play_boost_db: 12.0,
+        }
+    }
+
+    fn test_vad() -> Vad {
+        Vad::with_config(&test_config())
+    }
+
+    /// 先建立底噪，再连续喂两帧同电平，返回是否被判定为语音。
+    fn triggers(rms: f32, playing: bool) -> bool {
+        let mut vad = test_vad();
+        for _ in 0..20 {
+            vad.decide(0.0002, playing); // -74dBFS 环境底噪
+        }
+        let first = vad.decide(rms, playing);
+        let second = vad.decide(rms, playing);
+        first || second
+    }
+
     #[test]
     fn vad_triggers_on_speech_and_releases_after_silence() {
-        let mut vad = Vad::new();
+        let mut vad = test_vad();
         // 静音（-80dBFS）不触发。
-        assert!(!vad.decide(0.0001));
+        assert!(!vad.decide(0.0001, false));
         // 语音（-45dBFS）连续 2 帧触发（防抖）。
-        assert!(!vad.decide(0.0056), "防抖第一帧不应立即触发");
-        assert!(vad.decide(0.0056), "防抖第二帧应触发");
+        assert!(!vad.decide(0.0056, false), "防抖第一帧不应立即触发");
+        assert!(vad.decide(0.0056, false), "防抖第二帧应触发");
         // 词间停顿（-50dBFS，仍高于释放阈值）不释放。
-        assert!(vad.decide(0.003));
+        assert!(vad.decide(0.003, false));
         // 尾随：刚进入静音时仍发送（hangover 防切词）。
-        assert!(vad.decide(0.00008));
+        assert!(vad.decide(0.00008, false));
         // 持续静音最终释放。
         let mut released = false;
         for _ in 0..40 {
-            if !vad.decide(0.00008) {
+            if !vad.decide(0.00008, false) {
                 released = true;
                 break;
             }
         }
         assert!(released, "持续静音未释放");
         // 释放后新语音再次触发（仍需防抖 2 帧）。
-        assert!(!vad.decide(0.0056));
-        assert!(vad.decide(0.0056));
+        assert!(!vad.decide(0.0056, false));
+        assert!(vad.decide(0.0056, false));
     }
 
     #[test]
     fn vad_does_not_swallow_soft_speech_at_startup() {
         // 启动即说话（-55dBFS），阈值应从 min_on 起步，不应吞帧。
-        let mut vad = Vad::new();
-        assert!(!vad.decide(0.0018), "防抖第一帧等待确认");
-        assert!(vad.decide(0.0018), "启动即说话被 VAD 吞掉");
+        let mut vad = test_vad();
+        assert!(!vad.decide(0.0018, false), "防抖第一帧等待确认");
+        assert!(vad.decide(0.0018, false), "启动即说话被 VAD 吞掉");
     }
 
     #[test]
     fn vad_ignores_single_frame_transients() {
         // 单帧高电平（键盘敲击/鼠标点击类瞬态）不应触发语音。
-        let mut vad = Vad::new();
+        let mut vad = test_vad();
         for _ in 0..20 {
-            assert!(!vad.decide(0.0003)); // -70dBFS 环境静音，建立底噪
+            assert!(!vad.decide(0.0003, false)); // -70dBFS 环境静音，建立底噪
         }
-        assert!(!vad.decide(0.01), "单帧瞬态噪声误触发");
-        assert!(!vad.decide(0.0003), "瞬态后未回到静音");
+        assert!(!vad.decide(0.01, false), "单帧瞬态噪声误触发");
+        assert!(!vad.decide(0.0003, false), "瞬态后未回到静音");
     }
 
     #[test]
     fn vad_releases_when_stuck_on_low_level_noise() {
         // 持续 -60dBFS 环境噪声：可能短暂触发，但无强音应在钳制窗口内自动释放，
         // 且释放后噪声底抬高，底噪不再误触发。
-        let mut vad = Vad::new();
+        let mut vad = test_vad();
         let mut any_speech = false;
         for _ in 0..(vad.force_release_frames + 10) {
-            any_speech |= vad.decide(0.001);
+            any_speech |= vad.decide(0.001, false);
         }
         assert!(any_speech, "低电平噪声应短暂触发过（用于验证钳制）");
         for _ in 0..10 {
-            assert!(!vad.decide(0.001), "钳制释放后底噪仍误触发");
+            assert!(!vad.decide(0.001, false), "钳制释放后底噪仍误触发");
         }
+    }
+
+    /// 播放期抑制：旁人说话（-60dBFS）不再打断，近讲强音（-44dBFS）仍可打断。
+    #[test]
+    fn vad_playback_boosts_threshold() {
+        assert!(triggers(0.001, false), "非播放期中电平应触发");
+        assert!(
+            !triggers(0.001, true),
+            "播放期 -60dBFS（旁人/回声）不应触发"
+        );
+        assert!(triggers(0.006, true), "播放期近讲强音应仍能打断");
+    }
+
+    /// 播放期尾随减半：静音后更快释放，避免 TTS 尾音被当成用户语音上传。
+    #[test]
+    fn vad_playback_shortens_hangover() {
+        let hang = |playing: bool| {
+            let mut vad = test_vad();
+            assert!(!vad.decide(0.02, false), "防抖第一帧");
+            assert!(vad.decide(0.02, false), "应进入语音态");
+            let mut held = 0;
+            while vad.decide(0.00008, playing) {
+                held += 1;
+                assert!(held < 40, "静音后未释放");
+            }
+            held
+        };
+        // hangover_frames=12（720ms/60ms）：非播放期额外保持 11 帧，播放期 5 帧。
+        assert_eq!(hang(false), 11);
+        assert_eq!(hang(true), 5);
+    }
+
+    /// 播放期暂停底噪学习：TTS 回声不得抬高噪声底（否则停止播放后灵敏度长期偏低）。
+    #[test]
+    fn vad_playback_freezes_noise_floor() {
+        let mut vad = test_vad();
+        let before = vad.noise_floor;
+        for _ in 0..30 {
+            vad.decide(0.001, true); // 播放期持续中电平
+        }
+        assert_eq!(vad.noise_floor, before, "播放期不应更新噪声底");
+        // 对照：非播放期同样电平会正常抬升底噪。
+        let mut vad = test_vad();
+        for _ in 0..30 {
+            vad.decide(0.001, false);
+        }
+        assert!(vad.noise_floor > before, "非播放期应继续学习底噪");
+    }
+
+    /// 播放期持续插话（-54dBFS，高于抬高后的门限但低于固定强音线）不被钳制误释放。
+    #[test]
+    fn vad_playback_holds_sustained_barge_in() {
+        let mut vad = test_vad();
+        assert!(!vad.decide(0.002, true), "防抖第一帧");
+        assert!(vad.decide(0.002, true), "播放期近讲应触发");
+        for i in 0..(vad.force_release_frames + 5) {
+            assert!(vad.decide(0.002, true), "第 {} 帧插话被误释放", i);
+        }
+    }
+
+    /// 高通：直流快速归零，语音频段基本无损。
+    #[test]
+    fn high_pass_removes_dc_and_keeps_voice_band() {
+        let mut hp = HighPass::new(ENCODER_RATE);
+        let mut dc = vec![0.5f32; ENCODER_FRAME_SIZE * 3];
+        hp.process(&mut dc);
+        let tail = &dc[ENCODER_FRAME_SIZE..];
+        assert!(
+            tail.iter().all(|s| s.abs() < 0.01),
+            "直流未滤除: {}",
+            tail[0]
+        );
+
+        let mut hp = HighPass::new(ENCODER_RATE);
+        let mut sine: Vec<f32> = (0..ENCODER_FRAME_SIZE * 3)
+            .map(|i| {
+                let t = i as f32 / ENCODER_RATE as f32;
+                (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 0.5
+            })
+            .collect();
+        hp.process(&mut sine);
+        let tail = &sine[ENCODER_FRAME_SIZE..];
+        let rms = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt();
+        assert!(rms > 0.3, "1kHz 语音频段被衰减: RMS={}", rms);
+    }
+
+    /// 协同信号的播放/插话窗口按单调时钟到期；清环代号单调递增。
+    #[test]
+    fn duplex_windows_expire_and_flush_advances() {
+        let d = DuplexSignal::new();
+        assert!(!d.is_playing() && !d.is_ducked());
+        d.touch_play(0); // now + 0 已到期
+        assert!(!d.is_playing());
+        d.touch_play(10_000);
+        d.mark_barge_in(10_000);
+        assert!(d.is_playing() && d.is_ducked());
+        d.stop_play();
+        assert!(!d.is_playing());
+        let serial = d.flush_serial();
+        d.request_flush(123);
+        assert_eq!(d.flush_serial(), serial + 1);
+        assert_eq!(d.flush_target(), 123);
+    }
+
+    /// 插话闪避包络：快速压低、缓慢恢复。
+    #[test]
+    fn output_gain_ducks_and_recovers() {
+        let mut g = OutputGain::new(48_000);
+        let mut min = 1.0f32;
+        for _ in 0..4_800 {
+            min = min.min(g.next(DUCK_GAIN));
+        }
+        assert!((min - DUCK_GAIN).abs() < 0.01, "闪避未到位: {}", min);
+        let mut max = min;
+        for _ in 0..120_000 {
+            max = max.max(g.next(1.0));
+        }
+        assert!((max - 1.0).abs() < 0.01, "未恢复: {}", max);
+    }
+
+    /// 防抖确认后补发起始帧：两帧语音都应编码，首帧不被吞。
+    #[tokio::test]
+    async fn onset_frames_are_flushed_on_trigger() {
+        let duplex = Arc::new(DuplexSignal::new());
+        let mut worker = CaptureWorker::new(16_000, test_config(), duplex).unwrap();
+        let slot = LatestSlot::<Vec<u8>>::new();
+        worker.pending.extend(make_frame(0.02, ENCODER_FRAME_SIZE));
+        worker.pending.extend(make_frame(0.02, ENCODER_FRAME_SIZE));
+        worker.encode_pending(&slot).await;
+        assert_eq!(worker.stats.frames, 2, "防抖期首帧未被补发");
+        assert_eq!(worker.stats.speech_frames, 2);
+    }
+
+    /// 输出环清空：TTS 切换代号推进后，回调丢弃全部旧样本。
+    #[test]
+    fn output_flush_drains_stale_samples() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(8192);
+        for _ in 0..4096 {
+            producer.push(0.5).unwrap();
+        }
+        let duplex = DuplexSignal::new();
+        let cb = AtomicU64::new(0);
+        let mut state = OutputState::new(48_000, 240, &duplex, Arc::new(AtomicU64::new(0)));
+        let mut data = [0f32; 480];
+        duplex.request_flush(4096);
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert_eq!(consumer.slots(), 0, "清环后仍有残留样本");
+        assert!(data.iter().all(|s| *s == 0.0), "清环回调应输出静音");
+    }
+
+    /// 清环只删 flush 之前的样本：flush 后写入的新 TTS 首帧必须保留。
+    #[test]
+    fn flush_keeps_samples_written_after_it() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(8192);
+        for _ in 0..960 {
+            producer.push(0.5).unwrap();
+        }
+        let duplex = DuplexSignal::new();
+        let cb = AtomicU64::new(0);
+        let mut state = OutputState::new(48_000, 240, &duplex, Arc::new(AtomicU64::new(0)));
+        let mut data = [0f32; 480];
+        // 先消费半帧旧音频。
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert!((data[479] - 0.5).abs() < 1e-3);
+        // flush 目标 = 已写入的 960 样本；之后写入的新音频（0.25）不能被清掉。
+        duplex.request_flush(960);
+        for _ in 0..480 {
+            producer.push(0.25).unwrap();
+        }
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert!(
+            (data[479] - 0.25).abs() < 1e-3,
+            "flush 误删了新音频: {}",
+            data[479]
+        );
+        assert_eq!(consumer.slots(), 0);
+    }
+
+    /// 插话闪避：输出增益在数十毫秒内压到 DUCK_GAIN 附近。
+    #[test]
+    fn output_fill_ducks_when_user_barges_in() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(8192);
+        for _ in 0..4096 {
+            producer.push(0.5).unwrap();
+        }
+        let duplex = DuplexSignal::new();
+        duplex.mark_barge_in(10_000);
+        let cb = AtomicU64::new(0);
+        let mut state = OutputState::new(48_000, 240, &duplex, Arc::new(AtomicU64::new(0)));
+        let mut data = [0f32; 480];
+        for _ in 0..5 {
+            state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        }
+        let tail = data[data.len() - 1];
+        assert!(
+            (tail - 0.5 * DUCK_GAIN).abs() < 0.02,
+            "闪避未生效: {}",
+            tail
+        );
+    }
+
+    /// 播放 worker 测试夹具：返回 worker、消息发送端、协同信号与输出环消费者。
+    fn playback_fixture() -> (
+        PlaybackWorker,
+        mpsc::Sender<PlaybackMsg>,
+        Arc<DuplexSignal>,
+        rtrb::Consumer<f32>,
+    ) {
+        let (tx, rx) = mpsc::channel(32);
+        let (producer, consumer) = rtrb::RingBuffer::new(8192);
+        let duplex = Arc::new(DuplexSignal::new());
+        let setup = PlaybackSetup {
+            out: producer,
+            server_rate: 16_000,
+            output_rate: 16_000,
+            play_tail_ms: 300,
+            cb_count: Arc::new(AtomicU64::new(0)),
+            cb_samples: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
+            duplex: duplex.clone(),
+        };
+        let worker = PlaybackWorker::new(rx, setup).unwrap();
+        (worker, tx, duplex, consumer)
+    }
+
+    /// 环形缓冲不足一块时记一次欠载；连续空回调与清环静音不重复计数。
+    #[test]
+    fn output_counts_underrun_transitions() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(8192);
+        for _ in 0..480 {
+            producer.push(0.5).unwrap();
+        }
+        let duplex = DuplexSignal::new();
+        let cb = AtomicU64::new(0);
+        let underruns = Arc::new(AtomicU64::new(0));
+        let mut state = OutputState::new(48_000, 240, &duplex, underruns.clone());
+        let mut data = [0f32; 480];
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert_eq!(underruns.load(Ordering::Relaxed), 0, "满缓冲不应计欠载");
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert_eq!(underruns.load(Ordering::Relaxed), 1, "首次欠载未计数");
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert_eq!(underruns.load(Ordering::Relaxed), 1, "连续欠载重复计数");
+        duplex.request_flush(480);
+        state.fill(&mut data, 1, &mut consumer, &duplex, &cb);
+        assert_eq!(underruns.load(Ordering::Relaxed), 1, "清环静音被计为欠载");
+    }
+
+    /// 无新包时 PLC 补帧封顶：空闲期不能无限续帧（否则播放窗口永不过期）。
+    #[test]
+    fn plc_frames_are_capped() {
+        let (mut worker, _tx, _duplex, _consumer) = playback_fixture();
+        for _ in 0..(MAX_PLC_FRAMES + 5) {
+            worker.play_plc();
+        }
+        assert_eq!(worker.stats.plc, MAX_PLC_FRAMES as u64, "PLC 未按上限封顶");
+    }
+
+    /// 下行积压超过上限：丢弃最旧的过期音频，队列压回上限内。
+    #[test]
+    fn backlog_trim_drops_stale_audio() {
+        let (mut worker, tx, _duplex, _consumer) = playback_fixture();
+        for _ in 0..10 {
+            assert!(tx.try_send(PlaybackMsg::Audio(vec![0; 2])).is_ok());
+        }
+        worker.trim_backlog();
+        assert_eq!(worker.rx.len(), MAX_AUDIO_BACKLOG, "积压未压回上限");
+        assert_eq!(worker.stats.trimmed, 5, "丢弃计数异常");
+    }
+
+    /// 积压中遇到 TTS 切换：Flush 必须生效，不能被丢帧逻辑吞掉。
+    #[test]
+    fn backlog_trim_preserves_flush() {
+        let (mut worker, tx, duplex, _consumer) = playback_fixture();
+        assert!(tx.try_send(PlaybackMsg::Flush).is_ok());
+        for _ in 0..10 {
+            assert!(tx.try_send(PlaybackMsg::Audio(vec![0; 2])).is_ok());
+        }
+        worker.trim_backlog();
+        assert_eq!(duplex.flush_serial(), 1, "积压中的 Flush 被丢弃");
+        assert_eq!(worker.rx.len(), MAX_AUDIO_BACKLOG);
+        assert!(worker.stats.trimmed > 0, "未丢弃过期音频");
+    }
+
+    /// 播放占用校正必须是负反馈：占用高降速、占用低提速。
+    #[test]
+    fn occupancy_correction_is_negative_feedback() {
+        assert!(occupancy_ppm(120.0, 60.0) < 0.0, "占用高应降速");
+        assert!(occupancy_ppm(20.0, 60.0) > 0.0, "占用低应提速");
+        assert!(occupancy_ppm(60.0, 60.0).abs() < 1e-9);
     }
 
     /// 单次调整受速率限制（≤50ppm/s × 最小采样间隔 1ms = 0.05ppm）。
