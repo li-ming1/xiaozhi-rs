@@ -138,6 +138,18 @@ $env:XIAOZHI_VAD_PLAY_BOOST_DB = "18"; $env:XIAOZHI_VAD_ON_FRAMES = "3"; xiaozhi
 | `XIAOZHI_INPUT_DEVICE` | 输入设备名称子串（如 `麦克风阵列`） |
 | `XIAOZHI_OUTPUT_DEVICE` | 输出设备名称子串（如 `Realtek`、`耳机`） |
 
+### 实机验收
+
+1. `xiaozhi-rs doctor`：确认输入/输出设备行的 `[将使用]` 指向预期硬件；默认输出若是显示器音频，
+   用 `XIAOZHI_OUTPUT_DEVICE` 指定扬声器（Windows PowerShell：`$env:XIAOZHI_OUTPUT_DEVICE="Realtek"`）。
+2. `RUST_LOG=debug xiaozhi-rs start`：说一句话，日志应出现 `用户: ...`，随后 `AI: ...`；
+   TTS 播放中再次开口，应能立即打断（本地闪避，服务器随后停止 TTS）。
+3. 看以下 debug 诊断：
+   - `捕获诊断`：`丢弃输入` 长期为 0；`播放期N` 在 TTS 时增长；`RMS` 随说话变化。
+   - `播放诊断`：`欠载` 偶发或为 0；`占用` 接近 `目标`；`丢弃` 只在极端卡顿时增长。
+   - `用户插话：TTS 本地闪避` 应只在真正插话时出现。
+4. 若没声：先看启动日志是否有"输出设备疑似显示器音频"警告，或 `doctor` 的 `[将使用]` 是否指向扬声器。
+
 ### 激活流程
 
 1. 运行 `xiaozhi-rs start`（跳过激活请用 `xiaozhi-rs skip`）；
@@ -158,9 +170,9 @@ $env:XIAOZHI_VAD_PLAY_BOOST_DB = "18"; $env:XIAOZHI_VAD_ON_FRAMES = "3"; xiaozhi
 
 ```
 src/
-├── main.rs          CLI 入口 + 多线程 runtime + ring TLS provider + 日志器
+├── main.rs          CLI 入口 + doctor 设备检查 + 多线程 runtime + ring TLS provider + 日志器
 ├── lib.rs           模块声明与公共导出
-├── supervisor.rs    VoiceSupervisor 状态机（SelectTransport→Connect→Streaming→Backoff）+ RealtimeVoice 入口 + 传输类型
+├── supervisor.rs    VoiceSupervisor 状态机（Connect→Streaming→Backoff）+ 会话恢复
 ├── error.rs         类型化错误（认证/瞬态/协议/音频等）
 ├── identity.rs      设备身份（MAC 派生、HMAC、efuse 持久化）
 ├── ota.rs           OTA 配置拉取 + 激活轮询（reqwest）
@@ -168,10 +180,12 @@ src/
 ├── protocol/
 │   ├── mod.rs       TransportAdapter 闭集 + 统一收发句柄 + latest-slot 音频通道
 │   ├── message.rs   线上 JSON 协议类型
-│   ├── ws.rs        WebSocket v2 传输（BinaryProtocol2，心跳 15s）
-│   └── mqtt_udp.rs  MQTT+UDP 主链路（QoS0、防重放、UDP 黑洞检测）
+│   ├── ws.rs        WebSocket v2 传输（BinaryProtocol2，15s Ping / 45s 存活看门狗）
+│   └── mqtt_udp.rs  MQTT+UDP 主链路（QoS0、防重放、序列号精确计损、IPv6）
 └── audio/
-    ├── mod.rs       无锁管线：CPAL 回调 + 独立 DSP worker（CaptureWorker/PlaybackWorker）+ 漂移补偿
+    ├── mod.rs       CPAL 流 + 设备选择/警告 + DSP worker 编排
+    ├── vad.rs       VAD、80Hz 高通、环境变量调参
+    ├── output.rs    播放协同（进度/闪避/清环）+ 输出回调 + 欠载统计
     ├── opus.rs      Opus 编解码（opusic-sys 静态内置）+ PLC + 网络分级
     ├── resample.rs  rubato AsyncSinc（256-tap BlackmanHarris2）
     └── buffer.rs    自适应深度播放缓冲（40–240ms）
