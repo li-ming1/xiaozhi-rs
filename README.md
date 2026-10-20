@@ -128,6 +128,16 @@ $env:XIAOZHI_VAD_PLAY_BOOST_DB = "18"; $env:XIAOZHI_VAD_ON_FRAMES = "3"; xiaozhi
 "播放诊断"里的 `占用/目标/漂移/丢弃/欠载` 可确认抖动缓冲、时钟补偿、积压丢帧与输出欠载是否正常。
 若机器人说话期间 `RMS` 明显升高，说明是扬声器回声泄漏，改用耳机或降低音量最有效。
 
+### 音频设备选择
+
+`xiaozhi-rs doctor` 会列出全部输入/输出设备及默认格式。客户端默认使用系统默认设备；
+可用环境变量按名称子串（不区分大小写）指定，未匹配时回退默认并输出警告：
+
+| 变量 | 含义 |
+|------|------|
+| `XIAOZHI_INPUT_DEVICE` | 输入设备名称子串（如 `麦克风阵列`） |
+| `XIAOZHI_OUTPUT_DEVICE` | 输出设备名称子串（如 `Realtek`、`耳机`） |
+
 ### 激活流程
 
 1. 运行 `xiaozhi-rs start`（跳过激活请用 `xiaozhi-rs skip`）；

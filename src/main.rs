@@ -275,17 +275,13 @@ fn show_device_info() -> Result<()> {
     Ok(())
 }
 
-/// 打印默认音频设备与格式，供实机验收前快速确认硬件路径。
+/// 打印全部音频设备与格式，供实机验收前确认硬件路径。
 fn show_audio_doctor() -> Result<()> {
     use cpal::traits::HostTrait;
 
-    fn describe(label: &str, device: Option<cpal::Device>, input: bool) {
+    fn describe(device: &cpal::Device, input: bool) {
         use cpal::traits::DeviceTrait;
-        let Some(device) = device else {
-            println!("  {}: 未找到", label);
-            return;
-        };
-        println!("  {}: {}", label, device);
+        println!("    {}", device);
         let config = if input {
             device.default_input_config()
         } else {
@@ -293,22 +289,48 @@ fn show_audio_doctor() -> Result<()> {
         };
         match config {
             Ok(c) => println!(
-                "    {}Hz / {}ch / {:?}",
+                "      {}Hz / {}ch / {:?}",
                 c.sample_rate(),
                 c.channels(),
                 c.sample_format()
             ),
-            Err(e) => println!("    获取配置失败: {}", e),
+            Err(e) => println!("      获取配置失败: {}", e),
         }
     }
 
     let host = cpal::default_host();
     println!("音频设备检查:");
     println!("  主机: {}", host.id().name());
-    describe("默认输入", host.default_input_device(), true);
-    describe("默认输出", host.default_output_device(), false);
+    println!("  输入设备:");
+    match host.input_devices() {
+        Ok(devices) => {
+            let mut any = false;
+            for device in devices {
+                any = true;
+                describe(&device, true);
+            }
+            if !any {
+                println!("    未找到");
+            }
+        }
+        Err(e) => println!("    枚举失败: {}", e),
+    }
+    println!("  输出设备:");
+    match host.output_devices() {
+        Ok(devices) => {
+            let mut any = false;
+            for device in devices {
+                any = true;
+                describe(&device, false);
+            }
+            if !any {
+                println!("    未找到");
+            }
+        }
+        Err(e) => println!("    枚举失败: {}", e),
+    }
     println!();
-    println!("提示: 实机对话请运行 `RUST_LOG=debug xiaozhi-rs start`");
+    println!("提示: 可用 XIAOZHI_INPUT_DEVICE / XIAOZHI_OUTPUT_DEVICE 按名称子串选择设备");
     Ok(())
 }
 

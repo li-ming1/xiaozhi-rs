@@ -62,16 +62,55 @@ pub struct AudioPipeline {
     device_error: Option<Arc<AtomicBool>>,
 }
 
+/// 按环境变量中的设备名称子串选择设备；未设置/未匹配回退系统默认。
+fn pick_device(host: &cpal::Host, env: &str, input: bool) -> Option<Device> {
+    let want = std::env::var(env)
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty());
+    if let Some(want) = want {
+        let found = if input {
+            host.input_devices()
+                .ok()
+                .and_then(|mut it| it.find(|d| d.to_string().to_lowercase().contains(&want)))
+        } else {
+            host.output_devices()
+                .ok()
+                .and_then(|mut it| it.find(|d| d.to_string().to_lowercase().contains(&want)))
+        };
+        match found {
+            Some(device) => {
+                info!(
+                    "按 {} 选择{}设备: {}",
+                    env,
+                    if input { "输入" } else { "输出" },
+                    device
+                );
+                return Some(device);
+            }
+            None => warn!("{}={} 未匹配到设备，回退系统默认", env, want),
+        }
+    }
+    if input {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    }
+}
+
 impl AudioPipeline {
-    /// 探测默认设备。
+    /// 探测输入/输出设备（环境变量可按名称子串指定，未匹配回退系统默认）。
     pub fn new() -> Result<Self> {
         let host = cpal::default_host();
-        let input_device = host
-            .default_input_device()
-            .ok_or_else(|| VoiceError::Audio("未找到输入设备".into()))?;
-        let output_device = host
-            .default_output_device()
-            .ok_or_else(|| VoiceError::Audio("未找到输出设备".into()))?;
+        let input_device = pick_device(&host, "XIAOZHI_INPUT_DEVICE", true).ok_or_else(|| {
+            VoiceError::Audio("未找到输入设备（可用 XIAOZHI_INPUT_DEVICE 指定名称子串）".into())
+        })?;
+        let output_device =
+            pick_device(&host, "XIAOZHI_OUTPUT_DEVICE", false).ok_or_else(|| {
+                VoiceError::Audio(
+                    "未找到输出设备（可用 XIAOZHI_OUTPUT_DEVICE 指定名称子串）".into(),
+                )
+            })?;
         info!("输入设备: {}", input_device);
         info!("输出设备: {}", output_device);
         Ok(Self {
