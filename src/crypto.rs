@@ -84,8 +84,8 @@ pub fn hex_decode_16(s: &str) -> Result<[u8; 16], CryptoError> {
         return Err(CryptoError::BadHexLen(s.len()));
     }
     let mut out = [0u8; 16];
-    // 长度已校验为 32，chunks_exact(2) 恰好 16 组。
-    for (i, pair) in s.as_bytes().chunks_exact(2).enumerate() {
+    // 长度已校验为 32，as_chunks::<2> 恰好 16 组。
+    for (i, pair) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         out[i] = (hex_val(pair[0])? << 4) | hex_val(pair[1])?;
     }
     Ok(out)
