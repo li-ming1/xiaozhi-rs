@@ -22,6 +22,8 @@ const V2_HEADER_SIZE: usize = 16;
 const V3_HEADER_SIZE: usize = 4;
 const V2_TYPE_OPUS: u16 = 0;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// 连续 3 个心跳周期无任何下行帧（含 Pong）即判定连接失效。
+const PONG_TIMEOUT: Duration = Duration::from_secs(45);
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -153,6 +155,7 @@ async fn connect_and_handshake(
             ReceivedMessage::Audio(data) => {
                 debug!("握手阶段收到音频 {} 字节，忽略", data.len());
             }
+            ReceivedMessage::Control => continue,
         }
     }
 
@@ -210,6 +213,8 @@ enum ReceivedMessage {
     Json(ServerMessage),
     /// 二进制音频帧（原始 Bytes，剥头在 recv_loop 完成）。
     Audio(Bytes),
+    /// Ping/Pong 等控制帧：仅用于存活检测，不交付上层。
+    Control,
 }
 
 impl WsReceiver {
@@ -217,13 +222,21 @@ impl WsReceiver {
         loop {
             match self.stream.next().await {
                 Some(Ok(WsMessage::Text(text))) => {
-                    let msg: ServerMessage = serde_json::from_str(&text)?;
-                    return Ok(ReceivedMessage::Json(msg));
+                    // 单条未知/畸形消息不应打断整会话（与 MQTT 链路行为一致）。
+                    match serde_json::from_str::<ServerMessage>(&text) {
+                        Ok(msg) => return Ok(ReceivedMessage::Json(msg)),
+                        Err(e) => {
+                            warn!("WS JSON 解析失败: {} (payload={})", e, text);
+                            continue;
+                        }
+                    }
                 }
                 Some(Ok(WsMessage::Binary(data))) => {
                     return Ok(ReceivedMessage::Audio(data));
                 }
-                Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
+                Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => {
+                    return Ok(ReceivedMessage::Control);
+                }
                 Some(Ok(WsMessage::Close(f))) => {
                     return Err(VoiceError::Transport(format!("连接已关闭: {:?}", f)));
                 }
@@ -283,27 +296,66 @@ async fn send_loop(
     }
 }
 
+/// 心跳超时：距上次收到任何下行帧已超过 3 个 ping 周期。
+fn heartbeat_timeout(last_rx: Instant, now: Instant) -> bool {
+    now.duration_since(last_rx) >= PONG_TIMEOUT
+}
+
 /// 接收循环：文本→JSON，二进制→音频（剥 v2 头），断开→Closed。
 async fn recv_loop(
     mut receiver: WsReceiver,
     incoming_tx: mpsc::Sender<IncomingEvent>,
     mut close_rx: watch::Receiver<()>,
 ) {
+    // 裸 Opus 帧头诊断只打一次，避免每帧格式化 hex 刷屏（debug 级也不该拖慢下行）。
+    let mut header_warned = false;
+    // 存活检测：发送侧每 15s 一个 Ping，任何下行帧（含 Pong）都刷新 last_rx。
+    let mut heartbeat = interval(PING_INTERVAL);
+    heartbeat.reset();
+    let mut last_rx = Instant::now();
     loop {
         tokio::select! {
             _ = close_rx.changed() => break,
+            _ = heartbeat.tick() => {
+                if heartbeat_timeout(last_rx, Instant::now()) {
+                    warn!("WS 心跳超时：{}s 无任何下行帧", PONG_TIMEOUT.as_secs());
+                    let _ = incoming_tx.send(IncomingEvent::Closed).await;
+                    break;
+                }
+            }
             msg = receiver.receive() => match msg {
                 Ok(ReceivedMessage::Json(srv)) => {
+                    last_rx = Instant::now();
                     if incoming_tx.send(IncomingEvent::Json(srv)).await.is_err() {
                         break;
                     }
                 }
                 Ok(ReceivedMessage::Audio(data)) => {
-                    let payload = strip_binary_header(data);
-                    if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
+                    last_rx = Instant::now();
+                    let head = binary_header_len(&data);
+                    if head == 0 && !header_warned {
+                        header_warned = true;
+                        let hex: String =
+                            data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+                        debug!(
+                            "WS 下行帧头未识别，按裸 Opus 处理 (len={}): {}",
+                            data.len(),
+                            hex
+                        );
+                    }
+                    let payload = strip_binary_header(data, head);
+                    if incoming_tx
+                        .send(IncomingEvent::Audio {
+                            data: payload,
+                            lost_before: 0,
+                        })
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
+                Ok(ReceivedMessage::Control) => last_rx = Instant::now(),
                 Err(e) => {
                     warn!("WS 接收错误: {}", e);
                     let _ = incoming_tx.send(IncomingEvent::Closed).await;
@@ -334,21 +386,13 @@ fn binary_header_len(data: &[u8]) -> usize {
         {
             return V3_HEADER_SIZE;
         }
-        // 均未识别：按裸 Opus 处理，记录前 16 字节便于核对服务器实际格式。
-        let hex: String = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
-        debug!(
-            "WS 下行帧头未识别，按裸 Opus 处理 (len={}): {}",
-            data.len(),
-            hex
-        );
     }
     0
 }
 
 /// 剥离二进制帧头并交付 payload；识别失败按裸 Opus 原样交付。
 /// Bytes 所有权唯一时 split_to/into 均零拷贝，下行音频整条路径无中间复制。
-fn strip_binary_header(data: Bytes) -> Vec<u8> {
-    let head = binary_header_len(&data);
+fn strip_binary_header(data: Bytes, head: usize) -> Vec<u8> {
     let mut payload = data;
     if head > 0 {
         let _ = payload.split_to(head); // 丢弃头部，剩余部分即 payload。
@@ -371,7 +415,8 @@ mod tests {
         frame.extend_from_slice(&12345u32.to_be_bytes());
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload);
-        let out = strip_binary_header(Bytes::from(frame));
+        let head = binary_header_len(&frame);
+        let out = strip_binary_header(Bytes::from(frame), head);
         assert_eq!(out, payload);
     }
 
@@ -386,7 +431,8 @@ mod tests {
         frame.extend_from_slice(&0u32.to_be_bytes());
         frame.extend_from_slice(&u32::MAX.to_be_bytes()); // payload_size 与实际不符
         frame.extend_from_slice(payload);
-        let out = strip_binary_header(Bytes::from(frame.clone()));
+        let head = binary_header_len(&frame);
+        let out = strip_binary_header(Bytes::from(frame.clone()), head);
         assert_eq!(out, frame);
     }
 
@@ -402,5 +448,14 @@ mod tests {
             "含非法 Base64 字符: {}",
             key
         );
+    }
+
+    /// 3 个心跳周期内无任何下行帧才判超时。
+    #[test]
+    fn heartbeat_times_out_after_three_missed_pings() {
+        let t0 = Instant::now();
+        assert!(!heartbeat_timeout(t0, t0 + PING_INTERVAL));
+        assert!(!heartbeat_timeout(t0, t0 + PING_INTERVAL * 2));
+        assert!(heartbeat_timeout(t0, t0 + PONG_TIMEOUT));
     }
 }

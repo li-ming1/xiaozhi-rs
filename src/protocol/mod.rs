@@ -41,8 +41,12 @@ pub struct MqttParams {
 #[derive(Debug)]
 pub enum IncomingEvent {
     Json(ServerMessage),
-    /// 已解密的 Opus 音频载荷（UDP）或原始二进制音频（WebSocket）。
-    Audio(Vec<u8>),
+    /// 音频载荷（UDP 已解密 / WS 原始二进制）。
+    Audio {
+        data: Vec<u8>,
+        /// 本帧之前丢失的 UDP 帧数（WS 为可靠传输，恒 0）。
+        lost_before: u32,
+    },
     /// 传输层已断开。
     Closed,
 }

@@ -139,9 +139,8 @@ fn is_transport_loss(e: &VoiceError) -> bool {
     matches!(e, VoiceError::Transport(_) | VoiceError::Timeout(_))
 }
 
-/// 丢包估计器：按 60ms 帧到达间隙估算 10s 窗口丢包率。
+/// 丢包分级：按 UDP 序列号差精确统计 10s 窗口丢包率，驱动编码策略。
 struct LossEstimator {
-    last: Option<Instant>,
     received: u64,
     lost: u64,
     window_start: Instant,
@@ -149,14 +148,10 @@ struct LossEstimator {
 }
 
 impl LossEstimator {
-    const FRAME_MS: u64 = 60;
     const WINDOW: Duration = Duration::from_secs(10);
-    /// gap 超过此值视为服务器静默期（TTS 间隔/无下行），重置窗口而非计丢失。
-    const RESET_GAP_MS: u64 = 1000;
 
     fn new() -> Self {
         Self {
-            last: None,
             received: 0,
             lost: 0,
             window_start: Instant::now(),
@@ -164,21 +159,10 @@ impl LossEstimator {
         }
     }
 
-    fn observe_frame(&mut self, now: Instant) {
-        if let Some(prev) = self.last {
-            let gap_ms = now.duration_since(prev).as_millis() as u64;
-            // 服务器静默期无法区分"丢包"与"未发送"：>1s 重置窗口；
-            // 否则按帧间隔折算丢失。
-            if gap_ms > Self::RESET_GAP_MS {
-                self.received = 0;
-                self.lost = 0;
-                self.window_start = now;
-            } else if gap_ms > Self::FRAME_MS * 3 {
-                self.lost += gap_ms / Self::FRAME_MS - 1;
-            }
-        }
-        self.last = Some(now);
+    /// 记录一帧到达及其之前丢失的帧数；窗口满 10s 重算分级。
+    fn observe(&mut self, now: Instant, lost_before: u32) {
         self.received += 1;
+        self.lost += lost_before as u64;
         if now.duration_since(self.window_start) >= Self::WINDOW {
             let total = self.received + self.lost;
             let ratio = if total > 0 {
@@ -259,7 +243,8 @@ impl VoiceSupervisor {
                     Ok(()) => {
                         info!("会话正常结束，重新连接");
                         self.cleanup_session();
-                        State::Connect
+                        // 经退避状态重连：服务器连续 goodbye 时避免无间隔重连风暴。
+                        State::Backoff
                     }
                     Err(e) => {
                         warn!("流式会话结束: {}", e);
@@ -394,37 +379,28 @@ impl VoiceSupervisor {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break Ok(()),
                 _ = s.tick.tick() => {
-                    // UDP 黑洞检测（仅 MQTT+UDP）：首包 10s 无媒体，或中途断流 3s。
-                    if kind == TransportKind::MqttUdp && s.ctx.tts_active {
-                        let now = Instant::now();
-                        let blackhole = if s.ctx.sentence_has_media {
-                            s.last_audio.elapsed() >= Duration::from_secs(3)
-                        } else {
-                            s.ctx
-                                .tts_started_at
-                                .map(|t| now.duration_since(t) >= Duration::from_secs(10))
-                                .unwrap_or(false)
-                        };
-                        if blackhole {
-                            warn!("UDP 黑洞检测：活跃句子无媒体（首包>10s 或中途断流>3s）");
-                            break Err(VoiceError::Transport("UDP 黑洞".into()));
-                        }
+                    // CPAL 流错误先于黑洞判定：设备故障不应被误计为传输失败（MQTT 熔断）。
+                    if self.audio.as_ref().is_some_and(|a| a.has_device_error()) {
+                        warn!("音频流错误：重建音频管线");
+                        break Err(VoiceError::Audio("音频流错误".into()));
+                    }
+                    // 活跃句子无媒体（首包 10s / 中途断流 3s）→ 传输黑洞，重连。
+                    if media_blackhole(&s.ctx, s.last_audio, Instant::now()) {
+                        warn!("传输黑洞检测：活跃句子无媒体（首包>10s 或中途断流>3s）");
+                        break Err(VoiceError::Transport("传输黑洞".into()));
                     }
                     if s.downlink_diag.elapsed() >= Duration::from_secs(2) {
                         debug!("下行诊断: 收到服务器音频帧 {}", s.downlink_frames);
                         s.downlink_frames = 0;
                         s.downlink_diag = Instant::now();
                     }
-                    // 网络分级（10s 窗口）：下发捕获侧（编码策略）与播放侧（FEC 解码）。
+                    // 网络分级（10s 窗口）：下发捕获侧，调整编码码率/FEC/DTX。
                     if s.last_grade_check.elapsed() >= Duration::from_secs(10) {
                         let grade = s.loss.grade;
-                        if let Some(a) = self.audio.as_ref() {
-                            if let Some(tx) = a.grade_sender() {
-                                let _ = tx.send(grade).await;
-                            }
-                            if let Some(tx) = a.playback_grade_sender() {
-                                let _ = tx.send(grade).await;
-                            }
+                        if let Some(a) = self.audio.as_ref()
+                            && let Some(tx) = a.grade_sender()
+                        {
+                            let _ = tx.send(grade).await;
                         }
                         s.last_grade_check = Instant::now();
                     }
@@ -438,8 +414,9 @@ impl VoiceSupervisor {
                                 Err(e) => break Err(e),
                             }
                         }
-                        Some(IncomingEvent::Audio(data)) => {
-                            s.last_audio = Instant::now();
+                        Some(IncomingEvent::Audio { data, lost_before }) => {
+                            let now = Instant::now();
+                            s.last_audio = now;
                             s.ctx.sentence_has_media = true;
                             if !s.first_frame_logged {
                                 s.first_frame_logged = true;
@@ -448,9 +425,9 @@ impl VoiceSupervisor {
                                 debug!("下行首帧 hex (len={}): {}", data.len(), hex.join(" "));
                             }
                             s.downlink_frames += 1;
-                            // 丢包估计仅对 UDP 有意义（TCP 可靠传输，间隙是服务器停顿而非丢包）。
+                            // 丢包分级仅对 UDP 有意义（TCP 可靠传输，间隙是服务器停顿而非丢包）。
                             if kind == TransportKind::MqttUdp {
-                                s.loss.observe_frame(Instant::now());
+                                s.loss.observe(now, lost_before);
                             }
                             if let Some(tx) = &playback_tx
                                 && let Err(e) = tx.send(PlaybackMsg::Audio(data)).await
@@ -467,20 +444,26 @@ impl VoiceSupervisor {
             }
         };
 
-        // 异常结束（Err）时尽力通知服务器中断会话（Abort）。
-        // 否则服务器会停留在旧会话的 Listening/Speaking 状态，新会话的音频会被忽略约 60s。
-        if result.is_err() {
-            let _ = handles
-                .control_tx
-                .send(ClientMessage::Abort {
-                    session_id: handles.session_id.clone(),
-                    reason: "session_terminated".to_string(),
-                })
-                .await;
-        }
-        // 停止音频：下次会话重新建流，编解码器随纪元重建。
+        // 先停本地音频：停机/断线立即静音，不必等网络善后。
         if let Some(a) = self.audio.as_mut() {
             a.stop();
+        }
+        // 异常结束或用户停机：尽力通知服务器清理会话（正常 goodbye 无需重复告知）。
+        // 否则服务器会停留在旧会话的 Listening/Speaking 状态，新会话音频可能被忽略约 60s。
+        if result.is_err() || self.shutdown.is_cancelled() {
+            let reason = if self.shutdown.is_cancelled() {
+                "client_shutdown"
+            } else {
+                "session_terminated"
+            };
+            let abort = ClientMessage::Abort {
+                session_id: handles.session_id.clone(),
+                reason: reason.to_string(),
+            };
+            // 控制链路可能已断/拥塞：最多等 500ms，不能拖住退出。
+            let _ =
+                tokio::time::timeout(Duration::from_millis(500), handles.control_tx.send(abort))
+                    .await;
         }
         result
     }
@@ -593,6 +576,20 @@ impl SessionCtx {
     }
 }
 
+/// 活跃句子无媒体判定：本句已有媒体时断流 3s，尚无媒体时首包 10s。
+/// 句间停顿（SentenceEnd 后到下一句 SentenceStart 前）不参与判定。
+fn media_blackhole(ctx: &SessionCtx, last_audio: Instant, now: Instant) -> bool {
+    if !ctx.tts_active {
+        return false;
+    }
+    if ctx.sentence_has_media {
+        now.duration_since(last_audio) >= Duration::from_secs(3)
+    } else {
+        ctx.tts_started_at
+            .is_some_and(|t| now.duration_since(t) >= Duration::from_secs(10))
+    }
+}
+
 /// 流式会话状态（每次建流重建）：TTS/媒体跟踪、丢包估计、诊断计时。
 struct StreamSession {
     ctx: SessionCtx,
@@ -650,11 +647,18 @@ async fn handle_json(
                 ctx.tts_started_at = None;
             }
             TtsState::SentenceStart => {
+                // 逐句重置：上一句的首包/断流状态不能泄漏到下一句，
+                // 否则流式长回复里正常的句间停顿会被误判为 UDP 黑洞。
+                ctx.sentence_has_media = false;
+                ctx.tts_started_at = Some(Instant::now());
                 if let Some(t) = text {
                     info!("AI: {}", t);
                 }
             }
-            TtsState::SentenceStop | TtsState::SentenceEnd => {}
+            TtsState::SentenceStop | TtsState::SentenceEnd => {
+                ctx.sentence_has_media = false;
+                ctx.tts_started_at = None;
+            }
         },
         ServerMessage::Stt { text } => info!("用户: {}", text),
         ServerMessage::Llm { text } => {
@@ -681,26 +685,41 @@ async fn handle_json(
 mod tests {
     use super::*;
 
-    /// 服务器静默期（gap >1s）应重置窗口，不计入丢失。
+    /// 序列号差直接计损：10s 窗口内 ≥10% 丢包为 Poor，3%~10% 为 Fair。
     #[test]
-    fn loss_estimator_ignores_server_silence() {
+    fn loss_estimator_grades_by_sequence_gaps() {
         let mut e = LossEstimator::new();
         let t0 = Instant::now();
-        for i in 0..10 {
-            e.observe_frame(t0 + Duration::from_millis(i * 60));
+        for _ in 0..10 {
+            e.observe(t0, 0);
         }
-        e.observe_frame(t0 + Duration::from_millis(3000 + 600));
-        assert_eq!(e.lost, 0);
+        e.observe(t0 + Duration::from_secs(10), 0);
+        assert_eq!(e.grade, NetworkGrade::Good);
+
+        // 新窗口：103 帧到达、12 帧丢失（10.4%）→ Poor。
+        for _ in 0..90 {
+            e.observe(t0 + Duration::from_secs(11), 0);
+        }
+        for _ in 0..12 {
+            e.observe(t0 + Duration::from_secs(19), 1);
+        }
+        e.observe(t0 + Duration::from_secs(21), 0);
+        assert_eq!(e.grade, NetworkGrade::Poor);
     }
 
-    /// 180ms–1s 内的间隙按帧间隔折算丢失。
+    /// 3%~10% 丢包为 Fair。
     #[test]
-    fn loss_estimator_counts_gaps_within_threshold() {
+    fn loss_estimator_fair_window() {
         let mut e = LossEstimator::new();
         let t0 = Instant::now();
-        e.observe_frame(t0);
-        e.observe_frame(t0 + Duration::from_millis(300));
-        assert_eq!(e.lost, 4); // 5 帧间隔 → 丢 4 帧
+        for _ in 0..95 {
+            e.observe(t0, 0);
+        }
+        for _ in 0..5 {
+            e.observe(t0, 1);
+        }
+        e.observe(t0 + Duration::from_secs(10), 0);
+        assert_eq!(e.grade, NetworkGrade::Fair);
     }
 
     #[test]
@@ -764,5 +783,94 @@ mod tests {
             "重置后 delay 仍过大: {:?}",
             first
         );
+    }
+
+    /// 句边界必须重置媒体/首包状态：否则流式长回复的句间停顿会被误判为 UDP 黑洞。
+    #[tokio::test]
+    async fn sentence_boundaries_reset_media_tracking() {
+        let mut ctx = SessionCtx::new();
+        handle_json(
+            ServerMessage::Tts {
+                state: TtsState::Start,
+                text: None,
+            },
+            &mut ctx,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(ctx.tts_active);
+        assert!(ctx.tts_started_at.is_some());
+
+        handle_json(
+            ServerMessage::Tts {
+                state: TtsState::SentenceStart,
+                text: Some("第一句".into()),
+            },
+            &mut ctx,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!ctx.sentence_has_media);
+        assert!(ctx.tts_started_at.is_some(), "句首未重置首包计时");
+
+        // 该句收到音频后进入句末：媒体标记与首包计时都应清空。
+        ctx.sentence_has_media = true;
+        handle_json(
+            ServerMessage::Tts {
+                state: TtsState::SentenceEnd,
+                text: None,
+            },
+            &mut ctx,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!ctx.sentence_has_media, "句末未清除媒体标记");
+        assert!(ctx.tts_started_at.is_none(), "句末未清除首包计时");
+
+        // 下一句重新开始计时；整段结束时全部归零。
+        handle_json(
+            ServerMessage::Tts {
+                state: TtsState::SentenceStart,
+                text: None,
+            },
+            &mut ctx,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(ctx.tts_started_at.is_some());
+        handle_json(
+            ServerMessage::Tts {
+                state: TtsState::Stop,
+                text: None,
+            },
+            &mut ctx,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!ctx.tts_active && !ctx.sentence_has_media && ctx.tts_started_at.is_none());
+    }
+
+    /// 活跃句子的媒体超时：有媒体看 3s 断流，无媒体看 10s 首包；非 TTS 期不判。
+    #[test]
+    fn media_blackhole_per_sentence() {
+        let now = Instant::now();
+        let mut ctx = SessionCtx::new();
+        ctx.tts_active = true;
+        ctx.tts_started_at = Some(now - Duration::from_secs(9));
+        assert!(!media_blackhole(&ctx, now - Duration::from_secs(1), now));
+        ctx.tts_started_at = Some(now - Duration::from_secs(10));
+        assert!(media_blackhole(&ctx, now - Duration::from_secs(1), now));
+
+        ctx.sentence_has_media = true;
+        assert!(!media_blackhole(&ctx, now - Duration::from_secs(2), now));
+        assert!(media_blackhole(&ctx, now - Duration::from_secs(3), now));
+
+        ctx.tts_active = false;
+        assert!(!media_blackhole(&ctx, now - Duration::from_secs(10), now));
     }
 }

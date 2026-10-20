@@ -76,12 +76,18 @@ pub async fn connect(params: &ConnectParams) -> Result<TransportHandles> {
         negotiated.server_audio.frame_duration
     );
 
-    let udp_socket = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| VoiceError::Transport(format!("UDP 绑定失败: {}", e)))?,
-    );
     let addr = resolve_udp_addr(&negotiated.udp.server, negotiated.udp.port).await?;
+    // 绑定地址必须与目标地址族一致：0.0.0.0 仅覆盖 IPv4，IPv6 服务器需 [::]。
+    let bind_addr = if addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let udp_socket = Arc::new(
+        UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| VoiceError::Transport(format!("UDP 绑定失败({}): {}", bind_addr, e)))?,
+    );
     udp_socket
         .connect(addr)
         .await
@@ -301,8 +307,8 @@ async fn mqtt_event_loop(
 
 /// UDP 包处理结果。
 enum PktOutcome {
-    /// 校验通过，交付解密后的音频 payload。
-    Deliver(Vec<u8>),
+    /// 校验通过，交付解密后的音频 payload 及其之前丢失的帧数。
+    Deliver { data: Vec<u8>, lost_before: u32 },
     /// 丢弃并归类原因（诊断统计）。
     Drop(PktDrop),
 }
@@ -317,55 +323,62 @@ enum PktDrop {
 
 /// 连续重放丢弃达到该阈值时视为服务器重置了音频流（seq 归零），重置防重放基准。
 const REPLAY_RESET_THRESHOLD: u32 = 50;
+/// 单次序列号跳跃超过该值视为流重置而非网络丢包（约 10s 的帧量）。
+const MAX_PLAUSIBLE_SEQ_GAP: u32 = 600;
 
 /// 校验包头 → 防重放 → 解密。纯函数，便于单元测试。
-/// 返回 `(结果, 是否序列号跳跃)`；跳跃仅诊断，不改变交付。
+/// 交付结果携带序列号推算的丢帧数（仅前向跳跃，重置/重放不计）。
 fn process_udp_packet(
-    buf: &[u8],
-    n: usize,
+    packet: &[u8],
     cipher: &AesCtrCipher,
     remote_sequence: &mut Option<u32>,
     replay_streak: &mut u32,
-) -> (PktOutcome, bool) {
-    if n < HEADER_SIZE {
-        return (PktOutcome::Drop(PktDrop::Short), false);
+) -> PktOutcome {
+    if packet.len() < HEADER_SIZE {
+        return PktOutcome::Drop(PktDrop::Short);
     }
-    // 长度已由上方 n < HEADER_SIZE 守卫保证，切片必为 16 字节。
-    let iv: [u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().unwrap();
+    // 长度已由上方守卫保证，切片必为 16 字节。
+    let iv: [u8; HEADER_SIZE] = packet[..HEADER_SIZE].try_into().unwrap();
     let hdr = UdpAudioHeader::parse(&iv);
     if hdr.type_ != TYPE_AUDIO {
-        return (PktOutcome::Drop(PktDrop::WrongType), false);
+        return PktOutcome::Drop(PktDrop::WrongType);
     }
-    if HEADER_SIZE + hdr.payload_len as usize != n {
-        // 宽容处理：服务器 payload_len 仅供参考，数据按实际 n 切片，不丢弃。
+    if HEADER_SIZE + hdr.payload_len as usize != packet.len() {
+        // 宽容处理：服务器 payload_len 仅供参考，数据按实际长度切片，不丢弃。
         debug!(
             "UDP 长度不匹配: 实际 {} 声明 {}",
-            n - HEADER_SIZE,
+            packet.len() - HEADER_SIZE,
             hdr.payload_len
         );
     }
-    // 防重放：序列号必须单调递增（允许跳跃，丢弃过期包）。
-    let mut jumped = false;
+    // 防重放：序列号必须单调递增（允许跳跃，丢弃过期包）；前向跳跃折算丢帧数。
+    let mut lost_before = 0u32;
     if let Some(prev) = *remote_sequence {
         if hdr.sequence <= prev {
             *replay_streak += 1;
             if *replay_streak < REPLAY_RESET_THRESHOLD {
-                return (PktOutcome::Drop(PktDrop::Replay), false);
+                return PktOutcome::Drop(PktDrop::Replay);
             }
             // 服务器可能中途重置音频流（seq 归零）：连续大量重放达阈值时
-            // 重置基准并接受当前包，避免永久黑洞。
+            // 重置基准并接受当前包，避免永久黑洞；流重置不算丢包。
             warn!("UDP 连续重放 {} 包，重置序列基准", *replay_streak);
             *replay_streak = 0;
         } else {
             *replay_streak = 0;
-            jumped = hdr.sequence != prev.wrapping_add(1);
+            let gap = hdr.sequence.wrapping_sub(prev);
+            if gap > 1 && gap <= MAX_PLAUSIBLE_SEQ_GAP {
+                lost_before = gap - 1;
+            }
         }
     }
     *remote_sequence = Some(hdr.sequence);
 
-    let mut payload = buf[HEADER_SIZE..n].to_vec();
+    let mut payload = packet[HEADER_SIZE..].to_vec();
     cipher.apply_keystream(&iv, &mut payload);
-    (PktOutcome::Deliver(payload), jumped)
+    PktOutcome::Deliver {
+        data: payload,
+        lost_before,
+    }
 }
 
 /// UDP 接收循环：校验包头 → 防重放 → 解密 → Audio。
@@ -387,20 +400,23 @@ async fn udp_recv_loop(
             recv = udp.recv(&mut buf) => match recv {
                 Ok(n) => {
                     stats.received += 1;
-                    let (outcome, jumped) = process_udp_packet(
-                        &buf,
-                        n,
+                    let outcome = process_udp_packet(
+                        &buf[..n],
                         &cipher,
                         &mut remote_sequence,
                         &mut replay_streak,
                     );
                     match outcome {
-                        PktOutcome::Deliver(payload) => {
-                            if jumped {
-                                debug!("UDP 序列号跳跃");
+                        PktOutcome::Deliver { data, lost_before } => {
+                            if lost_before > 0 {
+                                debug!("UDP 序列号跳跃，丢 {} 帧", lost_before);
                             }
                             stats.ok += 1;
-                            if incoming_tx.send(IncomingEvent::Audio(payload)).await.is_err() {
+                            if incoming_tx
+                                .send(IncomingEvent::Audio { data, lost_before })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -487,13 +503,15 @@ mod tests {
         let mut prev = None;
         let mut streak = 0;
         let p1 = build_packet(b"hello", 0);
-        let (outcome, jumped) = process_udp_packet(&p1, p1.len(), &c, &mut prev, &mut streak);
-        assert!(matches!(outcome, PktOutcome::Deliver(_)), "首包应交付");
-        assert!(!jumped);
+        assert!(matches!(
+            process_udp_packet(&p1, &c, &mut prev, &mut streak),
+            PktOutcome::Deliver { lost_before: 0, .. }
+        ));
         let p2 = build_packet(b"world", 1);
-        let (outcome, jumped) = process_udp_packet(&p2, p2.len(), &c, &mut prev, &mut streak);
-        assert!(matches!(outcome, PktOutcome::Deliver(_)));
-        assert!(!jumped);
+        assert!(matches!(
+            process_udp_packet(&p2, &c, &mut prev, &mut streak),
+            PktOutcome::Deliver { lost_before: 0, .. }
+        ));
     }
 
     #[test]
@@ -502,8 +520,8 @@ mod tests {
         let mut prev = None;
         let mut streak = 0;
         let pkt = build_packet(b"secret-audio", 5);
-        let (PktOutcome::Deliver(payload), _) =
-            process_udp_packet(&pkt, pkt.len(), &c, &mut prev, &mut streak)
+        let PktOutcome::Deliver { data: payload, .. } =
+            process_udp_packet(&pkt, &c, &mut prev, &mut streak)
         else {
             panic!("应交付");
         };
@@ -520,13 +538,15 @@ mod tests {
         let mut prev = None;
         let mut streak = 0;
         assert!(matches!(
-            process_udp_packet(b"\x01\x02", 2, &c, &mut prev, &mut streak).0,
+            process_udp_packet(b"\x01\x02", &c, &mut prev, &mut streak),
             PktOutcome::Drop(PktDrop::Short)
         ));
         // 声明长度与实际不符（少传 1 字节）：宽容，仍交付。
         let pkt = build_packet(b"abc", 0);
-        let (outcome, _) = process_udp_packet(&pkt, pkt.len() - 1, &c, &mut prev, &mut streak);
-        assert!(matches!(outcome, PktOutcome::Deliver(_)));
+        assert!(matches!(
+            process_udp_packet(&pkt[..pkt.len() - 1], &c, &mut prev, &mut streak),
+            PktOutcome::Deliver { .. }
+        ));
     }
 
     /// 服务器重置音频流（seq 归零）后，连续重放丢弃达阈值应重置基准恢复交付。
@@ -538,43 +558,55 @@ mod tests {
         // 建立基线：seq=1000 起。
         let p0 = build_packet(b"a", 1000);
         assert!(matches!(
-            process_udp_packet(&p0, p0.len(), &c, &mut prev, &mut streak).0,
-            PktOutcome::Deliver(_)
+            process_udp_packet(&p0, &c, &mut prev, &mut streak),
+            PktOutcome::Deliver { lost_before: 0, .. }
         ));
         // 服务器重启：seq 归零，连续被拒。
         for _ in 0..(REPLAY_RESET_THRESHOLD - 1) {
             let p = build_packet(b"b", 3);
             assert!(matches!(
-                process_udp_packet(&p, p.len(), &c, &mut prev, &mut streak).0,
+                process_udp_packet(&p, &c, &mut prev, &mut streak),
                 PktOutcome::Drop(PktDrop::Replay)
             ));
         }
-        // 第 REPLAY_RESET_THRESHOLD 包：触发重置，接受并恢复交付。
+        // 第 REPLAY_RESET_THRESHOLD 包：触发重置，接受并恢复交付；流重置不计丢帧。
         let p_last = build_packet(b"c", 3);
-        let (outcome, _) = process_udp_packet(&p_last, p_last.len(), &c, &mut prev, &mut streak);
         assert!(
-            matches!(outcome, PktOutcome::Deliver(_)),
-            "重置后应恢复交付"
+            matches!(
+                process_udp_packet(&p_last, &c, &mut prev, &mut streak),
+                PktOutcome::Deliver { lost_before: 0, .. }
+            ),
+            "重置后应恢复交付且不计丢帧"
         );
     }
 
     #[test]
-    fn drops_replay_and_reports_jump() {
+    fn drops_replay_and_reports_loss() {
         let c = cipher("00000000000000000000000000000000");
         let mut prev = None;
         let mut streak = 0;
         let p1 = build_packet(b"x", 100);
-        process_udp_packet(&p1, p1.len(), &c, &mut prev, &mut streak);
+        process_udp_packet(&p1, &c, &mut prev, &mut streak);
         // 重放（seq 不递增）→ 丢弃。
         let p2 = build_packet(b"y", 100);
         assert!(matches!(
-            process_udp_packet(&p2, p2.len(), &c, &mut prev, &mut streak).0,
+            process_udp_packet(&p2, &c, &mut prev, &mut streak),
             PktOutcome::Drop(PktDrop::Replay)
         ));
-        // 跳跃（101 → 200）→ 接受并标记 jumped。
+        // 100 → 200：前向跳跃 99 帧。
         let p3 = build_packet(b"z", 200);
-        let (outcome, jumped) = process_udp_packet(&p3, p3.len(), &c, &mut prev, &mut streak);
-        assert!(matches!(outcome, PktOutcome::Deliver(_)));
-        assert!(jumped);
+        assert!(matches!(
+            process_udp_packet(&p3, &c, &mut prev, &mut streak),
+            PktOutcome::Deliver {
+                lost_before: 99,
+                ..
+            }
+        ));
+        // 超过合理窗口的跳跃按流重置处理，不计巨量丢帧。
+        let p4 = build_packet(b"w", 200 + MAX_PLAUSIBLE_SEQ_GAP + 1);
+        assert!(matches!(
+            process_udp_packet(&p4, &c, &mut prev, &mut streak),
+            PktOutcome::Deliver { lost_before: 0, .. }
+        ));
     }
 }
